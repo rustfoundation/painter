@@ -1,0 +1,31 @@
+[package]
+name = "painter"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# Internals
+thiserror = "1.0"
+clap = { version = "4.1", features = ["derive"] }
+
+# async
+smol = { version = "1.3" }
+smol-potat = { version = "1.1" }
+futures-lite = "1.12.0"
+rayon = "1.7"
+
+# For LLVM stuff
+# LLVM_SYS_140_PREFIX=/home/jaynus/dev/llvm@14
+llvm-ir = { version = "0.8", features = ["llvm-14"] }
+llvm-ir-analysis = { path = "llvm-ir-analysis", features = ["llvm-14"] }
+rustc-demangle = "0.1"
+
+#Graphing
+dot-structures = "0.1"
+graphviz-rust = "0.6"
+petgraph = "0.6"
+
+#Utility
+walkdir = "2.3"

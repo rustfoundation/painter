@@ -1,0 +1,3 @@
+[submodule "llvm-ir-analysis"]
+	path = llvm-ir-analysis
+	url = https://github.com/walterhpearce/llvm-ir-analysis
