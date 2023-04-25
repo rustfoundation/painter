@@ -1,3 +1,7 @@
+graph-imports/
 target/
 simple_test/target
 .idea
+docker/db/logs/*
+docker/db/data/*
+docker/db/plugins/*

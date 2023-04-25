@@ -1,0 +1,24 @@
+version: '3'
+services:
+  neo4j:
+    image: neo4j:latest
+    restart: unless-stopped
+    ports:
+      - 7474:7474
+      - 7687:7687
+    volumes:
+      - ./db/conf:/conf
+      - ./db/data:/data
+      - ./db/logs:/logs
+      - ./db/plugins:/plugins
+      - /home/jaynus/dev:/import
+    environment:
+      # Raise memory limits
+      - NEO4J_AUTH=none
+      - NEO4J_dbms_memory.pagecache_size=1G
+      - NEO4J_dbms.memory.heap.initial_size=1G
+      - NEO4J_dbms_memory_heap_max__size=1G
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_apoc_import_file_use__neo4j__config=true
+      - NEO4JLABS_PLUGINS=["apoc"]

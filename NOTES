@@ -1,0 +1,26 @@
+:auto USING PERIODIC COMMIT 500
+CALL apoc.load.json("file:///nodes.json")
+YIELD value
+CREATE (c:crate { name: value.name, version: value.version });
+
+
+MATCH (c)
+RETURN count(c) as count
+
+:auto USING PERIODIC COMMIT 500
+CALL apoc.load.json("file:///edges.json")
+YIELD value
+MATCH
+  (a:crate),
+  (b:crate)
+WHERE a.name = value.src.name AND a.version = value.src.version
+AND b.name = value.dst.name AND b.version = value.dst.version
+CREATE (a)-[r:DEPENDS_ON]->(b)
+
+:auto USING PERIODIC COMMIT 500
+CALL apoc.load.json("file:///edges.json")
+YIELD value
+MATCH
+  (a:crate { name: value.src.name, version: value.src.version }),
+  (b:crate { name: value.dst.name, version: value.dst.version })
+CALL apoc.merge.relationship(a,"DEPENDS_ON",{},{},b)

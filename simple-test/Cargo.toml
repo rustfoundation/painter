@@ -7,3 +7,6 @@ edition = "2021"
 
 [dependencies]
 simplecrypt = "1.0"
+
+[profile.release]
+lto="off"
