@@ -179,7 +179,7 @@ async fn main() -> Result<(), Error> {
             compile_all(&sources, &args.bytecodes_root)?;
         }
         Command::ExportAllNeo4j => {
-            analysis::export_all_neo4j(&args.bytecodes_root);
+            analysis::export_all_csv(&args.bytecodes_root);
         }
     }
 

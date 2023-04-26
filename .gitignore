@@ -1,4 +1,6 @@
-graph-imports/
+graph-imports/data/*
+graph-imports/bc/*
+graph-imports/*.csv
 target/
 simple_test/target
 .idea
