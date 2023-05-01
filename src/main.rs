@@ -1,4 +1,5 @@
 #![feature(string_remove_matches)]
+#![feature(iter_array_chunks)]
 
 use clap::{Parser, Subcommand, ValueHint};
 use rayon::prelude::*;
@@ -9,6 +10,8 @@ use std::{
 use walkdir::WalkDir;
 
 pub mod analysis;
+pub mod db;
+pub mod index;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {

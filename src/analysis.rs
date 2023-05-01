@@ -17,6 +17,16 @@ use std::{
 
 const BLOCKED_STRINGS: &'static [&str] = &["llvm.", "__rust", "rt::", "std::", "core::", "alloc::"];
 
+pub fn extract_target_crate_from_invoke(invoke: &str) -> Option<String> {
+    //let path = syn::parse_str::<syn::TypePath>(invoke)?;
+    //println!("{:?}", path);
+
+    to
+
+pub fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P) -> Result<(), Error> {
+    Ok(())
+}
+
 pub fn export_crate_csv<P: AsRef<Path>>(crate_bc_dir: P) -> Result<(), Error> {
     let mut calls = Vec::<(String, String)>::new();
     let crate_fullname = crate_bc_dir.as_ref().file_name().unwrap().to_str().unwrap();
@@ -75,4 +85,15 @@ pub fn export_all_csv<P: AsRef<Path>>(bc_root: P) -> Result<(), Error> {
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    pub fn extract_path() {
+        let c = extract_target_crate_from_invoke("<testcrate::asdf<T> as SomeTrait>::Associated")
+            .unwrap();
+    }
 }

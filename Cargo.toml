@@ -6,7 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-neo4j = []
+default = ["neo4j"]
+neo4j = ["neo4rs"]
 
 [dependencies]
 # Internals
@@ -16,7 +17,8 @@ clap = { version = "4.1", features = ["derive"] }
 # async
 smol = { version = "1.3" }
 smol-potat = { version = "1.1" }
-futures-lite = "1.12.0"
+async-compat = { version = "0.2" }
+futures = "0.3"
 rayon = "1.7"
 
 # For LLVM stuff
@@ -36,13 +38,14 @@ crates-index = "0.19"
 
 log = "0.4"
 env_logger = "0.10"
+syn = { version = "2.0", features = ["parsing"]}
+
+semver = { version = "1.0" }
+lenient_semver = { version = "0.4" }
 
 # serialization
-json = { version = "0.12" }
 toml = { version = "0.7" }
-
-# Debug
-deepsize = "0.2"
+csv = { version = "1.2" }
 
 # Db
 neo4rs = { version="0.6", optional = true, required-features = ["neo4j"]}

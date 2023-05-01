@@ -14,7 +14,7 @@ services:
       - /home/jaynus/dev:/import
     environment:
       # Raise memory limits
-      - NEO4J_AUTH=none
+      - NEO4J_AUTH=neo4j/a9834rjwl4ikj
       - NEO4J_dbms_memory.pagecache_size=1G
       - NEO4J_dbms.memory.heap.initial_size=1G
       - NEO4J_dbms_memory_heap_max__size=1G
