@@ -48,6 +48,7 @@ enum Command {
     },
     CompileAll,
     ExportAllNeo4j,
+    SemverCheck,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -183,6 +184,27 @@ async fn main() -> Result<(), Error> {
         }
         Command::ExportAllNeo4j => {
             analysis::export_all_csv(&args.bytecodes_root);
+        }
+        Command::SemverCheck => {
+            use std::sync::{Arc, Mutex};
+
+            let index = crates_index::Index::new_cargo_default().unwrap();
+            let mut invalid_versions = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+            index
+                .crates_parallel()
+                .filter_map(|c| c.ok())
+                .for_each(|c| {
+                    c.versions().iter().for_each(|v| {
+                        if let Err(e) = lenient_semver::parse(v.version()) {
+                            invalid_versions
+                                .lock()
+                                .unwrap()
+                                .insert(v.version().to_string());
+                        }
+                    })
+                });
+            println!("invalid versions: {:?}", invalid_versions.lock().unwrap());
         }
     }
 
