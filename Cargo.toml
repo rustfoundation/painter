@@ -1,0 +1,51 @@
+[package]
+name = "painter"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = ["neo4j"]
+neo4j = ["neo4rs"]
+
+[dependencies]
+# Internals
+thiserror = "1.0"
+clap = { version = "4.1", features = ["derive"] }
+
+# async
+smol = { version = "1.3" }
+smol-potat = { version = "1.1" }
+async-compat = { version = "0.2" }
+futures = "0.3"
+rayon = "1.7"
+
+# For LLVM stuff
+# LLVM_SYS_140_PREFIX=/home/jaynus/dev/llvm@14
+llvm-ir = { path = "llvm-ir", features = ["llvm-14"] }
+llvm-ir-analysis = { path = "llvm-ir-analysis", features = ["llvm-14"] }
+rustc-demangle = "0.1"
+
+#Graphing
+dot-structures = "0.1"
+graphviz-rust = "0.6"
+petgraph = "0.6"
+
+#Utility
+walkdir = "2.3"
+crates-index = "0.19"
+
+log = "0.4"
+env_logger = "0.10"
+syn = { version = "2.0", features = ["parsing"]}
+
+semver = { version = "1.0" }
+lenient_semver = { version = "0.4" }
+
+# serialization
+toml = { version = "0.7" }
+csv = { version = "1.2" }
+
+# Db
+neo4rs = { version="0.6", optional = true, required-features = ["neo4j"]}

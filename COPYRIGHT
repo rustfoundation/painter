@@ -1,0 +1,14 @@
+This project is dual licensed under Apache 2.0 and MIT terms with the exception 
+of documentation (e.g., `.md` docs in a `/docs` folder) which is licensed under 
+Creative Commons Attribution 4.0 International.
+
+Copyrights in a Rust Foundation project are retained by their contributors. No 
+copyright assignment is required to contribute to the Rust project.
+
+While not the default, some files may include explicit copyright notices 
+and/or license notices.
+
+Except as otherwise noted (e.g., with documentation), Rust is licensed under the 
+Apache License, Version 2.0 <LICENSE-APACHE> or 
+<http://www.apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT> or 
+<http://opensource.org/licenses/MIT>, at your option.
