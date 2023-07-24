@@ -1,6 +1,8 @@
 graph-imports/data/*
 graph-imports/bc/*
 graph-imports/*.csv
+graph-imports/*.sql
+graph-imports/*.report
 simple_test/target
 .idea
 docker/db/logs/*
