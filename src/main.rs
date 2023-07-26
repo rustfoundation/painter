@@ -2,6 +2,7 @@
 #![feature(string_remove_matches)]
 #![feature(iter_array_chunks)]
 
+use async_compat::CompatExt;
 use clap::{Parser, Subcommand, ValueHint};
 use db::Db;
 use rayon::prelude::*;
@@ -230,7 +231,7 @@ async fn main() -> Result<(), Error> {
             password,
         } => {
             let db = Arc::new(Db::connect(server, username, password).await?);
-            index::create_fresh_db(db).await?;
+            index::create_fresh_db(db).compat().await?;
         }
         Command::Compile { crate_fullname } => {
             compile_crate(&sources[&crate_fullname], &args.bytecodes_root)?;
