@@ -48,6 +48,13 @@ pub enum Error {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// The command stage to execute.
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(clap::Args, Debug)]
+struct Roots {
     /// Root directory containing the extracted sources tree.
     #[arg(short = 's', value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
     pub sources_root: PathBuf,
@@ -55,10 +62,15 @@ struct Args {
     /// Can be the same root path to output bytecode artifacts into the source tree.
     #[arg(short = 'b', value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
     pub bytecodes_root: PathBuf,
+}
 
-    /// The command stage to execute.
-    #[command(subcommand)]
-    command: Command,
+impl Roots {
+    fn get_crate_sources(&self) -> Result<HashMap<String, CrateSource>, Error> {
+        let sources = get_crate_sources(&self.sources_root)?;
+        log::trace!("Extracted valid sources, n={}", sources.len());
+
+        Ok(sources)
+    }
 }
 
 /// Command stages of painter to execute.
@@ -69,9 +81,14 @@ enum Command {
         /// The full name and version of the crate to compile. Must match folder name in source tree.
         #[arg(short = 'c')]
         crate_fullname: String,
+        #[command(flatten)]
+        roots: Roots,
     },
     /// Compile all crates found within the source tree.
-    CompileAll,
+    CompileAll {
+        #[command(flatten)]
+        roots: Roots,
+    },
     /// Export all crates with built bytecode to the neo4j database
     ExportAllNeo4j {
         #[arg(short = 's')]
@@ -80,6 +97,8 @@ enum Command {
         username: String,
         #[arg(short = 'p')]
         password: String,
+        #[command(flatten)]
+        roots: Roots,
     },
     SemverCheck,
 
@@ -220,9 +239,6 @@ async fn main() -> Result<(), Error> {
     let args = Args::parse();
     log::trace!("{:?}", args);
 
-    let sources = get_crate_sources(&args.sources_root)?;
-    log::trace!("Extracted valid sources, n={}", sources.len());
-
     match args.command {
         Command::CreateFreshDb {
             server,
@@ -232,19 +248,24 @@ async fn main() -> Result<(), Error> {
             let db = Arc::new(Db::connect(server, username, password).await?);
             index::create_fresh_db(db).await?;
         }
-        Command::Compile { crate_fullname } => {
-            compile_crate(&sources[&crate_fullname], &args.bytecodes_root)?;
+        Command::Compile {
+            crate_fullname,
+            roots,
+        } => {
+            let sources = roots.get_crate_sources()?;
+            compile_crate(&sources[&crate_fullname], &roots.bytecodes_root)?;
         }
-        Command::CompileAll => {
-            compile_all(&sources, &args.bytecodes_root);
+        Command::CompileAll { roots } => {
+            compile_all(&roots.get_crate_sources()?, &roots.bytecodes_root);
         }
         Command::ExportAllNeo4j {
             server,
             username,
             password,
+            roots,
         } => {
             let db = Arc::new(Db::connect(server, username, password).await?);
-            analysis::export_all_db(&args.bytecodes_root, db).await?;
+            analysis::export_all_db(&roots.bytecodes_root, db).await?;
         }
         Command::SemverCheck => {
             use std::sync::{Arc, Mutex};
