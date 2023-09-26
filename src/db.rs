@@ -10,6 +10,8 @@ pub enum Error {
     FieldNotFound(i64, String),
     #[error("Semver String Invalid: {0}")]
     InvalidSemver(String),
+    #[error("Crate Invalid: {0}")]
+    CrateNotFound(String),
 }
 
 pub struct Db {
@@ -75,8 +77,8 @@ impl Db {
             .execute(
                 query(
                     "MATCH (srcVersion:Version { name: $src_crate, version: $src_version }) 
-                        MATCH (dstCrate:Crate { name: dst_crate }) 
-                        CREATE (srcVersion)-[:INVOKES {caller: $caller, callee: $callee}]->(dstCrate)
+                        MATCH (dstCrate:Crate { name: $dst_crate }) 
+                        CREATE (srcVersion)-[:INVOKES {callsite: $caller, target: $callee}]->(dstCrate)
                     ",
                 )
                 .param("src_crate", src_crate.0)
@@ -150,7 +152,7 @@ impl Db {
             .execute(
                 query(
                     "MERGE (crate:Crate { name: $name }) 
-                     CREATE (version:Version {name: $name, version: $version, major: toInteger($semver_major), minor: toInteger($semver_minor), patch: toInteger($semver_patch), build: $semver_build, pre: $semver_pre })
+                     CREATE (version:Version {name: $name, version: $version, semver_major: toInteger($semver_major), semver_minor: toInteger($semver_minor), semver_patch: toInteger($semver_patch), semver_build: $semver_build, semver_pre: $semver_pre })
                      CREATE (version)-[:VERSION_OF]->(crate)
                      RETURN version",
                 )
@@ -175,24 +177,23 @@ impl Db {
             version_node.id()
         };
 
-        for depend in depends_on {
-            self
-                .conn
-                .execute(
-                    query(
-                        "MATCH (version:Version) WHERE ID(version) = $version_id
+        let tx = self.conn.start_txn().await.unwrap();
+
+        tx.run_queries(depends_on.into_iter().map(|depend| {
+            query(
+                "MATCH (version:Version) WHERE ID(version) = $version_id
                          MERGE (depend:Crate { name: $depend })
                          CREATE (version)-[:DEPENDS_ON { requirement: $req, features: $features, kind: $kind, optional: toBoolean($optional) } ]->(depend)",
-                    )
-                        .param("version_id", version_id)
-                        .param("depend", depend.0.as_ref())
-                        .param("req", depend.1.as_ref())
-                        .param("features", depend.2.as_ref())
-                        .param("kind", depend.3.as_ref())
-                        .param("optional", depend.4.as_ref())
-                )
-                .await?.next().await?;
-        }
+            )
+                .param("version_id", version_id)
+                .param("depend", depend.0.as_ref())
+                .param("req", depend.1.as_ref())
+                .param("features", depend.2.as_ref())
+                .param("kind", depend.3.as_ref())
+                .param("optional", depend.4.as_ref())
+        }).collect()).await?;
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -299,21 +300,39 @@ impl Db {
         };
 
         let version_id = {
-            let mut result = self.conn
+            let mut result = self
+                .conn
                 .execute(
                     query(
                         "MERGE (crate:Crate { name: $name }) 
-                     MERGE (version:Version {name: $name, version: $version, major: toInteger($semver_major), minor: toInteger($semver_minor), patch: toInteger($semver_patch), build: $semver_build, pre: $semver_pre })
+                     MERGE (version:Version {name: $name, version: $version, 
+                     semver_major: toInteger($semver_major), 
+                     semver_minor: toInteger($semver_minor), 
+                     semver_patch: toInteger($semver_patch), 
+                     semver_build: $semver_build, 
+                     semver_pre: $semver_pre })
                      MERGE (version)-[:VERSION_OF]->(crate)
                      RETURN version",
                     )
-                        .param("name", name)
-                        .param("version", version)
-                        .param("semver_major", u32::try_from(semver.major).map_err(|_| Error::InvalidSemver(version.to_owned()))?)
-                        .param("semver_minor", u32::try_from(semver.minor).map_err(|_| Error::InvalidSemver(version.to_owned()))?)
-                        .param("semver_patch", u32::try_from(semver.patch).map_err(|_| Error::InvalidSemver(version.to_owned()))?)
-                        .param("semver_build", semver.build.as_str())
-                        .param("semver_pre", semver.pre.as_str())
+                    .param("name", name)
+                    .param("version", version)
+                    .param(
+                        "semver_major",
+                        u32::try_from(semver.major)
+                            .map_err(|_| Error::InvalidSemver(version.to_owned()))?,
+                    )
+                    .param(
+                        "semver_minor",
+                        u32::try_from(semver.minor)
+                            .map_err(|_| Error::InvalidSemver(version.to_owned()))?,
+                    )
+                    .param(
+                        "semver_patch",
+                        u32::try_from(semver.patch)
+                            .map_err(|_| Error::InvalidSemver(version.to_owned()))?,
+                    )
+                    .param("semver_build", semver.build.as_str())
+                    .param("semver_pre", semver.pre.as_str()),
                 )
                 .await?;
 
@@ -348,5 +367,166 @@ impl Db {
         }
 
         Ok(())
+    }
+
+    ///
+    /// # Panics
+    ///
+    /// # Errors
+    ///
+    pub async fn crate_exists<S1>(&self, name: S1) -> Result<bool, Error>
+    where
+        S1: AsRef<str>,
+    {
+        Ok(self
+            .conn
+            .execute(
+                query("MATCH c=(Crate {name:  $name }) RETURN c LIMIT 1")
+                    .param("name", name.as_ref()),
+            )
+            .await?
+            .next()
+            .await
+            .unwrap()
+            .is_some())
+    }
+
+    ///
+    /// # Panics
+    ///
+    /// # Errors
+    ///
+    pub async fn set_latest<S1, S2>(&self, name: S1, version: S2) -> Result<(), Error>
+    where
+        S1: AsRef<str>,
+        S2: AsRef<str>,
+    {
+        // Clear all other latest for this name
+        self.conn
+            .execute(
+                query("MATCH (v:Version {name: $name }) SET v.latest = False")
+                    .param("name", name.as_ref()),
+            )
+            .await?
+            .next()
+            .await?;
+
+        self.conn
+            .execute(
+                query("MATCH (v:Version {name: $name, version: $version }) SET v.latest = True")
+                    .param("name", name.as_ref())
+                    .param("version", version.as_ref()),
+            )
+            .await?
+            .next()
+            .await?;
+
+        Ok(())
+    }
+
+    ///
+    /// # Panics
+    ///
+    /// # Errors
+    ///
+    pub async fn version_exists<S1, S2>(&self, name: S1, version: S2) -> Result<bool, Error>
+    where
+        S1: AsRef<str>,
+        S2: AsRef<str>,
+    {
+        Ok(self
+            .conn
+            .execute(
+                query("MATCH (v:Version { name: $name, version: $version } RETURN v LIMIT 1")
+                    .param("name", name.as_ref())
+                    .param("version", version.as_ref()),
+            )
+            .await?
+            .next()
+            .await
+            .unwrap()
+            .is_some())
+    }
+
+    ///
+    /// # Panics
+    ///
+    /// # Errors
+    ///
+    pub async fn crate_version_exists<S1, S2>(&self, name: S1, version: S2) -> Result<bool, Error>
+    where
+        S1: AsRef<str>,
+        S2: AsRef<str>,
+    {
+        Ok(self
+            .conn
+            .execute(
+                query("MATCH v=(Version {name:  $name, version: $version}) RETURN v LIMIT 1")
+                    .param("name", name.as_ref())
+                    .param("version", version.as_ref()),
+            )
+            .await?
+            .next()
+            .await
+            .unwrap()
+            .is_some())
+    }
+
+    ///
+    /// # Panics
+    ///
+    /// # Errors
+    ///
+    pub async fn set_unsafe<S1, S2>(
+        &self,
+        name: S1,
+        version: S2,
+        unsafe_result: &crate::analysis::CountUnsafeResult,
+    ) -> Result<(), Error>
+    where
+        S1: AsRef<str>,
+        S2: AsRef<str>,
+    {
+        if self
+            .conn
+            .execute(
+                query(
+                    "MATCH (v:Version {name:  $name, version: $version}) SET \
+                v.unsafe_total = $unsafe_total, \
+                v.unsafe_functions = $unsafe_functions, \
+                v.unsafe_exprs = $unsafe_exprs, \
+                v.unsafe_impls = $unsafe_impls, \
+                v.unsafe_traits = $unsafe_traits, \
+                v.unsafe_methods = $unsafe_methods, \
+                v.safe_functions = $safe_functions, \
+                v.safe_exprs = $safe_exprs, \
+                v.safe_impls = $safe_impls, \
+                v.safe_traits = $safe_traits, \
+                v.safe_methods = $safe_methods \
+                RETURN v",
+                )
+                .param("name", name.as_ref())
+                .param("version", version.as_ref())
+                .param("unsafe_total", unsafe_result.total_unsafe())
+                .param("unsafe_functions", unsafe_result.functions.unsafe_)
+                .param("unsafe_exprs", unsafe_result.exprs.unsafe_)
+                .param("unsafe_impls", unsafe_result.item_impls.unsafe_)
+                .param("unsafe_traits", unsafe_result.item_traits.unsafe_)
+                .param("unsafe_methods", unsafe_result.methods.unsafe_)
+                .param("safe_functions", unsafe_result.functions.safe)
+                .param("safe_exprs", unsafe_result.exprs.safe)
+                .param("safe_impls", unsafe_result.item_impls.safe)
+                .param("safe_traits", unsafe_result.item_traits.safe)
+                .param("safe_methods", unsafe_result.methods.safe),
+            )
+            .await?
+            .next()
+            .await?
+            .is_none()
+        {
+            Err(Error::CrateNotFound(name.as_ref().to_string()))
+        } else {
+            Ok(())
+        }
     }
 }

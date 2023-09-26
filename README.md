@@ -74,7 +74,7 @@ Note or change the default testing username/password.
 The first step is populating your neo4j database with the up-to-date crate index. This is pulled from the live
 crate index and populates the appropriate nodes and relationships. Crates, versions and dependency relationships 
 are populated at this step.
-- `cargo +nightly run -- create-fresh-db -d 127.0.0.1:7687 -u neo4j -p changeme123`
+- `cargo +nightly run --release -- create-fresh-db -d bolt://127.0.0.1:7687 -u neo4j -p changeme123`
 
 ## Run the analysis
 This will populate the database with all invocation relationships. These exist as a representation of a given 
@@ -82,8 +82,8 @@ version calling a given crate. We cannot definitively say what version of what c
 exists at `(Version)-[INVOKES]->(Crate)`
 - Extract all crate files to a working folder, where names are {crate}-{version}. This can be done with any number of tools
 in the ecosystem for mirroring. For this project we wrote [walterhpearce/crates-spider](https://github.com/walterhpearce/crates-spider.git)
-- `cargo +nightly run -- compile-all -s cargo_sources -b cargo_bytecodes`
-- `cargo +nightly run -- export-all-neo4j -s cargo_sources -b cargo_bytecodes -d 127.0.0.1:7687 -u neo4j -p changeme123` 
+- `cargo +nightly run --release -- compile-all -s cargo_sources -b cargo_bytecodes`
+- `cargo +nightly run --release -- export-all-neo4j -s cargo_sources -b cargo_bytecodes -d bolt://127.0.0.1:7687 -u neo4j -p changeme123` 
 
 ### Database 
 
