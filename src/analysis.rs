@@ -1,6 +1,5 @@
 use crate::{db::Db, Error, Roots};
-use llvm_ir::Module;
-use llvm_ir_analysis::ModuleAnalysis;
+use llvm_ir_analysis::{llvm_ir::Module, ModuleAnalysis};
 use rayon::prelude::*;
 use rustc_demangle::demangle;
 
@@ -65,6 +64,7 @@ pub async fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P, db: Arc<Db>) -> Re
     let crate_fullname = crate_bc_dir.as_ref().file_name().unwrap().to_str().unwrap();
 
     let (crate_name, crate_version) = crate_fullname.rsplit_once('-').unwrap();
+    log::trace!("Importing: {}", crate_name);
 
     for (caller, callee) in &calls {
         let dst_crate = callee.split_once("::").unwrap_or(("NONE", "")).0;

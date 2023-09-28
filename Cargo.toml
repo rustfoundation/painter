@@ -24,8 +24,7 @@ tokio = { version = "1.5.0", features = ["full"] }
 futures = "0.3"
 rayon = "1.7"
 
-llvm-ir = { path = "llvm-ir", features = ["llvm-14"] }
-llvm-ir-analysis = { path = "llvm-ir-analysis", features = ["llvm-14"] }
+llvm-ir-analysis = { path = "llvm-ir-analysis", features = ["llvm-15"] }
 rustc-demangle = "0.1"
 
 #Utility

@@ -63,7 +63,7 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CrateCache {
     src_crate_file: PathBuf,
     extracted_path: PathBuf,

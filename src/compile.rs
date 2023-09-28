@@ -70,7 +70,7 @@ pub fn clean(path: &Path) -> Result<(), Error> {
 fn compile_crate<P: AsRef<Path>>(
     name: &str,
     version: &str,
-    cache: &CrateCache,
+    src_path: P,
     bc_root: P,
 ) -> Result<(), Error> {
     let fullname = format!("{}-{}", &name, version);
@@ -83,7 +83,7 @@ fn compile_crate<P: AsRef<Path>>(
     // TODO: We should further limit optimizations and inlining to get an even better picture.
     let output = std::process::Command::new("cargo")
         .args([
-            "+1.60",
+            "+1.67",
             "rustc",
             "--release",
             "--",
@@ -92,7 +92,7 @@ fn compile_crate<P: AsRef<Path>>(
             "-C",
             "lto=off",
         ])
-        .current_dir(cache.path())
+        .current_dir(src_path.as_ref())
         .output()
         .unwrap();
 
@@ -103,7 +103,7 @@ fn compile_crate<P: AsRef<Path>>(
 
         // If the compile succeeded, search for emitted .bc files of bytecode and copy them over
         // to the Roots::bytecode_root directory.
-        WalkDir::new(cache.path())
+        WalkDir::new(src_path.as_ref())
             .into_iter()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some() && e.path().extension().unwrap() == "bc")
@@ -141,24 +141,26 @@ pub async fn compile_all<P: AsRef<Path> + Send + Sync>(
 
     let do_crate = |c: Crate, fs: Arc<Mutex<CrateFs>>, bc_root: PathBuf| {
         log::trace!("enter: {}", c.name());
-        for v in c.versions() {
-            let fullname = format!("{}-{}", c.name(), v.version());
-            log::trace!("Opening: {}", fullname);
+        //for v in c.versions() {
+        let v = c.latest_version();
 
-            let cache = {
-                let mut lock = fs.lock().unwrap();
-                if let Ok(entry) = lock.open(&fullname) {
-                    entry.clone()
-                } else {
-                    log::error!("Opening failed on {}", fullname);
-                    return;
-                }
-            };
+        let fullname = format!("{}-{}", c.name(), v.version());
+        log::trace!("Opening: {}", fullname);
 
-            if let Err(e) = compile_crate(c.name(), v.version(), &cache, &bc_root) {
-                log::error!("{:?}", e);
+        let cache = {
+            let mut lock = fs.lock().unwrap();
+            if let Ok(entry) = lock.open(&fullname) {
+                entry.path().to_path_buf()
+            } else {
+                log::error!("Opening failed on {}", fullname);
+                return;
             }
+        };
+
+        if let Err(e) = compile_crate(c.name(), v.version(), &cache, &bc_root) {
+            log::error!("{:?}", e);
         }
+        //}
     };
 
     index
