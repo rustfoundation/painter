@@ -1,6 +1,0 @@
-[submodule "llvm-ir-analysis"]
-	path = llvm-ir-analysis
-	url = https://github.com/walterhpearce/llvm-ir-analysis
-[submodule "llvm-ir"]
-	path = llvm-ir
-	url = https://github.com/walterhpearce/llvm-ir
