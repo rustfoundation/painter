@@ -88,9 +88,19 @@ pub async fn export_all_db<P: AsRef<Path>>(bc_root: P, db: Arc<Db>) -> Result<()
         .filter(|e| e.path().is_dir())
         .collect();
 
-    for crate_bc_dir in dirs {
-        export_crate_db(crate_bc_dir.path(), db.clone()).await?;
+    let iter = dirs.iter().array_chunks::<16>();
+    for chunk in iter {
+        let tasks: Vec<_> = chunk
+            .into_iter()
+            .map(|c| export_crate_db(c.path(), db.clone()))
+            .collect();
+
+        futures::future::join_all(tasks).await;
     }
+
+    //for crate_bc_dir in dirs {
+    //    ;
+    //}
 
     Ok(())
 }

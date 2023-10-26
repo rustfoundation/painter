@@ -86,6 +86,7 @@ fn compile_crate<P: AsRef<Path>>(
             "+1.67",
             "rustc",
             "--release",
+            "--lib",
             "--",
             "-g",
             "--emit=llvm-bc",
@@ -142,6 +143,7 @@ pub async fn compile_all<P: AsRef<Path> + Send + Sync>(
     let do_crate = |c: Crate, fs: Arc<Mutex<CrateFs>>, bc_root: PathBuf| {
         log::trace!("enter: {}", c.name());
         //for v in c.versions() {
+        // TODO: currently latest only
         let v = c.latest_version();
 
         let fullname = format!("{}-{}", c.name(), v.version());
