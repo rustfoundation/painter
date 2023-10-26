@@ -5,6 +5,11 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[[bin]]
+name = "painter"
+path = "src/main.rs"
+
+
 [features]
 default = ["neo4j"]
 neo4j = ["neo4rs"]
@@ -14,20 +19,13 @@ neo4j = ["neo4rs"]
 thiserror = "1.0"
 clap = { version = "4.1", features = ["derive"] }
 
-
 # async
 tokio = { version = "1.5.0", features = ["full"] }
 futures = "0.3"
 rayon = "1.7"
 
-llvm-ir = { path = "llvm-ir", features = ["llvm-14"] }
-llvm-ir-analysis = { path = "llvm-ir-analysis", features = ["llvm-14"] }
+llvm-ir-analysis = { path = "llvm-ir-analysis", features = ["llvm-15"] }
 rustc-demangle = "0.1"
-
-# POC requirements, not needed now
-#dot-structures = "0.1"
-#graphviz-rust = "0.6"
-#petgraph = "0.6"
 
 #Utility
 walkdir = "2.3"
@@ -40,8 +38,17 @@ semver = { version = "1.0" }
 lenient_semver = { version = "0.4" }
 
 # serialization
+serde = { version = "1", features = ["derive"]}
 toml = { version = "0.7" }
 csv = { version = "1.2" }
+serde_json = "1"
+
+# Compression
+flate2 = "1.0"
+tar = "0.4"
+
+# Data
+circular-buffer = "0.1"
 
 # Db
-neo4rs = { version="0.6", optional = true, required-features = ["neo4j"]}
+neo4rs = { version="0.6", optional = true }

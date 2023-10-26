@@ -14,9 +14,10 @@ services:
     environment:
       # Raise memory limits
       - NEO4J_AUTH=neo4j/changeme123
-      - NEO4J_dbms_memory_pagecache_size=1G
+      - NEO4J_server_memory_pagecache_size=1G
+      - NEO4J_dbms_memory_transaction_total_max=2G
       - NEO4J_dbms.memory_heap.initial_size=1G
-      - NEO4J_dbms_memory_heap_max__size=1G
+      - NEO4J_server_memory_heap_max__size=8G
       - NEO4J_apoc_export_file_enabled=true
       - NEO4J_apoc_import_file_enabled=true
       - NEO4J_apoc_import_file_use__neo4j__config=true
