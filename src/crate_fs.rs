@@ -67,6 +67,7 @@ where
 pub struct CrateCache {
     src_crate_file: PathBuf,
     extracted_path: PathBuf,
+    no_delete: bool,
 }
 impl CrateCache {
     pub fn new<P>(entry: &CrateEntry, crates_dir: P, sources_dir: P) -> Result<Self, Error>
@@ -75,6 +76,14 @@ impl CrateCache {
     {
         let src_crate_file = crates_dir.as_ref().join(entry.filename());
         let extracted_path = sources_dir.as_ref().join(entry.full_name()).clone();
+
+        if extracted_path.exists() {
+            return Ok(Self {
+                src_crate_file,
+                extracted_path,
+                no_delete: true,
+            });
+        }
 
         log::trace!(
             "Attempting extraction: {} -> {}",
@@ -94,6 +103,7 @@ impl CrateCache {
         Ok(Self {
             src_crate_file,
             extracted_path,
+            no_delete: false,
         })
     }
 
@@ -104,7 +114,9 @@ impl CrateCache {
 impl Drop for CrateCache {
     fn drop(&mut self) {
         log::trace!("dropping {:?}", self);
-        std::fs::remove_dir_all(&self.extracted_path).unwrap();
+        if !self.no_delete {
+            std::fs::remove_dir_all(&self.extracted_path).unwrap();
+        }
     }
 }
 

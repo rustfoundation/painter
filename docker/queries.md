@@ -37,3 +37,12 @@ MATCH (v:Version) REMOVE v.latest RETURN v
 
 # Top unsafe
 MATCH (v:Version) WHERE v.unsafe_total > 0 RETURN v.name, v.unsafe_total  ORDER BY v.unsafe_total DESC LIMIT 50
+
+# latest version
+MATCH (v:Version) WHERE (v.latest = true) RETURN (v) LIMIT 20
+
+# Latest unsafe totals
+MATCH (v:Version) WHERE (v.latest = true) AND (v.unsafe_total IS NOT NULL) AND (v.unsafe_total > 0) RETURN COUNT(v)
+
+# Transitive Unsafe
+MATCH (v:Version)[:DEPENDS_ON*]->(c:Crate) WHERE (v.latest = true) RETURN COUNT(v) LIMIT 100

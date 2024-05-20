@@ -396,6 +396,30 @@ impl Db {
     ///
     /// # Errors
     ///
+    pub async fn has_any_invoke<S1, S2>(&self, name: S1, version: S2) -> Result<bool, Error>
+    where
+        S1: AsRef<str>,
+        S2: AsRef<str>,
+    {
+        Ok(self
+            .conn
+            .execute(
+                query("MATCH (Version {name:  $name, version: $version })-[r:INVOKES]->() RETURN id(r) LIMIT 1")
+                    .param("name", name.as_ref())
+                    .param("version", version.as_ref()),
+            )
+            .await?
+            .next()
+            .await
+            .unwrap()
+            .is_some())
+    }
+
+    ///
+    /// # Panics
+    ///
+    /// # Errors
+    ///
     pub async fn set_latest<S1, S2>(&self, name: S1, version: S2) -> Result<(), Error>
     where
         S1: AsRef<str>,

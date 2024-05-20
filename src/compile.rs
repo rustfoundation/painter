@@ -48,6 +48,8 @@ pub fn clean(path: &Path) -> Result<(), Error> {
         .output()
         .unwrap();
 
+    std::fs::remove_dir_all(path.join("target"));
+
     if output.status.success() {
         Ok(())
     } else {
@@ -76,7 +78,7 @@ fn compile_crate<P: AsRef<Path>>(
     let fullname = format!("{}-{}", &name, version);
     let output_dir = bc_root.as_ref().join(&fullname);
 
-    log::debug!("Compiling: {} @ {}", &fullname, output_dir.display());
+    log::info!("Compiling: {} @ {}", &fullname, output_dir.display());
 
     // Build the crate with rustc, emitting llvm-bc. We also disable LTO to prevent some inlining
     // to gain better cross-crate function call introspection.
@@ -115,15 +117,17 @@ fn compile_crate<P: AsRef<Path>>(
                 }
                 std::fs::copy(e.path(), &dst).unwrap();
             });
+
+        clean(src_path.as_ref())?;
     } else {
+        clean(src_path.as_ref())?;
+
         return Err(Error::CompileFailed(format!(
             "{}\n-----------\n{}",
             std::str::from_utf8(&output.stdout).unwrap(),
             std::str::from_utf8(&output.stderr).unwrap()
         )));
     };
-
-    // clean(&cache.path())?;
 
     Ok(())
 }
@@ -148,6 +152,11 @@ pub async fn compile_all<P: AsRef<Path> + Send + Sync>(
 
         let fullname = format!("{}-{}", c.name(), v.version());
         log::trace!("Opening: {}", fullname);
+
+        if (bc_root.join(&fullname).exists()) {
+            log::info!("{} bytecode exists, skipping..", &fullname);
+            return;
+        }
 
         let cache = {
             let mut lock = fs.lock().unwrap();

@@ -64,6 +64,13 @@ pub async fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P, db: Arc<Db>) -> Re
     let crate_fullname = crate_bc_dir.as_ref().file_name().unwrap().to_str().unwrap();
 
     let (crate_name, crate_version) = crate_fullname.rsplit_once('-').unwrap();
+
+    // If this crate/version has an invoke, assume its completed and bail
+    if db.has_any_invoke(crate_name, crate_version).await? {
+        log::trace!("{}-{} Exists, skipping..", crate_name, crate_version);
+        return Ok(());
+    }
+
     log::trace!("Importing: {}", crate_name);
 
     for (caller, callee) in &calls {
@@ -138,7 +145,11 @@ impl CountUnsafeResult {
     }
 }
 
-pub(crate) async fn count_unsafe_crate(c: Crate, roots: Roots, db: Arc<Db>) -> Result<(), Error> {
+pub(crate) async fn count_unsafe_crate_extract(
+    c: Crate,
+    roots: Roots,
+    db: Arc<Db>,
+) -> Result<(), Error> {
     let compressed_root = &roots.compressed_root;
     let sources_root = &roots.sources_root;
 
@@ -173,8 +184,39 @@ pub(crate) async fn count_unsafe_crate(c: Crate, roots: Roots, db: Arc<Db>) -> R
                     }
 
                     // Finally delete
-                    std::fs::remove_dir_all(extracted_path).unwrap();
+                    //std::fs::remove_dir_all(extracted_path).unwrap();
                     log::trace!("Deleted {}", &crate_fullname);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+pub(crate) async fn count_unsafe_crate(c: Crate, roots: Roots, db: Arc<Db>) -> Result<(), Error> {
+    let compressed_root = &roots.compressed_root;
+    let sources_root = &roots.sources_root;
+
+    for v in c.versions() {
+        let crate_fullname = format!("{}-{}", v.name(), v.version());
+        let crate_path = sources_root.join(format!("{}", &crate_fullname));
+
+        // Lets work off the tgz for now, since we cant extract
+        // TODO: this needs to be unified to a file driver
+        if std::fs::metadata(&crate_path).is_ok() {
+            // Run our count
+            let output = std::process::Command::new("count-unsafe")
+                .args([&crate_path])
+                .output()
+                .unwrap();
+            if output.status.success() {
+                let raw_json = std::str::from_utf8(&output.stdout).unwrap();
+                log::trace!("{}", &raw_json);
+
+                let unsafe_result: CountUnsafeResult = serde_json::from_str(raw_json).unwrap();
+                if unsafe_result.has_unsafe() {
+                    log::debug!("{} unsafe", &crate_fullname);
+                    db.set_unsafe(v.name(), v.version(), &unsafe_result).await;
+                    //.unwrap();
                 }
             }
         }
