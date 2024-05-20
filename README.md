@@ -44,7 +44,7 @@ Relationships:
 ## Current Limitations
 - Only crates which can have a local build complete are currently imported. Work is underway to expand support, but this greatly limits us in cases such as local dependency requirements, custom build steps, etc.
 - We do not currently determine the version of a invoked callee
-- LTO and optimizers are disabled to prevent inlining, but many cases exist in which the invocation is lost at a bytecode level. Source analysis can improve this. Exmaples of cases where an invoke is likely lost:
+- LTO and optimizers are disabled to prevent inlining, but many cases exist in which the invocation is lost at a bytecode level. Source analysis can improve this. Examples of cases where an invoke is likely lost:
     - Dynamic function calls (pointers, vtables, etc.)
     - Inlining
 
