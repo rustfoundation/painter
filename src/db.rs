@@ -153,7 +153,7 @@ impl Db {
                 query(
                     "MERGE (crate:Crate { name: $name }) 
                      CREATE (version:Version {name: $name, version: $version, semver_major: toInteger($semver_major), semver_minor: toInteger($semver_minor), semver_patch: toInteger($semver_patch), semver_build: $semver_build, semver_pre: $semver_pre })
-                     CREATE (version)-[:VERSION_OF]->(crate)
+                     CREATE (version)<-[:VERSION_OF]-(crate)
                      RETURN version",
                 )
                 .param("name", name)

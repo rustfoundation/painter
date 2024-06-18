@@ -136,6 +136,7 @@ fn compile_crate<P: AsRef<Path>>(
 pub async fn compile_all<P: AsRef<Path> + Send + Sync>(
     mut fs: CrateFs,
     bc_root: P,
+    update_only: bool,
 ) -> Result<(), Error> {
     use rayon::iter::ParallelIterator;
 
@@ -148,12 +149,12 @@ pub async fn compile_all<P: AsRef<Path> + Send + Sync>(
         log::trace!("enter: {}", c.name());
         //for v in c.versions() {
         // TODO: currently latest only
-        let v = c.latest_version();
+        let v = c.highest_version();
 
         let fullname = format!("{}-{}", c.name(), v.version());
         log::trace!("Opening: {}", fullname);
 
-        if (bc_root.join(&fullname).exists()) {
+        if update_only && bc_root.join(&fullname).exists() {
             log::info!("{} bytecode exists, skipping..", &fullname);
             return;
         }

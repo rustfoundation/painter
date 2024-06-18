@@ -90,7 +90,9 @@ pub async fn update_missing_crates(conn: Arc<Db>) -> Result<(), Error> {
 /// # Errors
 ///
 pub async fn insert_fresh_crate(c: Crate, db: Arc<Db>) -> Result<(), Error> {
+    log::trace!("+Crate({})", c.name());
     for v in c.versions() {
+        log::trace!("+Crate({}),Version({})", c.name(), v.version());
         let depends: Vec<_> = v
             .dependencies()
             .iter()

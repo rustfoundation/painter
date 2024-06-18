@@ -1,7 +1,9 @@
 #![deny(clippy::all, clippy::pedantic)]
 #![allow(clippy::enum_variant_names)]
+
 #![feature(string_remove_matches)]
 #![feature(iter_array_chunks)]
+
 mod analysis;
 mod compile;
 mod crate_fs;
@@ -90,6 +92,8 @@ enum Command {
     },
     /// Compile all crates found within the source tree.
     CompileAll {
+        #[arg(long, short = 'u', default_value = "true")]
+        update_only: bool,
         #[command(flatten)]
         roots: Roots,
     },
@@ -205,10 +209,14 @@ async fn main() -> Result<(), Error> {
             // let sources = roots.get_crate_sources()?;
             //compile_crate(&sources[&crate_fullname], roots.bytecodes_root.unwrap())?;
         }
-        Command::CompileAll { roots } => {
-            compile::compile_all(cratefs_from_roots(&roots)?, roots.bytecodes_root.unwrap())
-                .await
-                .unwrap();
+        Command::CompileAll { update_only, roots } => {
+            compile::compile_all(
+                cratefs_from_roots(&roots)?,
+                roots.bytecodes_root.unwrap(),
+                update_only,
+            )
+            .await
+            .unwrap();
         }
         Command::CountUnsafe {
             roots,

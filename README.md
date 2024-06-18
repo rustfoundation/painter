@@ -83,8 +83,8 @@ exists at `(Version)-[INVOKES]->(Crate)`
 - Extract all crate files to a working folder, where names are {crate}-{version}. This can be done with any number of tools
 in the ecosystem for mirroring. For this project we wrote [walterhpearce/crates-spider](https://github.com/walterhpearce/crates-spider.git)
 - `cargo +nightly run --release -- compile-all -s cargo_sources -b cargo_bytecodes`
-- `cargo +nightly run --release -- export-all-neo4j -s cargo_sources -b cargo_bytecodes -d bolt://127.0.0.1:7687 -u neo4j -p changeme123` 
-- `cargo +nightly run --release -- count-unsafe -s /storage/crates/sources -c /storage/crates/crates -d bolt://127.0.0.1:7687 -u neo4j -p changeme123`
+- `cargo +nightly run --release -- export-all-neo4j -s /storage/crates/sources -b cargo_bytecodes -d bolt://127.0.0.1:7687 -u neo4j -p changeme123` 
+- `cargo +nightly run --release -- count-unsafe -s cargo_sources -c cargo_crates -d bolt://127.0.0.1:7687 -u neo4j -p changeme123`
 ### Database 
 
 Current `crates.io` graph snapshot: *Coming Soon*
