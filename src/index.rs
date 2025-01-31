@@ -122,7 +122,7 @@ pub async fn insert_fresh_crate(c: Crate, db: Arc<Db>) -> Result<(), Error> {
 pub async fn create_fresh_db(conn: Arc<Db>) -> Result<(), Error> {
     let index = crates_index::Index::new_cargo_default()?;
 
-    let iter = index.crates().array_chunks::<12>();
+    let iter = index.crates().array_chunks::<64>();
     for chunk in iter {
         let tasks: Vec<_> = chunk
             .into_iter()
@@ -148,7 +148,7 @@ pub async fn set_latest_versions(conn: Arc<Db>) -> Result<(), Error> {
         db.set_latest(c.name(), latest.version()).await;
     };
 
-    let iter = index.crates().array_chunks::<128>();
+    let iter = index.crates().array_chunks::<64>();
     for chunk in iter {
         let tasks: Vec<_> = chunk
             .into_iter()

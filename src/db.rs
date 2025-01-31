@@ -311,7 +311,7 @@ impl Db {
                      semver_patch: toInteger($semver_patch), 
                      semver_build: $semver_build, 
                      semver_pre: $semver_pre })
-                     MERGE (version)-[:VERSION_OF]->(crate)
+                     MERGE (version)<-[:VERSION_OF]-(crate)
                      RETURN version",
                     )
                     .param("name", name)
