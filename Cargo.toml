@@ -9,6 +9,9 @@ edition = "2021"
 name = "painter"
 path = "src/main.rs"
 
+[lib]
+name = "libpainter"
+path = "src/lib.rs"
 
 [features]
 default = ["neo4j"]
