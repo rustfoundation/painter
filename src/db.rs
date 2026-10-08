@@ -92,10 +92,15 @@ impl Db {
         Ok(())
     }
 
-    /// Insert every invocation of one crate version in a single write query, so a version's
-    /// `[:INVOKES]` edges are either all committed or none are. Each entry of `calls` is
+    /// Replace every invocation of one crate version in a single write query. Any `[:INVOKES]`
+    /// edges the version already has are deleted and the new ones created in the same
+    /// transaction, so re-importing a version never duplicates edges and the version's invoke
+    /// graph is either fully replaced or untouched. Each entry of `calls` is
     /// `(caller, callee, callee_crate)`. Callee crates that do not exist as `(Crate)` nodes are
     /// skipped by the `MATCH`.
+    ///
+    /// An empty `calls` still wipes the existing edges, so a version that no longer has any
+    /// cross-crate calls ends up with none.
     ///
     /// `(Version)-[:INVOKES { callsite, target }]->(Crate)`
     ///
@@ -107,7 +112,7 @@ impl Db {
         calls: &[(String, String, String)],
     ) -> Result<(), Error> {
         if calls.is_empty() {
-            return Ok(());
+            return self.delete_invokes(src_crate.0, src_crate.1).await;
         }
 
         // neo4rs 0.6 does not expose its map type, so send three parallel lists and index them.
@@ -119,6 +124,9 @@ impl Db {
             .run(
                 query(
                     "MATCH (srcVersion:Version { name: $src_crate, version: $src_version })
+                     OPTIONAL MATCH (srcVersion)-[old:INVOKES]->()
+                     DELETE old
+                     WITH DISTINCT srcVersion
                      UNWIND range(0, size($callers) - 1) AS i
                      MATCH (dstCrate:Crate { name: $dsts[i] })
                      CREATE (srcVersion)-[:INVOKES { callsite: $callers[i], target: $callees[i] }]->(dstCrate)",
@@ -431,6 +439,26 @@ impl Db {
             .await
             .unwrap()
             .is_some())
+    }
+
+    /// Delete every `[:INVOKES]` edge of one crate version, leaving the `(Version)` node and all
+    /// other relationships in place.
+    ///
+    /// # Errors
+    /// This function will return an `painter::db::Error` in the event of a database error.
+    pub async fn delete_invokes<S1, S2>(&self, name: S1, version: S2) -> Result<(), Error>
+    where
+        S1: AsRef<str>,
+        S2: AsRef<str>,
+    {
+        self.conn
+            .run(
+                query("MATCH (:Version { name: $name, version: $version })-[r:INVOKES]->() DELETE r")
+                    .param("name", name.as_ref())
+                    .param("version", version.as_ref()),
+            )
+            .await?;
+        Ok(())
     }
 
     ///

@@ -104,10 +104,10 @@ pub async fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P, db: Arc<Db>) -> Re
     let (crate_name, crate_version) = crate::crate_fs::split_full_name(crate_fullname)
         .ok_or_else(|| Error::CrateNameError(crate_fullname.to_string()))?;
 
-    // If this crate/version has an invoke, assume its completed and bail
+    // A re-import replaces the version's whole invoke graph: `insert_invokes` deletes the
+    // existing `[:INVOKES]` edges and creates the new ones in one transaction.
     if db.has_any_invoke(crate_name, crate_version).await? {
-        log::trace!("{}-{} Exists, skipping..", crate_name, crate_version);
-        return Ok(());
+        log::info!("{}: replacing existing invoke graph", crate_fullname);
     }
 
     log::trace!("Importing: {}", crate_name);
