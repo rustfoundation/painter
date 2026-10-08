@@ -1,0 +1,423 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel-2: #1f232c;
+  --border: #2a2f3a;
+  --text: #e6e8ee;
+  --muted: #8b93a7;
+  --accent: #4c8dff;
+  --danger: #e5484d;
+  --ok: #2bb673;
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    sans-serif;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* ---------- toolbar ---------- */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.search {
+  position: relative;
+  min-width: 280px;
+}
+
+.search input {
+  width: 100%;
+}
+
+.suggestions {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  margin: 2px 0 0;
+  padding: 4px 0;
+  list-style: none;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  max-height: 320px;
+  overflow: auto;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.suggestions li {
+  padding: 5px 10px;
+  cursor: pointer;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.suggestions li:hover,
+.suggestions li.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+input[type='text'],
+input[type='number'],
+select,
+textarea {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: inherit;
+}
+
+input[type='text']:focus,
+input[type='number']:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+input.limit {
+  width: 70px;
+  margin-left: 4px;
+}
+
+button {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 12px;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+button.danger {
+  color: var(--danger);
+}
+
+button.danger:hover:not(:disabled) {
+  border-color: var(--danger);
+}
+
+label.opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.spacer {
+  flex: 1;
+}
+
+/* ---------- main area ---------- */
+.main {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.canvas {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  background: radial-gradient(circle at 50% 50%, #151924 0%, var(--bg) 70%);
+}
+
+.canvas > div {
+  position: absolute;
+  inset: 0;
+}
+
+.empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  pointer-events: none;
+  z-index: 1;
+  padding: 0 20%;
+}
+
+.empty h1 {
+  font-weight: 500;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.sidebar {
+  width: 340px;
+  border-left: 1px solid var(--border);
+  background: var(--panel);
+  overflow: auto;
+}
+
+.details {
+  padding: 12px 14px;
+}
+
+.details h2 {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0 0 10px;
+  word-break: break-all;
+}
+
+.details h3 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin: 16px 0 6px;
+}
+
+.badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--panel-2);
+  color: var(--muted);
+  vertical-align: middle;
+}
+
+.badge.crate {
+  background: #4c8dff33;
+  color: #9cc0ff;
+}
+
+.badge.version {
+  background: #f5a62333;
+  color: #ffd38a;
+}
+
+.badge.rel {
+  background: #e5484d33;
+  color: #ff9a9d;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.actions button {
+  padding: 4px 9px;
+}
+
+table.props {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+table.props th,
+table.props td {
+  text-align: left;
+  padding: 3px 4px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  word-break: break-word;
+}
+
+table.props th {
+  color: var(--muted);
+  font-weight: 500;
+  width: 38%;
+}
+
+ul.targets {
+  margin: 0;
+  padding-left: 16px;
+}
+
+ul.targets code {
+  font-size: 11px;
+  word-break: break-all;
+}
+
+ul.legend {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+ul.legend li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.line {
+  width: 22px;
+  height: 3px;
+  display: inline-block;
+  border-radius: 2px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.small {
+  font-size: 11px;
+}
+
+/* ---------- cypher ---------- */
+.cypher {
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+}
+
+.cypher-header {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 6px 12px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.cypher-body {
+  padding: 0 12px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cypher-body textarea {
+  width: 100%;
+  min-height: 110px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  resize: vertical;
+}
+
+.cypher-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.rows {
+  max-height: 200px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.rows table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+}
+
+.rows th,
+.rows td {
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.rows th {
+  position: sticky;
+  top: 0;
+  background: var(--panel-2);
+}
+
+/* ---------- status bar ---------- */
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 12px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+
+.statusbar .dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--danger);
+}
+
+.statusbar .dot.ok {
+  background: var(--ok);
+}
+
+.statusbar .sep {
+  width: 1px;
+  height: 14px;
+  background: var(--border);
+}
+
+.statusbar .error {
+  color: var(--danger);
+  max-width: 50%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
