@@ -6,7 +6,48 @@ use rustc_demangle::demangle;
 use crates_index::Crate;
 use std::{io::Write, path::Path, sync::Arc};
 
-const BLOCKED_STRINGS: &[&str] = &["llvm.", "__rust", "rt::", "std::", "core::", "alloc::"];
+/// Callee crates that are never recorded as invocations: the standard library family and
+/// compiler/runtime intrinsics.
+const BLOCKED_CRATES: &[&str] = &["core", "std", "alloc"];
+
+/// Determine the crate a demangled Rust symbol belongs to: the first identifier that is
+/// immediately followed by `::`. Handles trait-impl paths such as
+/// `<serde::de::X as core::fmt::Display>::fmt` (gives `serde`) and
+/// `<&T as serde::Serialize>::serialize` (gives `serde`). Returns `None` for symbols without a
+/// path (e.g. `__rust_alloc`, `llvm.memcpy.p0.i64`).
+#[must_use]
+pub fn crate_of(demangled: &str) -> Option<&str> {
+    let bytes = demangled.as_bytes();
+    let mut start = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        let is_ident = b.is_ascii_alphanumeric() || b == b'_';
+        match (start, is_ident) {
+            (None, true) => start = Some(i),
+            (Some(st), false) => {
+                if bytes[i..].starts_with(b"::") {
+                    return Some(&demangled[st..i]);
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether a demangled callee should be recorded as a cross-crate invocation.
+#[must_use]
+pub fn callee_crate(demangled: &str) -> Option<&str> {
+    if demangled.starts_with("llvm.") || demangled.starts_with("__rust") {
+        return None;
+    }
+    let c = crate_of(demangled)?;
+    if BLOCKED_CRATES.contains(&c) {
+        None
+    } else {
+        Some(c)
+    }
+}
 
 /// Extract all function calls/invocations within a bytecode file. Returns a `Vec<(String,String)>`
 /// of (caller, callee) demangled function names.
@@ -38,10 +79,7 @@ pub fn extract_calls<P: AsRef<Path>>(crate_bc_dir: P) -> Result<Vec<(String, Str
             let src = format!("{:#}", demangle(src_raw));
             let dst = format!("{:#}", demangle(dst_raw));
 
-            if !BLOCKED_STRINGS
-                .iter()
-                .any(|s| src.contains(*s) || dst.contains(*s))
-            {
+            if callee_crate(&dst).is_some() {
                 calls.push((src, dst));
             }
         });
@@ -63,7 +101,8 @@ pub async fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P, db: Arc<Db>) -> Re
     let calls = extract_calls(&crate_bc_dir)?;
     let crate_fullname = crate_bc_dir.as_ref().file_name().unwrap().to_str().unwrap();
 
-    let (crate_name, crate_version) = crate_fullname.rsplit_once('-').unwrap();
+    let (crate_name, crate_version) = crate::crate_fs::split_full_name(crate_fullname)
+        .ok_or_else(|| Error::CrateNameError(crate_fullname.to_string()))?;
 
     // If this crate/version has an invoke, assume its completed and bail
     if db.has_any_invoke(crate_name, crate_version).await? {
@@ -73,11 +112,17 @@ pub async fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P, db: Arc<Db>) -> Re
 
     log::trace!("Importing: {}", crate_name);
 
-    for (caller, callee) in &calls {
-        let dst_crate = callee.split_once("::").unwrap_or(("NONE", "")).0;
-        db.insert_invoke(caller, callee, (crate_name, crate_version), dst_crate)
-            .await?;
-    }
+    // `extract_calls` only keeps callees with a recordable crate.
+    let rows: Vec<(String, String, String)> = calls
+        .into_iter()
+        .filter_map(|(caller, callee)| {
+            let dst = callee_crate(&callee)?.to_string();
+            Some((caller, callee, dst))
+        })
+        .collect();
+
+    db.insert_invokes((crate_name, crate_version), &rows).await?;
+    log::info!("{}: imported {} invocations", crate_fullname, rows.len());
 
     Ok(())
 }
@@ -95,19 +140,24 @@ pub async fn export_all_db<P: AsRef<Path>>(bc_root: P, db: Arc<Db>) -> Result<()
         .filter(|e| e.path().is_dir())
         .collect();
 
-    let iter = dirs.iter().array_chunks::<16>();
-    for chunk in iter {
+    let mut failures = 0usize;
+    for chunk in crate::chunked(dirs.iter(), 16) {
         let tasks: Vec<_> = chunk
-            .into_iter()
+            .iter()
             .map(|c| export_crate_db(c.path(), db.clone()))
             .collect();
 
-        futures::future::join_all(tasks).await;
+        for (dir, result) in chunk.iter().zip(futures::future::join_all(tasks).await) {
+            if let Err(e) = result {
+                failures += 1;
+                log::error!("{}: export failed: {}", dir.path().display(), e);
+            }
+        }
     }
 
-    //for crate_bc_dir in dirs {
-    //    ;
-    //}
+    if failures > 0 {
+        log::error!("{failures} crate version(s) failed to export");
+    }
 
     Ok(())
 }
@@ -145,7 +195,7 @@ impl CountUnsafeResult {
     }
 }
 
-pub(crate) async fn count_unsafe_crate_extract(
+pub async fn count_unsafe_crate_extract(
     c: Crate,
     roots: Roots,
     db: Arc<Db>,
@@ -179,8 +229,9 @@ pub(crate) async fn count_unsafe_crate_extract(
                     let unsafe_result: CountUnsafeResult = serde_json::from_str(raw_json).unwrap();
                     if unsafe_result.has_unsafe() {
                         log::debug!("{} unsafe", &crate_fullname);
-                        db.set_unsafe(v.name(), v.version(), &unsafe_result).await;
-                        //.unwrap();
+                        if let Err(e) = db.set_unsafe(v.name(), v.version(), &unsafe_result).await {
+                            log::error!("set_unsafe failed for {}: {}", &crate_fullname, e);
+                        }
                     }
 
                     // Finally delete
@@ -192,8 +243,7 @@ pub(crate) async fn count_unsafe_crate_extract(
     }
     Ok(())
 }
-pub(crate) async fn count_unsafe_crate(c: Crate, roots: Roots, db: Arc<Db>) -> Result<(), Error> {
-    let compressed_root = &roots.compressed_root;
+pub async fn count_unsafe_crate(c: Crate, roots: Roots, db: Arc<Db>) -> Result<(), Error> {
     let sources_root = &roots.sources_root;
 
     for v in c.versions() {
@@ -215,8 +265,9 @@ pub(crate) async fn count_unsafe_crate(c: Crate, roots: Roots, db: Arc<Db>) -> R
                 let unsafe_result: CountUnsafeResult = serde_json::from_str(raw_json).unwrap();
                 if unsafe_result.has_unsafe() {
                     log::debug!("{} unsafe", &crate_fullname);
-                    db.set_unsafe(v.name(), v.version(), &unsafe_result).await;
-                    //.unwrap();
+                    if let Err(e) = db.set_unsafe(v.name(), v.version(), &unsafe_result).await {
+                        log::error!("set_unsafe failed for {}: {}", &crate_fullname, e);
+                    }
                 }
             }
         }
@@ -224,10 +275,10 @@ pub(crate) async fn count_unsafe_crate(c: Crate, roots: Roots, db: Arc<Db>) -> R
     Ok(())
 }
 
-pub(crate) async fn count_unsafe(roots: &Roots, db: Arc<Db>) -> Result<(), Error> {
-    let index = crates_index::Index::new_cargo_default().map_err(crate::index::Error::from)?;
+pub async fn count_unsafe(roots: &Roots, db: Arc<Db>) -> Result<(), Error> {
+    let index = crate::index::open_index().map_err(crate::index::Error::from)?;
 
-    let iter = index.crates().array_chunks::<128>();
+    let iter = crate::chunked(index.crates(), 128);
     for chunk in iter {
         let tasks: Vec<_> = chunk
             .into_iter()
@@ -272,4 +323,34 @@ fn export_all_csv<P: AsRef<Path>>(bc_root: P) -> Result<(), Error> {
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crate_of_handles_plain_and_trait_impl_paths() {
+        assert_eq!(crate_of("serde::de::Deserialize::deserialize"), Some("serde"));
+        assert_eq!(
+            crate_of("<serde::de::WithDecimalPoint as core::fmt::Display>::fmt"),
+            Some("serde")
+        );
+        assert_eq!(crate_of("<&T as serde::Serialize>::serialize"), Some("serde"));
+        assert_eq!(crate_of("<[u8] as core::fmt::Debug>::fmt"), Some("core"));
+        assert_eq!(crate_of("alloc::vec::Vec<T>::push"), Some("alloc"));
+        assert_eq!(crate_of("__rust_alloc"), None);
+        assert_eq!(crate_of("llvm.memcpy.p0.i64"), None);
+    }
+
+    #[test]
+    fn callee_crate_blocks_std_family_and_intrinsics() {
+        assert_eq!(callee_crate("core::fmt::Write::write_char"), None);
+        assert_eq!(callee_crate("std::io::Write::write"), None);
+        assert_eq!(callee_crate("<alloc::string::String as core::fmt::Write>::write_str"), None);
+        assert_eq!(callee_crate("llvm.memset.p0.i64"), None);
+        assert_eq!(callee_crate("__rust_dealloc"), None);
+        assert_eq!(callee_crate("serde_json::ser::to_string"), Some("serde_json"));
+        assert_eq!(callee_crate("<T as serde::Serialize>::serialize"), Some("serde"));
+    }
 }

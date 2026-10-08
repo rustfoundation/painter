@@ -1,9 +1,6 @@
 #![allow(clippy::module_name_repetitions)]
 use circular_buffer::CircularBuffer;
-use std::{
-    path::{Path, PathBuf},
-    sync::Mutex,
-};
+use std::path::{Path, PathBuf};
 
 /// Top error type returned during any stage of analysis from compile to data import.
 #[derive(thiserror::Error, Debug)]
@@ -26,34 +23,101 @@ pub enum Error {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CrateEntry {
-    pub full_name: String,
+    name: String,
+    version: String,
 }
 impl CrateEntry {
+    /// Build an entry from a `<name>-<version>` string. Both crate names and versions may
+    /// contain `-` (e.g. `serde-1.0.172-alpha.0`), so the split is chosen as the right-most `-`
+    /// whose right-hand side parses as a semver version.
+    ///
+    /// # Errors
+    /// Returns `Error::CrateNameError` if no such split exists.
     pub fn new(full_name: String) -> Result<Self, Error> {
-        let (_, _) = full_name
-            .rsplit_once('-')
-            .ok_or(Error::CrateNameError(full_name.clone()))?;
-
-        // TODO: Semver check valid here
-
-        Ok(Self { full_name })
-    }
-    pub fn full_name(&self) -> &str {
-        &self.full_name
+        let (name, version) = split_full_name(&full_name)
+            .ok_or_else(|| Error::CrateNameError(full_name.clone()))?;
+        Ok(Self {
+            name: name.to_string(),
+            version: version.to_string(),
+        })
     }
 
+    /// Build an entry from an already-separated name and version (e.g. from the index).
+    #[must_use]
+    pub fn from_parts(name: &str, version: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            version: version.to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn full_name(&self) -> String {
+        format!("{}-{}", self.name, self.version)
+    }
+
+    #[must_use]
     pub fn name(&self) -> &str {
-        self.full_name.rsplit_once('-').unwrap().0
+        &self.name
     }
 
+    #[must_use]
     pub fn version(&self) -> &str {
-        self.full_name.rsplit_once('-').unwrap().1
+        &self.version
     }
 
     pub fn filename(&self) -> String {
         format!("{}.crate", self.full_name())
     }
+
+    /// Candidate locations of this crate's `.crate` file under `crates_dir`, most specific
+    /// first. Supports the crates.io-index style sharded layout
+    /// (`1/<n>`, `2/<n>`, `3/<c>/<n>`, `<ab>/<cd>/<n>`) with the crate name as the leaf
+    /// directory, the same layout without the name directory, and a flat directory.
+    pub fn candidate_paths(&self, crates_dir: &Path) -> Vec<PathBuf> {
+        let name = self.name().to_ascii_lowercase();
+        let file = self.filename();
+        let shard: PathBuf = match name.len() {
+            0 => PathBuf::new(),
+            1 => PathBuf::from("1"),
+            2 => PathBuf::from("2"),
+            3 => Path::new("3").join(&name[..1]),
+            _ => Path::new(&name[..2]).join(&name[2..4]),
+        };
+
+        vec![
+            crates_dir.join(&shard).join(&name).join(&file),
+            crates_dir.join(&shard).join(&file),
+            crates_dir.join(&file),
+        ]
+    }
+
+    /// Locate this crate's `.crate` file under `crates_dir`.
+    ///
+    /// # Errors
+    /// Returns `Error::CrateFileNotFound` if none of the candidate layouts contain the file.
+    pub fn locate(&self, crates_dir: &Path) -> Result<PathBuf, Error> {
+        self.candidate_paths(crates_dir)
+            .into_iter()
+            .find(|p| p.is_file())
+            .ok_or(Error::CrateFileNotFound)
+    }
 }
+/// Split `<name>-<version>` at the right-most `-` whose remainder is a valid (lenient) semver.
+#[must_use]
+pub fn split_full_name(full_name: &str) -> Option<(&str, &str)> {
+    full_name
+        .char_indices()
+        .filter(|(_, c)| *c == '-')
+        .map(|(i, _)| (&full_name[..i], &full_name[i + 1..]))
+        .rev()
+        .find(|(name, version)| {
+            !name.is_empty()
+                && version.starts_with(|c: char| c.is_ascii_digit())
+                && lenient_semver::parse(version).is_ok()
+        })
+}
+
 impl<S> From<S> for CrateEntry
 where
     S: AsRef<str>,
@@ -65,7 +129,6 @@ where
 
 #[derive(Debug)]
 pub struct CrateCache {
-    src_crate_file: PathBuf,
     extracted_path: PathBuf,
     no_delete: bool,
 }
@@ -74,16 +137,16 @@ impl CrateCache {
     where
         P: AsRef<Path>,
     {
-        let src_crate_file = crates_dir.as_ref().join(entry.filename());
         let extracted_path = sources_dir.as_ref().join(entry.full_name()).clone();
 
         if extracted_path.exists() {
             return Ok(Self {
-                src_crate_file,
                 extracted_path,
                 no_delete: true,
             });
         }
+
+        let src_crate_file = entry.locate(crates_dir.as_ref())?;
 
         log::trace!(
             "Attempting extraction: {} -> {}",
@@ -101,7 +164,6 @@ impl CrateCache {
         }
 
         Ok(Self {
-            src_crate_file,
             extracted_path,
             no_delete: false,
         })
@@ -146,17 +208,17 @@ impl CrateFsConfig {
 
 pub struct CrateFs {
     cache: Box<CircularBuffer<1024, (CrateEntry, CrateCache)>>,
-    index: crates_index::Index,
     config: CrateFsConfig,
 }
 impl CrateFs {
+    /// Create an empty cache over the configured crate and extraction directories.
+    ///
+    /// # Errors
+    /// Currently infallible; returns `Result` so callers do not change when validation is added.
     pub fn new(config: CrateFsConfig) -> Result<Self, Error> {
-        let index = crates_index::Index::new_cargo_default()?;
-
         Ok(Self {
             cache: CircularBuffer::boxed(),
             config,
-            index,
         })
     }
 
@@ -182,19 +244,18 @@ impl CrateFs {
 
     pub fn open<S: AsRef<str>>(&mut self, fullname: S) -> Result<&CrateCache, Error> {
         let entry = CrateEntry::new(fullname.as_ref().to_string())?;
+        self.open_entry(entry)
+    }
 
+    /// Open (extracting if needed) the crate described by `entry`.
+    ///
+    /// # Errors
+    /// Returns `Error::CrateFileNotFound` if the `.crate` file is missing, or an extraction
+    /// error.
+    pub fn open_entry(&mut self, entry: CrateEntry) -> Result<&CrateCache, Error> {
         if let Some(index) = self.find_cache_index(&entry) {
             Ok(&self.cache.get(index).ok_or(Error::CrateNotFound)?.1)
         } else {
-            // Check that we have the crate file
-            let cratefile_path = self
-                .config
-                .crates_path
-                .join(format!("{}.crate", entry.full_name()));
-            if !cratefile_path.exists() {
-                return Err(Error::CrateFileNotFound);
-            }
-
             // Check we have capcity, otherwise purge the front entry
 
             let cache_entry =
@@ -214,8 +275,26 @@ impl CrateFs {
 mod tests {
     use super::*;
 
-    fn init_logging() {
-        // capture log messages with test harness
-        let _ = env_logger::builder().is_test(true).try_init();
+    #[test]
+    fn splits_plain_and_prerelease_names() {
+        assert_eq!(split_full_name("serde-1.0.0"), Some(("serde", "1.0.0")));
+        assert_eq!(
+            split_full_name("serde-1.0.172-alpha.0"),
+            Some(("serde", "1.0.172-alpha.0"))
+        );
+        assert_eq!(split_full_name("serde-0.9.0-rc4"), Some(("serde", "0.9.0-rc4")));
+        assert_eq!(split_full_name("foo-2d-1.0.0"), Some(("foo-2d", "1.0.0")));
+        assert_eq!(split_full_name("nodash"), None);
+        assert_eq!(split_full_name("-1.0.0"), None);
+    }
+
+    #[test]
+    fn candidate_paths_follow_index_sharding() {
+        let root = Path::new("/r");
+        let first = |n: &str| CrateEntry::from_parts(n, "1.0.0").candidate_paths(root)[0].clone();
+        assert_eq!(first("s"), root.join("1/s/s-1.0.0.crate"));
+        assert_eq!(first("ab"), root.join("2/ab/ab-1.0.0.crate"));
+        assert_eq!(first("abc"), root.join("3/a/abc/abc-1.0.0.crate"));
+        assert_eq!(first("serde"), root.join("se/rd/serde/serde-1.0.0.crate"));
     }
 }

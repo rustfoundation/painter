@@ -92,6 +92,48 @@ impl Db {
         Ok(())
     }
 
+    /// Insert every invocation of one crate version in a single write query, so a version's
+    /// `[:INVOKES]` edges are either all committed or none are. Each entry of `calls` is
+    /// `(caller, callee, callee_crate)`. Callee crates that do not exist as `(Crate)` nodes are
+    /// skipped by the `MATCH`.
+    ///
+    /// `(Version)-[:INVOKES { callsite, target }]->(Crate)`
+    ///
+    /// # Errors
+    /// This function will return an `painter::db::Error` in the event of a database error.
+    pub async fn insert_invokes(
+        &self,
+        src_crate: (&str, &str),
+        calls: &[(String, String, String)],
+    ) -> Result<(), Error> {
+        if calls.is_empty() {
+            return Ok(());
+        }
+
+        // neo4rs 0.6 does not expose its map type, so send three parallel lists and index them.
+        let callers: Vec<&str> = calls.iter().map(|c| c.0.as_str()).collect();
+        let callees: Vec<&str> = calls.iter().map(|c| c.1.as_str()).collect();
+        let dsts: Vec<&str> = calls.iter().map(|c| c.2.as_str()).collect();
+
+        self.conn
+            .run(
+                query(
+                    "MATCH (srcVersion:Version { name: $src_crate, version: $src_version })
+                     UNWIND range(0, size($callers) - 1) AS i
+                     MATCH (dstCrate:Crate { name: $dsts[i] })
+                     CREATE (srcVersion)-[:INVOKES { callsite: $callers[i], target: $callees[i] }]->(dstCrate)",
+                )
+                .param("src_crate", src_crate.0)
+                .param("src_version", src_crate.1)
+                .param("callers", callers)
+                .param("callees", callees)
+                .param("dsts", dsts),
+            )
+            .await?;
+
+        Ok(())
+    }
+
     /// Insert a new version of a crate into the database. This will create a new `(Version)` node,
     /// linking it to its associated top-level `(Crate)` node. If that node does not exist, it is created.
     ///
@@ -225,7 +267,7 @@ impl Db {
             .execute(
                 query(
                     "MATCH (srcVersion:Version { name: $src_crate, version: $src_version }) 
-                        MATCH (dstCrate:Crate { name: dst_crate }) 
+                        MATCH (dstCrate:Crate { name: $dst_crate }) 
                         MERGE (srcVersion)-[:INVOKES {caller: $caller, callee: $callee}]->(dstCrate)
                     ",
                 )
