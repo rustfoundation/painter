@@ -1,26 +1,19 @@
 #![deny(clippy::all, clippy::pedantic)]
-#![allow(clippy::enum_variant_names)]
-#![feature(string_remove_matches)]
-#![feature(iter_array_chunks)]
-
-mod analysis;
-mod compile;
-mod crate_fs;
-mod db;
-mod index;
-
-mod error;
 
 use clap::{Parser, Subcommand};
-use crate_fs::{CrateFs, CrateFsConfig};
-use db::Db;
+use libpainter::{
+    analysis, compile,
+    db::Db,
+    ecosystems::EcosystemsClient,
+    index,
+    rules::{BuildEverything, BuildRules, EcosystemsRules, NamedCrates},
+    Error, Roots,
+};
 use rayon::prelude::*;
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
-
-pub use error::Error;
 
 /// Top level arguments
 #[derive(Parser, Debug)]
@@ -32,13 +25,9 @@ struct Args {
 }
 
 /// Clap argument object for specifying the root paths to be used for this work session.
-/// These folders are as follows:
-/// `sources_root`: A location that all crate sources to be analyzed have been extracted to in the format of
-/// `sources_root/<name>-<version>`
-/// `bytecodes_root`: A location that all bytecodes will be emitted via `rustc`, distributed in folders
-/// in the format of `sources_root/<name>-<version>`
+/// See [`libpainter::Roots`] for the meaning of each directory.
 #[derive(clap::Args, Debug, Clone)]
-struct Roots {
+struct RootsArgs {
     /// Root directory containing the extracted sources tree.
     #[arg(short = 's', value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
     pub sources_root: PathBuf,
@@ -46,9 +35,103 @@ struct Roots {
     /// Can be the same root path to output bytecode artifacts into the source tree.
     #[arg(short = 'b', value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
     pub bytecodes_root: Option<PathBuf>,
-
+    /// Root directory containing the compressed `.crate` files.
     #[arg(short = 'c', value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
     pub compressed_root: PathBuf,
+}
+
+impl From<RootsArgs> for Roots {
+    fn from(args: RootsArgs) -> Self {
+        Self {
+            sources_root: args.sources_root,
+            bytecodes_root: args.bytecodes_root,
+            compressed_root: args.compressed_root,
+        }
+    }
+}
+
+/// Build-rule selection. With no `--top-*` flag and no `--only`, every crate in the index is a
+/// candidate. `--top-*` flags combine as a union. `--newer-than` filters versions by publish
+/// date (from ecosyste.ms). See `libpainter::rules::BuildRules` to supply custom policies.
+#[derive(clap::Args, Debug, Clone)]
+struct RulesArgs {
+    /// Consider every non-yanked version, not just the highest.
+    #[arg(long)]
+    all_versions: bool,
+    /// Restrict to these crate names (repeatable). Combines with `--top-*` as a union.
+    #[arg(long = "only", value_name = "CRATE")]
+    only: Vec<String>,
+    /// Top N crates by total downloads (ecosyste.ms).
+    #[arg(long, value_name = "N")]
+    top_downloads: Option<usize>,
+    /// Top N crates by number of dependent packages (ecosyste.ms).
+    #[arg(long, value_name = "N")]
+    top_reverse_deps: Option<usize>,
+    /// Every crate of the top N maintainers by total downloads (ecosyste.ms, full scan).
+    #[arg(long, value_name = "N")]
+    top_maintainers: Option<usize>,
+    /// Only versions published after this date (YYYY-MM-DD or RFC 3339), via ecosyste.ms.
+    #[arg(long, value_name = "DATE")]
+    newer_than: Option<String>,
+    /// ecosyste.ms API base URL.
+    #[arg(long, value_name = "URL", default_value = libpainter::ecosystems::DEFAULT_BASE_URL)]
+    ecosystems_url: String,
+}
+
+impl RulesArgs {
+    fn into_rules(self) -> Result<Box<dyn BuildRules>, Error> {
+        let uses_ecosystems = self.top_downloads.is_some()
+            || self.top_reverse_deps.is_some()
+            || self.top_maintainers.is_some()
+            || self.newer_than.is_some();
+        if !uses_ecosystems {
+            if !self.only.is_empty() {
+                return Ok(Box::new(NamedCrates {
+                    names: self.only,
+                    all_versions: self.all_versions,
+                }));
+            }
+            return Ok(Box::new(BuildEverything {
+                all_versions: self.all_versions,
+            }));
+        }
+
+        let newer_than = self
+            .newer_than
+            .as_deref()
+            .map(EcosystemsRules::parse_date)
+            .transpose()?;
+
+        Ok(Box::new(EcosystemsRules {
+            client: EcosystemsClient::new(&self.ecosystems_url),
+            crates: self.only,
+            top_downloads: self.top_downloads,
+            top_reverse_dependencies: self.top_reverse_deps,
+            top_maintainers: self.top_maintainers,
+            newer_than,
+            all_versions: self.all_versions,
+        }))
+    }
+}
+
+/// Neo4j connection parameters shared by every database-touching stage.
+#[derive(clap::Args, Debug, Clone)]
+struct DbArgs {
+    /// Bolt URI of the neo4j server, e.g. `bolt://127.0.0.1:7687`.
+    #[arg(short = 'd')]
+    host: String,
+    #[arg(short = 'u')]
+    username: String,
+    #[arg(short = 'p')]
+    password: String,
+}
+
+impl DbArgs {
+    async fn connect(self) -> Result<Arc<Db>, Error> {
+        Ok(Arc::new(
+            Db::connect(self.host, self.username, self.password).await?,
+        ))
+    }
 }
 
 /// Command stages of painter to execute.
@@ -56,88 +139,73 @@ struct Roots {
 enum Command {
     /// Compile a single crate from the source tree.
     Compile {
-        /// The full name and version of the crate to compile. Must match folder name in source tree.
-        #[arg(short = 'c')]
+        /// The full name and version of the crate to compile (`<name>-<version>`). Must match the
+        /// `.crate` filename in the compressed root.
+        #[arg(value_name = "NAME-VERSION")]
         crate_fullname: String,
+        /// rustup toolchain to compile with (`cargo +<toolchain>`).
+        #[arg(long, default_value = compile::DEFAULT_TOOLCHAIN)]
+        toolchain: String,
         #[command(flatten)]
-        roots: Roots,
+        roots: RootsArgs,
     },
-    /// Compile all crates found within the source tree.
+    /// Compile crates selected by the build rules (default: every crate in the index).
     CompileAll {
+        /// Skip crate versions that already have a bytecode directory.
         #[arg(long, short = 'u', default_value = "true")]
         update_only: bool,
+        /// rustup toolchain to compile with (`cargo +<toolchain>`).
+        #[arg(long, default_value = compile::DEFAULT_TOOLCHAIN)]
+        toolchain: String,
         #[command(flatten)]
-        roots: Roots,
+        rules: RulesArgs,
+        #[command(flatten)]
+        roots: RootsArgs,
+    },
+    /// Print the crate versions the build rules would select, without compiling.
+    Plan {
+        #[command(flatten)]
+        rules: RulesArgs,
+    },
+    /// Idempotently import (or refresh) the named crates and all their versions from the index.
+    ImportCrates {
+        #[command(flatten)]
+        db: DbArgs,
+        /// Crate names to import.
+        #[arg(value_name = "CRATE", required = true)]
+        names: Vec<String>,
     },
     /// Export all crates with built bytecode to the neo4j database
     ExportAllNeo4j {
-        #[arg(short = 'd')]
-        host: String,
-        #[arg(short = 'u')]
-        username: String,
-        #[arg(short = 'p')]
-        password: String,
         #[command(flatten)]
-        roots: Roots,
+        db: DbArgs,
+        #[command(flatten)]
+        roots: RootsArgs,
     },
+    /// List index versions that fail lenient semver parsing.
     SemverCheck,
-
-    // Database operations
+    /// Populate an empty database with every crate and version in the index.
     CreateFreshDb {
-        #[arg(short = 'd')]
-        host: String,
-        #[arg(short = 'u')]
-        username: String,
-        #[arg(short = 'p')]
-        password: String,
+        #[command(flatten)]
+        db: DbArgs,
     },
-    // Database operations
+    /// Report versions present in the index but missing from the database.
     UpdateDb {
-        #[arg(short = 'd')]
-        host: String,
-        #[arg(short = 'u')]
-        username: String,
-        #[arg(short = 'p')]
-        password: String,
+        #[command(flatten)]
+        db: DbArgs,
     },
-    // Database operations
+    /// Flag the highest version of every crate with `latest = true`.
     SetLatestVersions {
-        #[arg(short = 'd')]
-        host: String,
-        #[arg(short = 'u')]
-        username: String,
-        #[arg(short = 'p')]
-        password: String,
+        #[command(flatten)]
+        db: DbArgs,
     },
+    /// Run `count-unsafe` over every crate source and store the totals.
     CountUnsafe {
         #[command(flatten)]
-        roots: Roots,
-        #[arg(short = 'd')]
-        host: String,
-        #[arg(short = 'u')]
-        username: String,
-        #[arg(short = 'p')]
-        password: String,
+        roots: RootsArgs,
+        #[command(flatten)]
+        db: DbArgs,
     },
-}
-
-/// Container object for storing the information of a given crate.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CrateSource {
-    /// The crates name
-    name: String,
-    /// The crates semver version in `String` format.
-    version: String,
-    /// The fully qualified path the crate source was discovered and is located.
-    path: PathBuf,
-}
-
-fn cratefs_from_roots(roots: &Roots) -> Result<CrateFs, Error> {
-    // Queue up the caching FS
-    Ok(CrateFs::new(CrateFsConfig::with_paths(
-        roots.compressed_root.clone(),
-        roots.sources_root.clone(),
-    ))?)
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 32)]
@@ -148,68 +216,62 @@ async fn main() -> Result<(), Error> {
     log::trace!("{:?}", args);
 
     match args.command {
-        Command::CreateFreshDb {
-            host,
-            username,
-            password,
-        } => {
-            let db = Arc::new(Db::connect(host, username, password).await?);
-            index::create_fresh_db(db).await?;
+        Command::CreateFreshDb { db } => {
+            index::create_fresh_db(db.connect().await?).await?;
         }
-        Command::UpdateDb {
-            host,
-            username,
-            password,
-        } => {
-            let db = Arc::new(Db::connect(host, username, password).await?);
-            //index::update_missing_crates(db.clone()).await?;
-            index::update_missing_versions(db.clone()).await?;
+        Command::UpdateDb { db } => {
+            index::update_missing_versions(db.connect().await?).await?;
         }
-        Command::SetLatestVersions {
-            host,
-            username,
-            password,
-        } => {
-            let db = Arc::new(Db::connect(host, username, password).await?);
-            //index::update_missing_crates(db.clone()).await?;
-            index::set_latest_versions(db.clone()).await?;
+        Command::SetLatestVersions { db } => {
+            index::set_latest_versions(db.connect().await?).await?;
+        }
+        Command::ImportCrates { db, names } => {
+            index::import_crates(&names, db.connect().await?).await?;
         }
         Command::Compile {
             crate_fullname,
+            toolchain,
             roots,
         } => {
-            // let sources = roots.get_crate_sources()?;
-            //compile_crate(&sources[&crate_fullname], roots.bytecodes_root.unwrap())?;
+            let roots = Roots::from(roots);
+            let bc_root = roots.bytecodes_root()?.clone();
+            let mut fs = roots.crate_fs()?;
+            let entry = libpainter::crate_fs::CrateEntry::new(crate_fullname)?;
+            let src_path = fs.open_entry(entry.clone())?.path().to_path_buf();
+            compile::compile_crate(entry.name(), entry.version(), src_path, bc_root, &toolchain)?;
         }
-        Command::CompileAll { update_only, roots } => {
-            compile::compile_all(
-                cratefs_from_roots(&roots)?,
-                roots.bytecodes_root.unwrap(),
+        Command::CompileAll {
+            update_only,
+            toolchain,
+            rules,
+            roots,
+        } => {
+            let roots = Roots::from(roots);
+            let bc_root = roots.bytecodes_root()?.clone();
+            let opts = compile::CompileOptions {
                 update_only,
-            )
-            .await
-            .unwrap();
+                toolchain,
+                ..compile::CompileOptions::default()
+            };
+            let rules = rules.into_rules()?;
+            compile::compile_all(roots.crate_fs()?, bc_root, opts, rules.as_ref()).await?;
         }
-        Command::CountUnsafe {
-            roots,
-            host,
-            username,
-            password,
-        } => {
-            let db = Arc::new(Db::connect(host, username, password).await?);
-            analysis::count_unsafe(&roots, db).await?;
+        Command::Plan { rules } => {
+            let rules = rules.into_rules()?;
+            let opts = compile::CompileOptions::default();
+            for (name, version) in compile::plan(rules.as_ref(), opts.rules_concurrency).await? {
+                println!("{name}-{version}");
+            }
         }
-        Command::ExportAllNeo4j {
-            host,
-            username,
-            password,
-            roots,
-        } => {
-            let db = Arc::new(Db::connect(host, username, password).await?);
-            analysis::export_all_db(&roots.bytecodes_root.unwrap(), db).await?;
+        Command::CountUnsafe { roots, db } => {
+            analysis::count_unsafe(&Roots::from(roots), db.connect().await?).await?;
+        }
+        Command::ExportAllNeo4j { db, roots } => {
+            let roots = Roots::from(roots);
+            analysis::export_all_db(roots.bytecodes_root()?, db.connect().await?).await?;
         }
         Command::SemverCheck => {
-            let index = crates_index::Index::new_cargo_default().unwrap();
+            let index = index::open_index().map_err(libpainter::index::Error::from)?;
             let invalid_versions = Arc::new(Mutex::new(std::collections::HashSet::new()));
 
             index

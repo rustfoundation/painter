@@ -1,168 +1,73 @@
-use llvm_ir_analysis::llvm_ir::Module;
-use llvm_ir_analysis::ModuleAnalysis;
-use rustc_demangle::demangle;
-use std::path::Path;
-use walkdir::WalkDir;
+//! `libpainter`: the pipeline stages behind the `painter` CLI.
+//!
+//! - [`index`]: crates.io index -> Neo4j `(Crate)` / `(Version)` graph
+//! - [`compile`]: mass compilation of crate sources to LLVM bitcode
+//! - [`analysis`]: call-graph extraction from bitcode and export to Neo4j
+//! - [`crate_fs`]: cached extraction of `.crate` tarballs
+//! - [`db`]: the Neo4j connection wrapper and all Cypher
+#![deny(clippy::all, clippy::pedantic)]
+#![allow(clippy::enum_variant_names)]
 
-/// Top error type returned during any stage of analysis from compile to data import.
-#[derive(thiserror::Error, Debug)]
-pub enum Error {
-    ///
-    #[error("IO Error: {0}")]
-    IoError(#[from] std::io::Error),
-    ///
-    #[error("LLVM IR failure: {0}")]
-    LLVMError(String),
-    ///
-    #[error("Compilation Failure: {0}")]
-    CompileFailed(String),
-    ///
-    #[error("Clean stage failed")]
-    CleanFailure(std::process::Output),
+pub mod analysis;
+pub mod compile;
+pub mod crate_fs;
+pub mod db;
+pub mod ecosystems;
+pub mod error;
+pub mod index;
+pub mod rules;
+
+use std::path::PathBuf;
+
+pub use error::Error;
+pub use rules::BuildRules;
+
+/// Group an iterator into `Vec`s of at most `size` items. Unlike `Iterator::array_chunks`, the
+/// final partial chunk is yielded rather than dropped.
+pub fn chunked<I: Iterator>(iter: I, size: usize) -> impl Iterator<Item = Vec<I::Item>> {
+    let mut iter = iter.peekable();
+    std::iter::from_fn(move || {
+        if iter.peek().is_none() {
+            return None;
+        }
+        Some(iter.by_ref().take(size).collect())
+    })
 }
 
-const BLOCKED_STRINGS: &[&str] = &["llvm.", "__rust", "rt::", "std::", "core::", "alloc::"];
-
-/// Extract all function calls/invocations within a bytecode file. Returns a `Vec<(String,String)>`
-/// of (caller, callee) demangled function names.
+/// Root directories used by the compile, export, and unsafe-counting stages.
 ///
-/// # Panics
-/// This function will panic if iterating the `Roots::bytecode_root` fails.
-///
-/// This function will panic if an LLVM parsing error occurs while parsing the bytecode.
-/// # Errors
-/// TODO: Failure cases currently panic and should be moved to errors.
-#[allow(clippy::unnecessary_wraps)]
-pub fn extract_calls<P: AsRef<Path>>(crate_bc_dir: P) -> Result<Vec<(String, String)>, Error> {
-    let mut calls = Vec::<(String, String)>::new();
+/// - `sources_root`: extracted crate sources, laid out as `sources_root/<name>-<version>/`
+/// - `bytecodes_root`: emitted LLVM bitcode, laid out as `bytecodes_root/<name>-<version>/`
+/// - `compressed_root`: `.crate` tarballs, named `<name>-<version>.crate`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Roots {
+    pub sources_root: PathBuf,
+    pub bytecodes_root: Option<PathBuf>,
+    pub compressed_root: PathBuf,
+}
 
-    for bc_entry in std::fs::read_dir(crate_bc_dir.as_ref())
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some() && e.path().extension().unwrap() == "bc")
-    {
-        let bc_path = bc_entry.path();
-
-        let module = Module::from_bc_path(&bc_path)
-            .map_err(Error::LLVMError)
-            .unwrap();
-        let analysis = ModuleAnalysis::new(&module);
-
-        let graph = analysis.call_graph();
-        graph.inner().all_edges().for_each(|(src_raw, dst_raw, _)| {
-            let src = format!("{:#}", demangle(src_raw));
-            let dst = format!("{:#}", demangle(dst_raw));
-
-            if !BLOCKED_STRINGS
-                .iter()
-                .any(|s| src.contains(*s) || dst.contains(*s))
-            {
-                calls.push((src, dst));
-            }
-        });
+impl Roots {
+    /// Build a [`crate_fs::CrateFs`] over this session's compressed and sources roots.
+    ///
+    /// # Panics
+    /// Panics if either directory does not exist (see [`crate_fs::CrateFsConfig::with_paths`]).
+    ///
+    /// # Errors
+    /// Returns [`Error::CrateFsError`] if the cache cannot be initialised.
+    pub fn crate_fs(&self) -> Result<crate_fs::CrateFs, Error> {
+        Ok(crate_fs::CrateFs::new(crate_fs::CrateFsConfig::with_paths(
+            self.compressed_root.clone(),
+            self.sources_root.clone(),
+        ))?)
     }
 
-    Ok(calls)
-}
-
-/// Executes a cargo rustc  within the crates sources directory. This is executed within the
-/// `Roots::sources_root` directory inside a given crates version folder.
-///
-/// # Panics
-/// This function will panic if executing `cargo` or `rustc` fails due to OS process execution problems.
-/// It will not panic on failure of the command itself.
-///
-/// This function will panic if the stdout or stderr from `rustc` fails to UTF-8 decode.
-///
-/// # Errors
-/// returns an instance of `Error::CompileFailed`, containing the output of stdout and stderr from the
-/// execution.
-fn compile_crate<PS: AsRef<Path>, PC: AsRef<Path>>(
-    name: &str,
-    version: &str,
-    src_path: PS,
-    bc_root: PC,
-) -> Result<(), crate::Error> {
-    let fullname = format!("{}-{}", &name, version);
-    let output_dir = bc_root.as_ref().join(&fullname);
-
-    log::info!("Compiling: {} @ {}", &fullname, output_dir.display());
-
-    // Build the crate with rustc, emitting llvm-bc. We also disable LTO to prevent some inlining
-    // to gain better cross-crate function call introspection.
-    // TODO: We should further limit optimizations and inlining to get an even better picture.
-    let output = std::process::Command::new("cargo")
-        .args([
-            "+1.67",
-            "rustc",
-            "--release",
-            "--lib",
-            "--",
-            "-g",
-            "--emit=llvm-bc",
-            "-C",
-            "lto=off",
-        ])
-        .current_dir(src_path.as_ref())
-        .output()
-        .unwrap();
-
-    log::trace!("Compiled: {} with result: {:?}", fullname, output);
-
-    if output.status.success() {
-        std::fs::create_dir(&output_dir);
-
-        // If the compile succeeded, search for emitted .bc files of bytecode and copy them over
-        // to the Roots::bytecode_root directory.
-        WalkDir::new(src_path.as_ref())
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some() && e.path().extension().unwrap() == "bc")
-            .for_each(|e| {
-                let dst = output_dir.join(Path::new(e.path().file_name().unwrap()));
-                if dst.exists() {
-                    std::fs::remove_file(&dst).unwrap();
-                }
-                std::fs::copy(e.path(), &dst).unwrap();
-            });
-
-        clean(src_path.as_ref())?;
-    } else {
-        clean(src_path.as_ref())?;
-
-        return Err(Error::CompileFailed(format!(
-            "{}\n-----------\n{}",
-            std::str::from_utf8(&output.stdout).unwrap(),
-            std::str::from_utf8(&output.stderr).unwrap()
-        )));
-    };
-
-    Ok(())
-}
-
-/// Executes a cargo clean within the crates sources directory. This is executed within the
-/// `Roots::sources_root` directory inside a given crates version folder.
-///
-/// # Panics
-/// This function will panic if executing `cargo` or `rustc` fails due to OS process execution problems.
-/// It will not panic on failure of the command itself.
-/// # Errors
-/// returns an instance of `Error::CleanFailure`, containing the output of stdout and stderr from the
-/// execution.
-pub fn clean(path: &Path) -> Result<(), Error> {
-    // cargo rustc --release -- -g --emit=llvm-bc
-    let output = std::process::Command::new("cargo")
-        .arg("+1.60")
-        .arg("clean")
-        .current_dir(path)
-        .output()
-        .unwrap();
-
-    std::fs::remove_dir_all(path.join("target"));
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(Error::CleanFailure(output))
+    /// The bytecode output root.
+    ///
+    /// # Errors
+    /// Returns [`Error::MissingBytecodesPath`] if it was not provided.
+    pub fn bytecodes_root(&self) -> Result<&PathBuf, Error> {
+        self.bytecodes_root
+            .as_ref()
+            .ok_or(Error::MissingBytecodesPath)
     }
 }
