@@ -14,6 +14,54 @@ pub enum Error {
     CrateNotFound(String),
 }
 
+/// Parse a version string leniently: `lenient_semver` first, then a `major.minor.patch`
+/// fallback that strips non-digits from the patch, because the index contains non-compliant
+/// versions.
+///
+/// # Errors
+/// Returns `Error::InvalidSemver` if no interpretation works.
+pub fn parse_semver(version: &str) -> Result<semver::Version, Error> {
+    if let Ok(s) = lenient_semver::parse(version) {
+        return Ok(s);
+    }
+    let invalid = || Error::InvalidSemver(version.to_owned());
+    let split: Vec<_> = version.split('.').collect();
+    if split.len() < 3 {
+        return Err(invalid());
+    }
+    let patch = split[2]
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>()
+        .parse::<u64>()
+        .map_err(|_| invalid())?;
+
+    Ok(semver::Version {
+        major: split[0].parse::<u64>().map_err(|_| invalid())?,
+        minor: split[1].parse::<u64>().map_err(|_| invalid())?,
+        patch,
+        build: semver::BuildMetadata::default(),
+        pre: semver::Prerelease::default(),
+    })
+}
+
+/// One dependency declaration of a crate version, as stored on `[:DEPENDS_ON]`.
+#[derive(Debug, Clone)]
+pub struct DependencyRow {
+    pub name: String,
+    pub requirement: String,
+    pub features: String,
+    pub kind: String,
+    pub optional: bool,
+}
+
+/// One version of a crate with its dependency declarations, for batched inserts.
+#[derive(Debug, Clone)]
+pub struct VersionRow {
+    pub version: String,
+    pub dependencies: Vec<DependencyRow>,
+}
+
 pub struct Db {
     conn: Arc<Graph>,
 }
@@ -116,8 +164,8 @@ impl Db {
         }
 
         // neo4rs 0.6 does not expose its map type, so send three parallel lists and index them.
-        let callers: Vec<&str> = calls.iter().map(|c| c.0.as_str()).collect();
-        let callees: Vec<&str> = calls.iter().map(|c| c.1.as_str()).collect();
+        let callsites: Vec<&str> = calls.iter().map(|c| c.0.as_str()).collect();
+        let targets: Vec<&str> = calls.iter().map(|c| c.1.as_str()).collect();
         let dsts: Vec<&str> = calls.iter().map(|c| c.2.as_str()).collect();
 
         self.conn
@@ -133,8 +181,8 @@ impl Db {
                 )
                 .param("src_crate", src_crate.0)
                 .param("src_version", src_crate.1)
-                .param("callers", callers)
-                .param("callees", callees)
+                .param("callers", callsites)
+                .param("callees", targets)
                 .param("dsts", dsts),
             )
             .await?;
@@ -142,108 +190,95 @@ impl Db {
         Ok(())
     }
 
-    /// Insert a new version of a crate into the database. This will create a new `(Version)` node,
-    /// linking it to its associated top-level `(Crate)` node. If that node does not exist, it is created.
+    /// Insert a crate with every one of its versions and their dependency edges in a single
+    /// write query. This is the fast path used by `create-fresh-db`: one round trip per crate
+    /// instead of one per version plus one per dependency.
     ///
-    /// Also inserts all dependency relationships for this version of the crate; whatever is specified
-    /// in the Cargo.toml for this version as its dependencies will gain `[:DEPENDS_ON]` relationships
-    /// with other `(Crate)` nodes. We do not specify exact version-version `[:DEPENDS_ON]` relationships,
-    /// because semver may cause these versions to shift and change based on build time and release
-    /// cycles.
+    /// Resumable: versions that already exist in the database are skipped (checked through the
+    /// `(name, version)` uniqueness index), so re-running an interrupted import only adds what is
+    /// missing and never duplicates nodes or edges. `(Crate)` nodes are `MERGE`d because other
+    /// crates' dependencies may already have created them. Versions whose number cannot be
+    /// parsed even leniently are skipped with a warning rather than failing the crate.
     ///
-    /// `(Version)-[:DEPENDS_ON {requirement, features, kind, optional}]->(Crate)`
+    /// `(Crate)-[:VERSION_OF]->(Version)-[:DEPENDS_ON {requirement, features, kind, optional}]->(Crate)`
     ///
-    /// # Panics
-    /// This function may panic if there is an error in the initial insertion of the Crate node
-    /// in which it cant be referenced in future queries. Specifically, it will panic in the event
-    /// a new Node is not returned during insertion.
     /// # Errors
     /// This function will return an `painter::db::Error` in the event of a database error.
-    pub async fn insert_crate_version<'a, I, S1, S2, S3, S4, S5>(
-        &self,
-        name: &str,
-        version: &str,
-        depends_on: I,
-    ) -> Result<(), Error>
-    where
-        I: Iterator<Item = &'a (S1, S2, S3, S4, S5)>,
-        S1: AsRef<str> + 'a,
-        S2: AsRef<str> + 'a,
-        S3: AsRef<str> + 'a,
-        S4: AsRef<str> + 'a,
-        S5: AsRef<str> + 'a,
-    {
-        let semver = if let Ok(s) = lenient_semver::parse(version) {
-            s
-        } else {
-            let split: Vec<_> = version.split('.').collect();
-            let patch = split[2]
-                .chars()
-                .filter(char::is_ascii_digit)
-                .collect::<String>()
-                .parse::<u64>()
-                .map_err(|_| Error::InvalidSemver(version.to_owned()))?;
+    pub async fn insert_crate_versions(&self, name: &str, rows: &[VersionRow]) -> Result<(), Error> {
+        let parsed: Vec<(&VersionRow, semver::Version)> = rows
+            .iter()
+            .filter_map(|row| match parse_semver(&row.version) {
+                Ok(sv) => Some((row, sv)),
+                Err(e) => {
+                    log::warn!("{}-{}: skipping, {}", name, row.version, e);
+                    None
+                }
+            })
+            .collect();
 
-            semver::Version {
-                major: split[0]
-                    .parse::<u64>()
-                    .map_err(|_| Error::InvalidSemver(version.to_owned()))?,
-                minor: split[1]
-                    .parse::<u64>()
-                    .map_err(|_| Error::InvalidSemver(version.to_owned()))?,
-                patch,
-                build: semver::BuildMetadata::default(),
-                pre: semver::Prerelease::default(),
-            }
-        };
+        if parsed.is_empty() {
+            // Still make sure the crate node exists.
+            self.conn
+                .run(query("MERGE (:Crate { name: $name })").param("name", name))
+                .await?;
+            return Ok(());
+        }
 
-        let version_id = {
-            let mut result = self.conn
-            .execute(
+        let versions: Vec<&str> = parsed.iter().map(|(r, _)| r.version.as_str()).collect();
+        let majors: Vec<i64> = parsed.iter().map(|(_, sv)| i64::try_from(sv.major).unwrap_or(i64::MAX)).collect();
+        let minors: Vec<i64> = parsed.iter().map(|(_, sv)| i64::try_from(sv.minor).unwrap_or(i64::MAX)).collect();
+        let patches: Vec<i64> = parsed.iter().map(|(_, sv)| i64::try_from(sv.patch).unwrap_or(i64::MAX)).collect();
+        let builds: Vec<&str> = parsed.iter().map(|(_, sv)| sv.build.as_str()).collect();
+        let pres: Vec<&str> = parsed.iter().map(|(_, sv)| sv.pre.as_str()).collect();
+        // Per-version dependency columns: outer index = version, inner = dependency.
+        let dep_names: Vec<Vec<&str>> = parsed.iter().map(|(r, _)| r.dependencies.iter().map(|d| d.name.as_str()).collect()).collect();
+        let dep_reqs: Vec<Vec<&str>> = parsed.iter().map(|(r, _)| r.dependencies.iter().map(|d| d.requirement.as_str()).collect()).collect();
+        let dep_features: Vec<Vec<&str>> = parsed.iter().map(|(r, _)| r.dependencies.iter().map(|d| d.features.as_str()).collect()).collect();
+        let dep_kinds: Vec<Vec<&str>> = parsed.iter().map(|(r, _)| r.dependencies.iter().map(|d| d.kind.as_str()).collect()).collect();
+        let dep_optional: Vec<Vec<bool>> = parsed.iter().map(|(r, _)| r.dependencies.iter().map(|d| d.optional).collect()).collect();
+
+        self.conn
+            .run(
                 query(
-                    "MERGE (crate:Crate { name: $name }) 
-                     CREATE (version:Version {name: $name, version: $version, semver_major: toInteger($semver_major), semver_minor: toInteger($semver_minor), semver_patch: toInteger($semver_patch), semver_build: $semver_build, semver_pre: $semver_pre })
-                     CREATE (version)<-[:VERSION_OF]-(crate)
-                     RETURN version",
+                    "MERGE (crate:Crate { name: $name })
+                     WITH crate
+                     UNWIND range(0, size($versions) - 1) AS i
+                     WITH crate, i
+                     WHERE NOT EXISTS { MATCH (:Version { name: $name, version: $versions[i] }) }
+                     CREATE (v:Version {
+                         name: $name,
+                         version: $versions[i],
+                         semver_major: $majors[i],
+                         semver_minor: $minors[i],
+                         semver_patch: $patches[i],
+                         semver_build: $builds[i],
+                         semver_pre: $pres[i]
+                     })
+                     CREATE (crate)-[:VERSION_OF]->(v)
+                     WITH v, i
+                     UNWIND range(0, size($dep_names[i]) - 1) AS j
+                     MERGE (d:Crate { name: $dep_names[i][j] })
+                     CREATE (v)-[:DEPENDS_ON {
+                         requirement: $dep_reqs[i][j],
+                         features: $dep_features[i][j],
+                         kind: $dep_kinds[i][j],
+                         optional: $dep_optional[i][j]
+                     }]->(d)",
                 )
                 .param("name", name)
-                .param("version", version)
-                .param("semver_major", u32::try_from(semver.major).map_err(|_| Error::InvalidSemver(version.to_owned()))?)
-                    .param("semver_minor", u32::try_from(semver.minor).map_err(|_| Error::InvalidSemver(version.to_owned()))?)
-                    .param("semver_patch", u32::try_from(semver.patch).map_err(|_| Error::InvalidSemver(version.to_owned()))?)
-                    .param("semver_build", semver.build.as_str())
-                    .param("semver_pre", semver.pre.as_str())
+                .param("versions", versions)
+                .param("majors", majors)
+                .param("minors", minors)
+                .param("patches", patches)
+                .param("builds", builds)
+                .param("pres", pres)
+                .param("dep_names", dep_names)
+                .param("dep_reqs", dep_reqs)
+                .param("dep_features", dep_features)
+                .param("dep_kinds", dep_kinds)
+                .param("dep_optional", dep_optional),
             )
             .await?;
-
-            let version_node: Node = result
-                .next()
-                .await
-                .unwrap()
-                .unwrap()
-                .get("version")
-                .unwrap();
-
-            version_node.id()
-        };
-
-        let tx = self.conn.start_txn().await.unwrap();
-
-        tx.run_queries(depends_on.into_iter().map(|depend| {
-            query(
-                "MATCH (version:Version) WHERE ID(version) = $version_id
-                         MERGE (depend:Crate { name: $depend })
-                         CREATE (version)-[:DEPENDS_ON { requirement: $req, features: $features, kind: $kind, optional: toBoolean($optional) } ]->(depend)",
-            )
-                .param("version_id", version_id)
-                .param("depend", depend.0.as_ref())
-                .param("req", depend.1.as_ref())
-                .param("features", depend.2.as_ref())
-                .param("kind", depend.3.as_ref())
-                .param("optional", depend.4.as_ref())
-        }).collect()).await?;
-
-        tx.commit().await?;
 
         Ok(())
     }
@@ -325,29 +360,7 @@ impl Db {
         S4: AsRef<str> + 'a,
         S5: AsRef<str> + 'a,
     {
-        let semver = if let Ok(s) = lenient_semver::parse(version) {
-            s
-        } else {
-            let split: Vec<_> = version.split('.').collect();
-            let patch = split[2]
-                .chars()
-                .filter(char::is_ascii_digit)
-                .collect::<String>()
-                .parse::<u64>()
-                .map_err(|_| Error::InvalidSemver(version.to_owned()))?;
-
-            semver::Version {
-                major: split[0]
-                    .parse::<u64>()
-                    .map_err(|_| Error::InvalidSemver(version.to_owned()))?,
-                minor: split[1]
-                    .parse::<u64>()
-                    .map_err(|_| Error::InvalidSemver(version.to_owned()))?,
-                patch,
-                build: semver::BuildMetadata::default(),
-                pre: semver::Prerelease::default(),
-            }
-        };
+        let semver = parse_semver(version)?;
 
         let version_id = {
             let mut result = self

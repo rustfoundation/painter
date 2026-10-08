@@ -185,9 +185,14 @@ enum Command {
     /// List index versions that fail lenient semver parsing.
     SemverCheck,
     /// Populate an empty database with every crate and version in the index.
+    /// Import every crate and version from the index. Safe to re-run: existing versions are
+    /// skipped, so an interrupted run resumes where it left off.
     CreateFreshDb {
         #[command(flatten)]
         db: DbArgs,
+        /// Import only these crates (repeatable); default is the whole index.
+        #[arg(long = "only", value_name = "CRATE")]
+        only: Vec<String>,
     },
     /// Report versions present in the index but missing from the database.
     UpdateDb {
@@ -216,8 +221,8 @@ async fn main() -> Result<(), Error> {
     log::trace!("{:?}", args);
 
     match args.command {
-        Command::CreateFreshDb { db } => {
-            index::create_fresh_db(db.connect().await?).await?;
+        Command::CreateFreshDb { db, only } => {
+            index::create_fresh_db(db.connect().await?, &only).await?;
         }
         Command::UpdateDb { db } => {
             index::update_missing_versions(db.connect().await?).await?;
