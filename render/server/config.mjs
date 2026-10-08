@@ -38,6 +38,16 @@ export const config = {
    * read transaction, but you may still want this off on a shared deployment.
    */
   allowCypher: env('RENDER_ALLOW_CYPHER', 'true') !== 'false',
+  /**
+   * Crate-level dependency view (/api/graph/deps). `depsMaxEdges` caps how
+   * many aggregated crate->crate edges one response may carry; the full
+   * graph result is cached in memory for `depsCacheMs`.
+   */
+  depsMaxEdges: int('RENDER_DEPS_MAX_EDGES', 50_000),
+  depsDefaultEdges: int('RENDER_DEPS_DEFAULT_EDGES', 5_000),
+  depsCacheMs: int('RENDER_DEPS_CACHE_MS', 600_000),
+  /** Transaction timeout for the whole-graph deps query, which scans every DEPENDS_ON edge. */
+  depsTimeoutMs: int('RENDER_DEPS_TIMEOUT_MS', 180_000),
 };
 
 export const describeConfig = () => ({
@@ -51,4 +61,6 @@ export const describeConfig = () => ({
     queryTimeoutMs: config.neo4j.queryTimeoutMs,
   },
   allowCypher: config.allowCypher,
+  depsMaxEdges: config.depsMaxEdges,
+  depsDefaultEdges: config.depsDefaultEdges,
 });

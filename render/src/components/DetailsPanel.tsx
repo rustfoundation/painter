@@ -1,7 +1,10 @@
-import type { ExpandType, GraphNode, GraphRel } from '../api';
+import type { ExpandType, GraphNode, GraphRel, View } from '../api';
 import { isCrate, isVersion, nodeTitle, relTitle } from '../graph';
 
 interface Props {
+  view: View;
+  /** Deps view: load a crate's crate-level dependencies / dependents. */
+  onExpandDeps: (name: string, direction: 'in' | 'out' | 'both') => void;
   selected: GraphNode | GraphRel | null;
   nodeById: (id: string) => GraphNode | undefined;
   onExpand: (id: string, direction: 'in' | 'out' | 'both', types: ExpandType[]) => void;
@@ -36,15 +39,30 @@ function Properties({ props }: { props: Record<string, unknown> }) {
   );
 }
 
-export function DetailsPanel({ selected, nodeById, onExpand, onRemove, onLoadCrate, busy }: Props) {
+export function DetailsPanel({ view, onExpandDeps, selected, nodeById, onExpand, onRemove, onLoadCrate, busy }: Props) {
   if (!selected) {
     return (
       <div className="details">
         <h2>Nothing selected</h2>
         <p className="muted">
-          Click a node or relationship to inspect it. Double-click a node to expand all of its neighbours.
+          {view === 'deps'
+            ? 'Click a crate or edge to inspect it. Double-click a crate to add its direct crate-level dependencies and dependents.'
+            : 'Click a node or relationship to inspect it. Double-click a node to expand all of its neighbours.'}
         </p>
         <h3>Legend</h3>
+        {view === 'deps' ? (
+          <ul className="legend">
+            <li>
+              <span className="swatch" style={{ background: '#1F5FD1' }} /> Crate (loaded root)
+            </li>
+            <li>
+              <span className="swatch" style={{ background: '#4C8DFF' }} /> Crate (size = connections)
+            </li>
+            <li>
+              <span className="line" style={{ background: '#4C8DFF' }} /> A → B: some version of A depends on B (width = how many)
+            </li>
+          </ul>
+        ) : (
         <ul className="legend">
           <li>
             <span className="swatch" style={{ background: '#1F5FD1' }} /> Crate (loaded root)
@@ -71,6 +89,7 @@ export function DetailsPanel({ selected, nodeById, onExpand, onRemove, onLoadCra
             <span className="line" style={{ background: '#E5484D' }} /> INVOKES (width = call count)
           </li>
         </ul>
+        )}
       </div>
     );
   }
@@ -87,10 +106,16 @@ export function DetailsPanel({ selected, nodeById, onExpand, onRemove, onLoadCra
         <p>
           <strong>{from ? nodeTitle(from) : selected.from}</strong> → <strong>{to ? nodeTitle(to) : selected.to}</strong>
         </p>
-        {selected.properties.aggregated === true && (
+        {selected.properties.aggregated === true && selected.type === 'INVOKES' && (
           <p className="muted">
             Aggregated: {fmt(selected.properties.count)} INVOKES edges collapsed into one. Showing up to 10 distinct
             targets.
+          </p>
+        )}
+        {selected.properties.aggregated === true && selected.type === 'DEPENDS_ON' && (
+          <p className="muted">
+            Crate-level edge: {fmt(selected.properties.versions)} version(s) of {from ? nodeTitle(from) : selected.from}{' '}
+            declare a dependency on {to ? nodeTitle(to) : selected.to}.
           </p>
         )}
         {targets ? (
@@ -121,7 +146,20 @@ export function DetailsPanel({ selected, nodeById, onExpand, onRemove, onLoadCra
       </h2>
 
       <div className="actions">
-        {isCrate(node) && (
+        {isCrate(node) && view === 'deps' && (
+          <>
+            <button disabled={busy} onClick={() => onExpandDeps(name, 'out')} title="Add direct crate-level dependencies">
+              Dependencies
+            </button>
+            <button disabled={busy} onClick={() => onExpandDeps(name, 'in')} title="Add direct crate-level dependents">
+              Dependents
+            </button>
+            <button disabled={busy} onClick={() => onLoadCrate(name)} title="Replace the canvas with this crate's full transitive chain">
+              Chain from here
+            </button>
+          </>
+        )}
+        {isCrate(node) && view === 'default' && (
           <>
             <button disabled={busy} onClick={() => onLoadCrate(name)}>
               Load crate
@@ -150,9 +188,11 @@ export function DetailsPanel({ selected, nodeById, onExpand, onRemove, onLoadCra
             </button>
           </>
         )}
-        <button disabled={busy} onClick={() => onExpand(node.id, 'both', [])}>
-          Expand all
-        </button>
+        {view === 'default' && (
+          <button disabled={busy} onClick={() => onExpand(node.id, 'both', [])}>
+            Expand all
+          </button>
+        )}
         <button disabled={busy} className="danger" onClick={() => onRemove(node.id)}>
           Remove
         </button>

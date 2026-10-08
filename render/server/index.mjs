@@ -36,15 +36,21 @@ const clampLimit = (value, fallback) => {
 };
 
 /** Run a Cypher query in a read transaction and return the collected graph. */
-const readGraph = async (cypher, params = {}) => {
+const readGraph = async (cypher, params = {}, { timeoutMs = config.neo4j.queryTimeoutMs } = {}) => {
   const session = driver.session({ database: config.neo4j.database, defaultAccessMode: neo4j.session.READ });
   try {
     const started = Date.now();
-    const result = await session.executeRead((tx) => tx.run(cypher, params), {
-      timeout: config.neo4j.queryTimeoutMs,
-    });
+    const result = await session.executeRead((tx) => tx.run(cypher, params), { timeout: timeoutMs });
+    const elapsedMs = Date.now() - started;
+    // Neo4j 5 can end a timed-out read as an empty stream instead of raising
+    // TransactionTimedOut; treat "nothing back, took the whole budget" as a timeout.
+    if (result.records.length === 0 && elapsedMs >= timeoutMs * 0.95) {
+      const err = new Error(`query timed out after ${elapsedMs} ms (limit ${timeoutMs} ms); the database may be busy`);
+      err.code = 'Neo.ClientError.Transaction.TransactionTimedOut';
+      throw err;
+    }
     const graph = collectGraph(result.records);
-    return { ...graph, meta: { records: result.records.length, elapsedMs: Date.now() - started } };
+    return { ...graph, meta: { records: result.records.length, elapsedMs } };
   } finally {
     await session.close();
   }
@@ -112,19 +118,42 @@ api.get(
   }),
 );
 
-/** Crate name autocomplete. Uses the unique constraint index on Crate.name. */
+/**
+ * Crate name search: case-insensitive partial match anywhere in the name.
+ * Prefix matches rank first, then shorter names, so "serd" lists serde,
+ * serde_json, ... before e.g. "xserde". A TEXT index on Crate.name
+ * (docker/queries.md) makes CONTAINS fast; without it this is a label scan.
+ */
+const searchCrates = async (q, limit) =>
+  readGraph(
+    `MATCH (c:Crate) WHERE toLower(c.name) CONTAINS $q
+     WITH c, toLower(c.name) AS lname
+     RETURN c.name AS name
+     ORDER BY lname = $q DESC, lname STARTS WITH $q DESC, size(c.name), c.name
+     LIMIT $limit`,
+    { q, limit: neo4j.int(limit) },
+  ).then((g) => g.rows.map((r) => r.name));
+
+/**
+ * Resolve user input to a crate name: exact match first, otherwise the best
+ * partial match as ranked by searchCrates. Returns null when nothing matches.
+ */
+const resolveCrateName = async (input) => {
+  const q = String(input ?? '').trim();
+  if (!q) return null;
+  const exact = await readGraph(`MATCH (c:Crate {name: $name}) RETURN c.name AS name LIMIT 1`, { name: q });
+  if (exact.rows.length) return exact.rows[0].name;
+  const matches = await searchCrates(q.toLowerCase(), 1);
+  return matches[0] ?? null;
+};
+
 api.get(
   '/crates/search',
   wrap(async (req, res) => {
     const q = String(req.query.q ?? '').trim().toLowerCase();
     const limit = clampLimit(req.query.limit, 20);
     if (!q) return res.json({ names: [] });
-    const g = await readGraph(
-      `MATCH (c:Crate) WHERE c.name STARTS WITH $q
-       RETURN c.name AS name ORDER BY size(c.name), c.name LIMIT $limit`,
-      { q, limit: neo4j.int(limit) },
-    );
-    res.json({ names: g.rows.map((r) => r.name) });
+    res.json({ names: await searchCrates(q, limit) });
   }),
 );
 
@@ -143,7 +172,8 @@ const aggregatedInvokes = (fromId, toId, count, targets) => ({
 
 /**
  * Load a crate with its versions and, optionally, their outgoing DEPENDS_ON
- * and INVOKES edges and incoming dependents.
+ * and INVOKES edges and incoming dependents. `:name` may be a partial name;
+ * it is resolved to the best match and reported back as meta.resolvedName.
  *
  * Query params:
  *   versions   = latest | all            (default latest)
@@ -158,7 +188,11 @@ const aggregatedInvokes = (fromId, toId, count, targets) => ({
 api.get(
   '/graph/crate/:name',
   wrap(async (req, res) => {
-    const name = String(req.params.name);
+    const requested = String(req.params.name);
+    const name = await resolveCrateName(requested);
+    if (!name) {
+      return res.status(404).json({ error: `no crate matches '${requested}'` });
+    }
     const allVersions = req.query.versions === 'all';
     const deps = req.query.deps !== 'false';
     const invokes = req.query.invokes !== 'false';
@@ -198,6 +232,7 @@ api.get(
     if (g.nodes.length === 0) {
       return res.status(404).json({ error: `crate '${name}' not found` });
     }
+    g.meta.resolvedName = name;
 
     for (const row of g.rows) {
       if (!row.v) continue;
@@ -265,6 +300,272 @@ api.post(
   }),
 );
 
+// ---------------------------------------------------------------------------
+// Crate-level dependency view
+// ---------------------------------------------------------------------------
+
+/**
+ * Synthetic crate->crate edge: "some version of `from` depends on `to`".
+ * `versions` is how many distinct versions of `from` declare the dependency.
+ */
+const aggregatedDependsOn = (fromId, toId, versions) => ({
+  id: `dep:${fromId}->${toId}`,
+  type: 'DEPENDS_ON',
+  from: fromId,
+  to: toId,
+  properties: { versions, aggregated: true },
+});
+
+const depsFromRows = (g) => {
+  for (const row of g.rows) {
+    if (row.a && row.b) g.rels.push(aggregatedDependsOn(row.a.id, row.b.id, row.versions));
+  }
+  return g;
+};
+
+/** In-memory cache for the (expensive) whole-graph query, keyed by limit. Only non-empty results are cached. */
+const depsCache = new Map();
+
+/**
+ * Total distinct crate->crate pairs. Informational only, so it is computed in
+ * the background and never blocks a response: null until known, refreshed
+ * after depsCacheMs so it tracks an import in progress.
+ */
+let depsTotalPairs = { value: null, at: 0, inFlight: null };
+
+const totalCratePairs = () => {
+  const stale = Date.now() - depsTotalPairs.at > config.depsCacheMs;
+  if (stale && !depsTotalPairs.inFlight) {
+    depsTotalPairs.inFlight = readGraph(
+      `MATCH (v:Version)-[:DEPENDS_ON]->(b:Crate)
+       RETURN count(DISTINCT [v.name, b.name]) AS pairs`,
+      {},
+      { timeoutMs: config.depsTimeoutMs },
+    )
+      .then((g) => {
+        const pairs = g.rows[0]?.pairs ?? null;
+        if (pairs !== null && pairs > 0) depsTotalPairs = { ...depsTotalPairs, value: pairs, at: Date.now() };
+      })
+      .catch((err) => log(`total crate pairs count failed: ${err.message}`))
+      .finally(() => {
+        depsTotalPairs.inFlight = null;
+      });
+  }
+  return depsTotalPairs.value;
+};
+
+const clampDepsLimit = (value) => {
+  const n = Number.parseInt(value ?? '', 10);
+  if (!Number.isFinite(n) || n <= 0) return config.depsDefaultEdges;
+  return Math.min(n, config.depsMaxEdges);
+};
+
+/**
+ * Crate-level dependency graph: only `(Crate)` nodes and aggregated
+ * `DEPENDS_ON` edges. Every version of a crate is folded into the crate, and
+ * an edge A->B exists if any version of A depends on B.
+ *
+ * Query params:
+ *   crate     = name (may be partial)   neighbourhood of one crate; omit for the whole graph
+ *   direction = out | in | both         (default both; only with `crate`)
+ *   limit     = max edges               (default RENDER_DEPS_DEFAULT_EDGES, capped by RENDER_DEPS_MAX_EDGES)
+ *
+ * Without `crate` the response is the `limit` most-used crate->crate edges
+ * (ranked by how many versions declare them), so a capped view still shows
+ * the core of the ecosystem. meta.totalPairs reports the uncapped size.
+ */
+api.get(
+  '/graph/deps',
+  wrap(async (req, res) => {
+    const limit = clampDepsLimit(req.query.limit);
+    const crateInput = String(req.query.crate ?? '').trim();
+
+    if (!crateInput) {
+      const cached = depsCache.get(limit);
+      if (cached && Date.now() - cached.at < config.depsCacheMs) {
+        return res.json({ ...cached.payload, meta: { ...cached.payload.meta, cached: true } });
+      }
+      // Version nodes carry the crate name, so the VERSION_OF hop is unnecessary:
+      // group DEPENDS_ON edges by (v.name, b) and resolve the source Crate only
+      // for the `limit` winners. This scans every DEPENDS_ON edge once, which is
+      // why it gets its own (long) timeout.
+      const g = depsFromRows(
+        await readGraph(
+          `MATCH (v:Version)-[:DEPENDS_ON]->(b:Crate)
+           WITH v.name AS aName, b, count(*) AS versions
+           ORDER BY versions DESC
+           LIMIT $limit
+           MATCH (a:Crate {name: aName})
+           RETURN a, b, versions`,
+          { limit: neo4j.int(limit) },
+          { timeoutMs: config.depsTimeoutMs },
+        ),
+      );
+      const totalPairs = totalCratePairs();
+      const payload = {
+        ...stripRows(g),
+        meta: {
+          ...g.meta,
+          limit,
+          totalPairs,
+          truncated: g.rels.length >= limit && (totalPairs === null || totalPairs > limit),
+        },
+      };
+      if (g.rels.length > 0) depsCache.set(limit, { at: Date.now(), payload });
+      return res.json(payload);
+    }
+
+    const name = await resolveCrateName(crateInput);
+    if (!name) return res.status(404).json({ error: `no crate matches '${crateInput}'` });
+    const direction = req.query.direction === 'out' || req.query.direction === 'in' ? req.query.direction : 'both';
+    const cap = neo4j.int(limit);
+
+    const g = await readGraph(`MATCH (c:Crate {name: $name}) RETURN c`, { name });
+    if (direction !== 'in') {
+      mergeInto(
+        g,
+        depsFromRows(
+          await readGraph(
+            `MATCH (a:Crate {name: $name})
+             MATCH (v:Version {name: $name})-[:DEPENDS_ON]->(b:Crate)
+             WITH a, b, count(*) AS versions
+             ORDER BY versions DESC LIMIT $limit
+             RETURN a, b, versions`,
+            { name, limit: cap },
+          ),
+        ),
+      );
+    }
+    if (direction !== 'out') {
+      mergeInto(
+        g,
+        depsFromRows(
+          await readGraph(
+            `MATCH (b:Crate {name: $name})<-[:DEPENDS_ON]-(v:Version)
+             WITH b, v.name AS aName, count(*) AS versions
+             ORDER BY versions DESC LIMIT $limit
+             MATCH (a:Crate {name: aName})
+             RETURN a, b, versions`,
+            { name, limit: cap },
+          ),
+        ),
+      );
+    }
+    res.json({ ...stripRows(g), meta: { ...g.meta, limit, resolvedName: name } });
+  }),
+);
+
+/**
+ * Transitive dependency chain, crate level.
+ *
+ * Query params:
+ *   q      = filter text. A crate named exactly `q` is the only root when it
+ *            exists. Otherwise, with 3+ characters, every crate whose name
+ *            contains `q` (case-insensitive) is a root.
+ *   limit  = max edges in the response (default RENDER_DEPS_DEFAULT_EDGES, capped by RENDER_DEPS_MAX_EDGES)
+ *   depth  = max hops from the roots, 0 = unlimited (default 0)
+ *   exact  = 1 to force an exact name match regardless of length (suggestion picked)
+ *
+ * Breadth-first from the roots: each level is one query that resolves the
+ * crate-level dependencies (any version of A depends on B) of the whole
+ * frontier. Stops when the frontier is empty, `depth` is reached, or the edge
+ * cap is hit; meta reports which. Root nodes are always included even if
+ * they have no dependencies.
+ */
+api.get(
+  '/graph/deps/chain',
+  wrap(async (req, res) => {
+    const q = String(req.query.q ?? '').trim();
+    if (!q) return res.status(400).json({ error: 'q is required' });
+    const limit = clampDepsLimit(req.query.limit);
+    const maxDepth = Math.max(0, Number.parseInt(req.query.depth ?? '0', 10) || 0);
+    const forceExact = req.query.exact === '1' || req.query.exact === 'true';
+    const started = Date.now();
+
+    // Roots: the exact crate if it exists; otherwise all partial matches (3+ chars).
+    let rootsGraph = await readGraph(`MATCH (c:Crate {name: $q}) RETURN c`, { q });
+    let exact = rootsGraph.nodes.length > 0;
+    let partial = false;
+    if (!exact && !forceExact && q.length >= 3) {
+      partial = true;
+      rootsGraph = await readGraph(
+        `MATCH (c:Crate) WHERE toLower(c.name) CONTAINS $q RETURN c ORDER BY size(c.name), c.name`,
+        { q: q.toLowerCase() },
+        { timeoutMs: config.depsTimeoutMs },
+      );
+    }
+    if (rootsGraph.nodes.length === 0) {
+      return res.status(404).json({
+        error: partial ? `no crate name contains '${q}'` : q.length >= 3 ? `no crate named '${q}'` : `no crate named '${q}' (3+ characters enables partial matching)`,
+      });
+    }
+
+    const g = { nodes: [...rootsGraph.nodes], rels: [], meta: { records: rootsGraph.meta.records, elapsedMs: 0 } };
+    const roots = rootsGraph.nodes.map((n) => n.properties.name);
+    const visited = new Set(roots);
+    let frontier = roots;
+    let depth = 0;
+    let truncated = false;
+
+    while (frontier.length > 0 && (maxDepth === 0 || depth < maxDepth)) {
+      const remaining = limit - g.rels.length;
+      if (remaining <= 0) {
+        truncated = true;
+        break;
+      }
+      // Crate.name is unique-constrained (indexed); Version.name is reached via VERSION_OF.
+      const level = depsFromRows(
+        await readGraph(
+          `MATCH (a:Crate) WHERE a.name IN $names
+           MATCH (a)-[:VERSION_OF]-(v:Version)-[:DEPENDS_ON]->(b:Crate)
+           WITH a, b, count(v) AS versions
+           ORDER BY a.name = $q DESC, versions DESC
+           RETURN a, b, versions
+           LIMIT $limit`,
+          { names: frontier, q, limit: neo4j.int(remaining + 1) },
+          { timeoutMs: config.depsTimeoutMs },
+        ),
+      );
+      if (level.rels.length > remaining) {
+        truncated = true;
+        level.rels = level.rels.slice(0, remaining);
+        const keep = new Set(level.rels.flatMap((r) => [r.from, r.to]));
+        level.nodes = level.nodes.filter((n) => keep.has(n.id));
+      }
+      mergeInto(g, level);
+      depth += 1;
+      const next = [];
+      for (const n of level.nodes) {
+        const name = n.properties.name;
+        if (!visited.has(name)) {
+          visited.add(name);
+          next.push(name);
+        }
+      }
+      frontier = next;
+      if (truncated) break;
+    }
+
+    res.json({
+      ...stripRows(g),
+      meta: {
+        ...g.meta,
+        elapsedMs: Date.now() - started,
+        query: q,
+        partial,
+        exact,
+        roots,
+        depth,
+        maxDepth,
+        limit,
+        truncated,
+        crates: g.nodes.length,
+        edges: g.rels.length,
+      },
+    });
+  }),
+);
+
 /** Fetch a single node (with properties) by elementId. */
 api.get(
   '/node/:id',
@@ -308,7 +609,14 @@ app.use('/api', api);
 // Error handler: Neo4j errors carry a `code`; surface it so the UI can show it.
 // eslint-disable-next-line no-unused-vars
 app.use('/api', (err, _req, res, _next) => {
-  const status = err.type === 'entity.parse.failed' ? 400 : err.code?.startsWith('Neo.ClientError') ? 400 : 500;
+  const status =
+    err.type === 'entity.parse.failed'
+      ? 400
+      : err.code === 'Neo.ClientError.Transaction.TransactionTimedOut'
+        ? 504
+        : err.code?.startsWith('Neo.ClientError')
+          ? 400
+          : 500;
   log(`api error ${status}: ${err.code ?? ''} ${err.message}`);
   res.status(status).json({ error: err.message, code: err.code ?? null });
 });

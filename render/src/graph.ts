@@ -69,6 +69,10 @@ export const nodeTitle = (n: GraphNode): string => {
 
 export const relTitle = (r: GraphRel): string => {
   if (r.type === 'INVOKES' && typeof r.properties.count === 'number') return `INVOKES ×${r.properties.count}`;
+  if (r.type === 'DEPENDS_ON' && r.properties.aggregated === true) {
+    const v = Number(r.properties.versions ?? 0);
+    return `${v} version${v === 1 ? '' : 's'}`;
+  }
   if (r.type === 'DEPENDS_ON') {
     const kind = r.properties.kind && r.properties.kind !== 'normal' ? ` (${r.properties.kind})` : '';
     const opt = r.properties.optional ? ' optional' : '';
@@ -124,6 +128,8 @@ export const toNvl = (
     let width = 1;
     if (r.type === 'INVOKES' && typeof r.properties.count === 'number') {
       width = Math.min(1 + Math.log2(r.properties.count + 1), 8);
+    } else if (r.type === 'DEPENDS_ON' && typeof r.properties.versions === 'number') {
+      width = Math.min(1 + Math.log2(r.properties.versions + 1) / 2, 6);
     }
     rels.push({
       id: r.id,

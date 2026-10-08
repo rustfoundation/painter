@@ -4,7 +4,10 @@ CREATE CONSTRAINT FOR (n:Version) REQUIRE (n.name, n.version) IS UNIQUE
 CREATE INDEX idx_invoke FOR ()-[r:INVOKES]-() ON (r.caller, r.callee)
 CREATE INDEX idx_is_latest FOR (n:Version) ON (n.latest)
 CREATE INDEX idx_unsafe_total FOR (n:Version) ON (n.unsafe_total)
+CREATE TEXT INDEX idx_crate_name_text IF NOT EXISTS FOR (n:Crate) ON (n.name)
 ```
+
+`idx_crate_name_text` backs the render UI's partial-name search (`CONTAINS`).
 
 ### Enterprise Indexes
 

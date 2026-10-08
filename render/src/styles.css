@@ -111,6 +111,10 @@ input.limit {
   margin-left: 4px;
 }
 
+input.limit.wide {
+  width: 90px;
+}
+
 button {
   background: var(--panel-2);
   color: var(--text);
@@ -142,6 +146,31 @@ button.danger {
 
 button.danger:hover:not(:disabled) {
   border-color: var(--danger);
+}
+
+/* segmented view switch */
+.views {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.views button {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 6px 12px;
+  color: var(--muted);
+}
+
+.views button + button {
+  border-left: 1px solid var(--border);
+}
+
+.views button.active {
+  background: var(--accent);
+  color: #fff;
 }
 
 label.opt {

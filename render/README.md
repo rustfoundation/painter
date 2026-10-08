@@ -36,6 +36,10 @@ Everything is an environment variable, read once at startup
 | `NEO4J_CONNECT_RETRIES`       | `0` (forever)             | Startup connectivity retries before exiting                 |
 | `NEO4J_CONNECT_RETRY_DELAY_MS`| `3000`                    |                                                             |
 | `RENDER_ALLOW_CYPHER`         | `true`                    | Set `false` to disable the ad-hoc Cypher panel              |
+| `RENDER_DEPS_MAX_EDGES`       | `50000`                   | Cap on crate→crate edges per Deps-view response             |
+| `RENDER_DEPS_DEFAULT_EDGES`   | `5000`                    | Deps-view edge limit when the request gives none            |
+| `RENDER_DEPS_CACHE_MS`        | `600000`                  | In-memory cache lifetime for the whole-graph Deps query     |
+| `RENDER_DEPS_TIMEOUT_MS`      | `180000`                  | Transaction timeout for the whole-graph Deps query          |
 | `PORT`                        | `8080`                    | HTTP port                                                   |
 | `HOST`                        | `0.0.0.0`                 | Bind address                                                |
 
@@ -95,9 +99,38 @@ The server starts serving immediately and keeps retrying the database in the
 background, so `render` can come up before `neo4j` is ready. The status bar
 in the UI (and `GET /api/health`) shows the real connection state.
 
+## Views
+
+The toolbar's **Views** switch picks which graph the canvas shows:
+
+- **Default**: crates, versions, and their `VERSION_OF` / `DEPENDS_ON` /
+  `INVOKES` edges, as described below.
+- **Deps**: crates only, as a transitive dependency chain. Type a crate name
+  and press Load. A crate with exactly that name is the only root when it
+  exists (`serde` is just serde). Otherwise, with 3 or more characters, every
+  crate whose name contains the text (case-insensitive) becomes a root
+  (`serde_js` is serde_json, serde_json5, ...). Every version of a crate is folded into its crate node and the
+  view draws one edge A → B when *any* version of A depends on B, following
+  the chain breadth-first until it ends, **max depth** is reached (0 =
+  unlimited), or **max edges** (default 5000) is hit; the status bar reports
+  which. The details panel can add a crate's direct dependents or
+  dependencies, or restart the chain from that crate. Edge width reflects the
+  number of versions declaring the dependency.
+
+`RENDER_DEPS_MAX_EDGES` (default 50000) caps one response and
+`RENDER_DEPS_DEFAULT_EDGES` (default 5000) is the limit used when none is
+given. Each breadth-first level is one query with its own timeout
+(`RENDER_DEPS_TIMEOUT_MS`, default 3 minutes). `GET /api/graph/deps` (whole
+graph or one crate's direct neighbours, cached for `RENDER_DEPS_CACHE_MS`)
+remains available to API users but the UI no longer loads the whole graph.
+
 ## Using the UI
 
-- Type a crate name (autocomplete) and press Load. Options next to the box
+- Type a crate name, or part of one, and press Load. Suggestions and Load
+  both match case-insensitively anywhere in the name, prefix matches first
+  (`serd` → `serde`, `serde_json`, ...). Load picks the top match and shows
+  the resolved name in the box. Create the TEXT index from
+  `docker/queries.md` to keep `CONTAINS` fast on a full graph. Options next to the box
   control what is fetched: latest or all versions, outgoing `DEPENDS_ON`,
   outgoing `INVOKES`, incoming dependents, and a per-type limit.
 - Click a node or edge to see its properties. The side panel offers targeted
@@ -132,5 +165,7 @@ where `id` is the Neo4j `elementId`.
 | `GET /api/crates/search?q=&limit=` | Crate names starting with `q`                                 |
 | `GET /api/graph/crate/:name`       | Crate neighbourhood; see query params in `server/index.mjs`   |
 | `POST /api/graph/expand`           | `{id, direction, types, limit}` neighbours of a node          |
+| `GET /api/graph/deps`              | Crate-level graph; `crate=`, `direction=`, `limit=`            |
+| `GET /api/graph/deps/chain`        | Transitive crate-level chain; `q=`, `limit=`, `depth=` (Deps view) |
 | `GET /api/node/:id`                | Single node by elementId                                      |
 | `POST /api/cypher`                 | `{query, params}` read-only, row-capped                       |

@@ -19,7 +19,24 @@ export interface GraphPayload {
   rels: GraphRel[];
   rows?: Record<string, unknown>[];
   columns?: string[];
-  meta: { records: number; elapsedMs: number; truncated?: boolean };
+  meta: {
+    records: number;
+    elapsedMs: number;
+    truncated?: boolean;
+    resolvedName?: string;
+    /** Deps view: edge cap applied, total crate->crate pairs in the DB (whole-graph only), cache hit. */
+    limit?: number;
+    totalPairs?: number | null;
+    cached?: boolean;
+    /** Deps chain: filter text, whether it was a partial match, root crate names, depth reached. */
+    query?: string;
+    partial?: boolean;
+    roots?: string[];
+    depth?: number;
+    maxDepth?: number;
+    crates?: number;
+    edges?: number;
+  };
 }
 
 export interface Health {
@@ -29,8 +46,18 @@ export interface Health {
   config: {
     neo4j: { uri: string; user: string; database: string; maxRows: number; queryTimeoutMs: number };
     allowCypher: boolean;
+    depsMaxEdges: number;
+    depsDefaultEdges: number;
   };
 }
+
+/** Which graph the UI shows. */
+export type View = 'default' | 'deps';
+
+export const VIEWS: { id: View; label: string; title: string }[] = [
+  { id: 'default', label: 'Default', title: 'Crates, versions, and their DEPENDS_ON / INVOKES edges' },
+  { id: 'deps', label: 'Deps', title: 'Transitive crate-level dependency chain of every crate matching the filter' },
+];
 
 export interface Stats {
   crates: number;
@@ -95,6 +122,20 @@ export const api = {
       limit: String(opts.limit),
     });
     return request<GraphPayload>(`/api/graph/crate/${encodeURIComponent(name)}?${params}`);
+  },
+  /**
+   * Transitive crate-level dependency chain for every crate matching `q`
+   * (partial match from 3 characters, exact below). depth 0 = unlimited.
+   */
+  loadDepsChain: (q: string, limit: number, depth: number, exact = false) =>
+    request<GraphPayload>(
+      `/api/graph/deps/chain?${new URLSearchParams({ q, limit: String(limit), depth: String(depth), exact: exact ? '1' : '0' })}`,
+    ),
+  /** Crate-level dependency graph. `crate` null loads the whole (capped) graph. */
+  loadDeps: (crate: string | null, direction: 'in' | 'out' | 'both', limit: number) => {
+    const params = new URLSearchParams({ direction, limit: String(limit) });
+    if (crate) params.set('crate', crate);
+    return request<GraphPayload>(`/api/graph/deps?${params}`);
   },
   expand: (id: string, direction: 'in' | 'out' | 'both', types: ExpandType[], limit = 100) =>
     request<GraphPayload>('/api/graph/expand', json({ id, direction, types, limit })),
