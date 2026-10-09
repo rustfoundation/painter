@@ -157,6 +157,9 @@ enum Command {
         /// rustup toolchain to compile with (`cargo +<toolchain>`).
         #[arg(long, default_value = compile::DEFAULT_TOOLCHAIN)]
         toolchain: String,
+        /// Compile at most N crates at a time (default: one per CPU).
+        #[arg(long, short = 'j', value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        jobs: Option<u64>,
         #[command(flatten)]
         rules: RulesArgs,
         #[command(flatten)]
@@ -261,6 +264,7 @@ async fn main() -> Result<(), Error> {
         Command::CompileAll {
             update_only,
             toolchain,
+            jobs,
             rules,
             roots,
         } => {
@@ -269,6 +273,7 @@ async fn main() -> Result<(), Error> {
             let opts = compile::CompileOptions {
                 update_only,
                 toolchain,
+                jobs: jobs.map(|j| usize::try_from(j).unwrap_or(usize::MAX)),
                 ..compile::CompileOptions::default()
             };
             let rules = rules.into_rules()?;

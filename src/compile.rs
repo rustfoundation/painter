@@ -19,6 +19,9 @@ pub enum Error {
     ///
     #[error("Clean stage failed")]
     CleanFailure(std::process::Output),
+    /// The bounded compile pool could not be built.
+    #[error("Thread pool error: {0}")]
+    ThreadPool(#[from] rayon::ThreadPoolBuildError),
     ///
     #[error("LLVM IR failure: {0}")]
     LLVMError(String),
@@ -152,6 +155,9 @@ pub struct CompileOptions {
     /// How many crates to resolve through the rules concurrently (bounds requests to external
     /// data sources such as ecosyste.ms).
     pub rules_concurrency: usize,
+    /// How many crates to compile at once. `None` uses one per CPU. Each compile is itself a
+    /// `cargo` process that may spawn several `rustc` jobs for dependencies.
+    pub jobs: Option<usize>,
 }
 
 impl Default for CompileOptions {
@@ -160,6 +166,7 @@ impl Default for CompileOptions {
             update_only: true,
             toolchain: DEFAULT_TOOLCHAIN.to_string(),
             rules_concurrency: 16,
+            jobs: None,
         }
     }
 }
@@ -289,8 +296,9 @@ pub async fn plan(
 /// `fs` on demand.
 ///
 /// # Errors
-/// Returns `Error::IndexError` if the crates.io index cannot be opened, or `Error::RulesError`
-/// if the rules fail. Individual crate build failures are logged and skipped.
+/// Returns `Error::IndexError` if the crates.io index cannot be opened, `Error::RulesError`
+/// if the rules fail, or `Error::ThreadPool` if the compile pool cannot be created. Individual
+/// crate build failures are logged and skipped.
 pub async fn compile_all<P: AsRef<Path> + Send + Sync>(
     fs: CrateFs,
     bc_root: P,
@@ -301,10 +309,23 @@ pub async fn compile_all<P: AsRef<Path> + Send + Sync>(
 
     let work = plan(rules, opts.rules_concurrency).await?;
 
+    // A dedicated pool so `jobs` bounds the number of concurrent `cargo` processes regardless
+    // of how many threads the global rayon pool has.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(opts.jobs.unwrap_or(0))
+        .build()?;
+    log::info!(
+        "compiling {} crate versions, {} at a time",
+        work.len(),
+        pool.current_num_threads()
+    );
+
     let fs = Mutex::new(fs);
     let bc_root = bc_root.as_ref();
-    work.into_par_iter().for_each(|(name, version)| {
-        compile_version(&name, &version, &fs, bc_root, &opts);
+    pool.install(|| {
+        work.into_par_iter().for_each(|(name, version)| {
+            compile_version(&name, &version, &fs, bc_root, &opts);
+        });
     });
 
     Ok(())
