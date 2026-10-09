@@ -5,10 +5,12 @@
 //! - [`analysis`]: call-graph extraction from bitcode and export to Neo4j
 //! - [`crate_fs`]: cached extraction of `.crate` tarballs
 //! - [`db`]: the Neo4j connection wrapper and all Cypher
+//! - [`check`]: reconcile index, bytecode root, and database (`compile-check`)
 #![deny(clippy::all, clippy::pedantic)]
 #![allow(clippy::enum_variant_names)]
 
 pub mod analysis;
+pub mod check;
 pub mod compile;
 pub mod crate_fs;
 pub mod db;

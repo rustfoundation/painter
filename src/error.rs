@@ -1,4 +1,4 @@
-use crate::{compile, crate_fs, db, index, rules};
+use crate::{check, compile, crate_fs, db, index, rules};
 
 /// Top error type returned during any stage of analysis from compile to data import.
 #[derive(thiserror::Error, Debug)]
@@ -29,6 +29,9 @@ pub enum Error {
     ///
     #[error("Build rules error: {0}")]
     RulesError(#[from] rules::Error),
+    /// `compile-check` failure.
+    #[error("Compile check error: {0}")]
+    CheckError(#[from] check::Error),
     ///
     #[error("MissingBytecodesPath")]
     MissingBytecodesPath,

@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use libpainter::{
-    analysis, compile,
+    analysis, check, compile,
     db::Db,
     ecosystems::EcosystemsClient,
     index,
@@ -162,6 +162,19 @@ enum Command {
         #[command(flatten)]
         roots: RootsArgs,
     },
+    /// Compare the index against the bytecode root and the database: how many selected crate
+    /// versions have bytecode, a `(Version)` node, and exported `INVOKES` edges.
+    CompileCheck {
+        /// List every version that is missing bytecode, a database node, or both.
+        #[arg(long, short = 'v')]
+        verbose: bool,
+        #[command(flatten)]
+        db: DbArgs,
+        #[command(flatten)]
+        rules: RulesArgs,
+        #[command(flatten)]
+        roots: RootsArgs,
+    },
     /// Print the crate versions the build rules would select, without compiling.
     Plan {
         #[command(flatten)]
@@ -260,6 +273,29 @@ async fn main() -> Result<(), Error> {
             };
             let rules = rules.into_rules()?;
             compile::compile_all(roots.crate_fs()?, bc_root, opts, rules.as_ref()).await?;
+        }
+        Command::CompileCheck {
+            verbose,
+            db,
+            rules,
+            roots,
+        } => {
+            let roots = Roots::from(roots);
+            let bc_root = roots.bytecodes_root()?.clone();
+            let rules = rules.into_rules()?;
+            let opts = compile::CompileOptions::default();
+            let report = check::compile_check(
+                rules.as_ref(),
+                opts.rules_concurrency,
+                &bc_root,
+                db.connect().await?,
+            )
+            .await?;
+            print!("{}", report.render_summary());
+            if verbose {
+                println!();
+                print!("{}", report.render_missing());
+            }
         }
         Command::Plan { rules } => {
             let rules = rules.into_rules()?;

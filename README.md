@@ -99,6 +99,9 @@ in the ecosystem for mirroring. For this project we wrote [walterhpearce/crates-
 - `cargo +nightly run --release -- compile-all -s cargo_sources -b cargo_bytecodes`
 - `cargo +nightly run --release -- export-all-neo4j -s /storage/crates/sources -b cargo_bytecodes -d bolt://127.0.0.1:7687 -u neo4j -p changeme123` 
 - `cargo +nightly run --release -- count-unsafe -s cargo_sources -c cargo_crates -d bolt://127.0.0.1:7687 -u neo4j -p changeme123`
+- `cargo +nightly run --release -- compile-check -s cargo_sources -c cargo_crates -b cargo_bytecodes -d bolt://127.0.0.1:7687 -u neo4j -p changeme123`
+  prints how many selected crates/versions have bytecode, a `Version` node, and `INVOKES` edges; takes the
+  same rule flags as `compile-all` (`--all-versions`, `--only`, `--top-*`), and `-v` lists every incomplete version.
 ### Database 
 
 Current `crates.io` graph snapshot: *Coming Soon*

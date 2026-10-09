@@ -60,3 +60,5 @@ neo4rs = { version = "0.6", optional = true }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+[dev-dependencies]
+tempfile = "3"

@@ -62,6 +62,15 @@ pub struct VersionRow {
     pub dependencies: Vec<DependencyRow>,
 }
 
+/// What the database holds for one crate, as returned by [`Db::crate_version_status`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrateDbStatus {
+    /// Version strings with a `(Version)` node.
+    pub versions: std::collections::HashSet<String>,
+    /// Version strings whose node has at least one outgoing `INVOKES` edge.
+    pub exported: std::collections::HashSet<String>,
+}
+
 pub struct Db {
     conn: Arc<Graph>,
 }
@@ -281,6 +290,53 @@ impl Db {
             .await?;
 
         Ok(())
+    }
+
+    /// For each crate name that has a `(Crate)` node, list its `(Version)` nodes and which of
+    /// them carry `INVOKES` edges. Names with no `(Crate)` node are absent from the result.
+    /// Versions are reached through `VERSION_OF` because the `(name, version)` constraint
+    /// index cannot serve a name-only lookup, which would otherwise scan every `Version`.
+    ///
+    /// # Panics
+    /// Panics if the server returns a row without the requested columns.
+    /// # Errors
+    /// Returns `Error::Neo4jError` on a query failure.
+    pub async fn crate_version_status(
+        &self,
+        names: &[&str],
+    ) -> Result<std::collections::HashMap<String, CrateDbStatus>, Error> {
+        let mut result = self
+            .conn
+            .execute(
+                query(
+                    "UNWIND $names AS name
+                     MATCH (c:Crate { name: name })
+                     OPTIONAL MATCH (c)-[:VERSION_OF]->(v:Version)
+                     WITH name, v,
+                          CASE WHEN v IS NULL THEN false
+                               ELSE EXISTS { (v)-[:INVOKES]->() } END AS exported
+                     RETURN name,
+                            collect(v.version) AS versions,
+                            collect(CASE WHEN exported THEN v.version END) AS exported",
+                )
+                .param("names", names.to_vec()),
+            )
+            .await?;
+
+        let mut out = std::collections::HashMap::new();
+        while let Ok(Some(row)) = result.next().await {
+            let name: String = row.get("name").unwrap();
+            let versions: Vec<String> = row.get("versions").unwrap();
+            let exported: Vec<String> = row.get("exported").unwrap();
+            out.insert(
+                name,
+                CrateDbStatus {
+                    versions: versions.into_iter().collect(),
+                    exported: exported.into_iter().collect(),
+                },
+            );
+        }
+        Ok(out)
     }
 
     /// Upserts a new function invocation into the database. This creates the specified relationship
