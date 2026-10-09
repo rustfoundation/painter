@@ -275,3 +275,198 @@ impl EcosystemsClient {
         .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A one-shot HTTP/1.1 server: `respond(path_and_query, hit_number) -> (status, body)`.
+    async fn serve<F>(respond: F) -> (String, Arc<AtomicUsize>)
+    where
+        F: Fn(&str, usize) -> (u16, String) + Send + Sync + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let target = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let hit = counter.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = respond(&target, hit);
+                let reason = if status == 200 { "OK" } else { "ERR" };
+                let resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/api/v1"), hits)
+    }
+
+    fn query(target: &str, key: &str) -> Option<String> {
+        target
+            .split_once('?')?
+            .1
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(&format!("{key}=")).map(str::to_string))
+    }
+
+    #[test]
+    fn base_url_trailing_slash_is_trimmed() {
+        let c = EcosystemsClient::new("http://example/api/v1/");
+        assert_eq!(
+            c.registry_url("packages"),
+            "http://example/api/v1/registries/crates.io/packages"
+        );
+    }
+
+    #[test]
+    fn maintainer_id_prefers_login() {
+        let m: Maintainer = serde_json::from_str(r#"{"uuid":"u1","login":"alice"}"#).unwrap();
+        assert_eq!(m.id(), "alice");
+        let m: Maintainer = serde_json::from_str(r#"{"uuid":"u1"}"#).unwrap();
+        assert_eq!(m.id(), "u1");
+    }
+
+    #[tokio::test]
+    async fn top_packages_paginates_until_a_short_page() {
+        let (url, hits) = serve(|target, _| {
+            assert!(target.starts_with("/api/v1/registries/crates.io/packages?"));
+            assert_eq!(query(target, "sort").as_deref(), Some("downloads"));
+            let page: usize = query(target, "page").unwrap().parse().unwrap();
+            let per_page: usize = query(target, "per_page").unwrap().parse().unwrap();
+            // 1000 then 500 requested; return a full first page and a short second one.
+            let count = if page == 1 { per_page } else { 1 };
+            let items: Vec<String> = (0..count)
+                .map(|i| format!(r#"{{"name":"p{page}-{i}","downloads":{i}}}"#))
+                .collect();
+            (200, format!("[{}]", items.join(",")))
+        })
+        .await;
+        let client = EcosystemsClient::new(&url);
+        let pkgs = client
+            .top_packages(PackageSort::Downloads, 1500)
+            .await
+            .unwrap();
+        assert_eq!(pkgs.len(), 1001);
+        assert_eq!(pkgs[0].name, "p1-0");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn top_packages_caps_the_page_size_to_the_limit() {
+        let (url, hits) = serve(|target, _| {
+            assert_eq!(query(target, "per_page").as_deref(), Some("3"));
+            assert_eq!(
+                query(target, "sort").as_deref(),
+                Some("dependent_packages_count")
+            );
+            (
+                200,
+                r#"[{"name":"a"},{"name":"b"},{"name":"c"}]"#.to_string(),
+            )
+        })
+        .await;
+        let pkgs = EcosystemsClient::new(&url)
+            .top_packages(PackageSort::DependentPackages, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            pkgs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "limit reached: no second page requested"
+        );
+    }
+
+    #[tokio::test]
+    async fn package_versions_parse_dates_and_paths() {
+        let (url, _) = serve(|target, _| {
+            assert!(target.starts_with("/api/v1/registries/crates.io/packages/serde/versions?"));
+            (
+                200,
+                r#"[{"number":"1.0.0","published_at":"2017-04-20T10:00:00.000Z"},{"number":"0.1.0"}]"#.to_string(),
+            )
+        })
+        .await;
+        let versions = EcosystemsClient::new(&url)
+            .package_versions("serde")
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].number, "1.0.0");
+        assert_eq!(
+            versions[0].published_at.unwrap().to_rfc3339(),
+            "2017-04-20T10:00:00+00:00"
+        );
+        assert!(versions[1].published_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn maintainers_ranked_by_downloads_client_side() {
+        let (url, _) = serve(|_, _| {
+            (
+                200,
+                r#"[{"uuid":"a","login":"alice","total_downloads":10},
+                    {"uuid":"b","total_downloads":300},
+                    {"uuid":"c","login":"carol"}]"#
+                    .to_string(),
+            )
+        })
+        .await;
+        let top = EcosystemsClient::new(&url)
+            .top_maintainers_by_downloads(2)
+            .await
+            .unwrap();
+        assert_eq!(
+            top.iter().map(Maintainer::id).collect::<Vec<_>>(),
+            ["b", "alice"]
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_errors_are_retried_and_hard_errors_are_not() {
+        let (url, hits) = serve(|_, hit| {
+            if hit == 0 {
+                (503, "busy".to_string())
+            } else {
+                (200, r#"[{"name":"ok"}]"#.to_string())
+            }
+        })
+        .await;
+        let pkgs = EcosystemsClient::new(&url)
+            .maintainer_packages("alice")
+            .await
+            .unwrap();
+        assert_eq!(pkgs[0].name, "ok");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        let (url, hits) = serve(|_, _| (404, "{}".to_string())).await;
+        let err = EcosystemsClient::new(&url)
+            .maintainer_packages("nobody")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Status { status, .. } if status == reqwest::StatusCode::NOT_FOUND)
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "4xx is not retried");
+    }
+}

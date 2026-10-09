@@ -242,6 +242,107 @@ impl BuildRules for EcosystemsRules {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::test_support::fake_crate;
+
+    fn utc(s: &str) -> DateTime<Utc> {
+        EcosystemsRules::parse_date(s).unwrap()
+    }
+
+    #[test]
+    fn index_versions_highest_or_all_unyanked() {
+        let c = fake_crate(
+            "foo",
+            &[
+                ("0.1.0", false, &[]),
+                ("0.2.0", true, &[]),
+                ("0.3.0", false, &[]),
+            ],
+        );
+        let highest: Vec<_> = index_versions(&c, false)
+            .iter()
+            .map(|v| v.version().to_string())
+            .collect();
+        assert_eq!(highest, ["0.3.0"]);
+        let all: Vec<_> = index_versions(&c, true)
+            .iter()
+            .map(|v| v.version().to_string())
+            .collect();
+        assert_eq!(all, ["0.1.0", "0.3.0"], "yanked versions are dropped");
+    }
+
+    #[test]
+    fn filter_newer_than_drops_old_and_undated_versions() {
+        let c = fake_crate(
+            "foo",
+            &[
+                ("0.1.0", false, &[]),
+                ("0.2.0", false, &[]),
+                ("0.3.0", false, &[]),
+            ],
+        );
+        let cutoff = utc("2024-01-01");
+        let published = |v: &str| match v {
+            "0.1.0" => Some(utc("2023-06-01")),
+            "0.2.0" => Some(utc("2024-01-01")), // exactly the cutoff: not strictly newer
+            "0.3.0" => Some(utc("2024-02-01")),
+            _ => None,
+        };
+        let kept: Vec<_> = filter_newer_than(index_versions(&c, true), &published, &cutoff)
+            .iter()
+            .map(|v| v.version().to_string())
+            .collect();
+        assert_eq!(kept, ["0.3.0"]);
+
+        let none = filter_newer_than(index_versions(&c, true), &|_| None, &cutoff);
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_everything_visits_whole_index() {
+        let rules = BuildEverything {
+            all_versions: false,
+        };
+        assert_eq!(rules.candidate_crates().await.unwrap(), None);
+        let c = fake_crate("foo", &[("0.1.0", false, &[]), ("0.2.0", false, &[])]);
+        let v = rules.select_versions(&c).await.unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].version(), "0.2.0");
+    }
+
+    #[tokio::test]
+    async fn named_crates_lists_names() {
+        let rules = NamedCrates {
+            names: vec!["a".into(), "b".into()],
+            all_versions: true,
+        };
+        assert_eq!(
+            rules.candidate_crates().await.unwrap(),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        let c = fake_crate("a", &[("0.1.0", false, &[]), ("0.2.0", false, &[])]);
+        assert_eq!(rules.select_versions(&c).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ecosystems_rules_without_selectors_cover_the_index() {
+        let rules = EcosystemsRules::default();
+        assert!(!rules.has_crate_selectors());
+        assert_eq!(rules.candidate_crates().await.unwrap(), None);
+        // No `newer_than`: versions pass straight through without any API call.
+        let c = fake_crate("a", &[("0.1.0", false, &[])]);
+        assert_eq!(rules.select_versions(&c).await.unwrap().len(), 1);
+
+        let rules = EcosystemsRules {
+            crates: vec!["serde".into()],
+            ..EcosystemsRules::default()
+        };
+        assert!(rules.has_crate_selectors());
+        // Explicit crates need no API call either.
+        assert_eq!(
+            rules.candidate_crates().await.unwrap(),
+            Some(vec!["serde".to_string()])
+        );
+    }
 
     #[test]
     fn parses_dates() {

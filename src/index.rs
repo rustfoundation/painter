@@ -312,3 +312,81 @@ pub async fn set_latest_versions(conn: Arc<Db>) -> Result<(), Error> {
 
     Ok(())
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crates_index::Crate;
+
+    /// One dependency of a fake index record: `(name, req, optional, package_rename)`.
+    pub type FakeDep<'a> = (&'a str, &'a str, bool, Option<&'a str>);
+    /// One version of a fake index record: `(version, yanked, deps)`.
+    pub type FakeVersion<'a> = (&'a str, bool, &'a [FakeDep<'a>]);
+
+    /// Build an index `Crate` from [`FakeVersion`] records.
+    pub fn fake_crate(name: &str, versions: &[FakeVersion<'_>]) -> Crate {
+        let mut lines = Vec::new();
+        for (vers, yanked, deps) in versions {
+            let deps: Vec<String> = deps
+                .iter()
+                .map(|(dn, req, optional, package)| {
+                    let package = package.map_or("null".to_string(), |p| format!("\"{p}\""));
+                    format!(
+                        "{{\"name\":\"{dn}\",\"req\":\"{req}\",\"features\":[\"std\"],\
+                         \"optional\":{optional},\"default_features\":true,\"target\":null,\
+                         \"kind\":\"normal\",\"package\":{package}}}"
+                    )
+                })
+                .collect();
+            lines.push(format!(
+                "{{\"name\":\"{name}\",\"vers\":\"{vers}\",\"deps\":[{}],\
+                 \"cksum\":\"{}\",\"features\":{{}},\"yanked\":{yanked}}}",
+                deps.join(","),
+                "0".repeat(64)
+            ));
+        }
+        Crate::from_slice(lines.join("\n").as_bytes()).expect("valid index json")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::fake_crate;
+    use super::*;
+
+    #[test]
+    fn version_rows_mirror_the_index_record() {
+        let c = fake_crate(
+            "foo",
+            &[
+                ("0.1.0", false, &[("serde", "^1.0", true, None)]),
+                (
+                    "0.2.0",
+                    false,
+                    &[("tokio", ">=1", false, Some("tokio-renamed"))],
+                ),
+            ],
+        );
+        let rows = version_rows(&c);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].version, "0.1.0");
+        let d = &rows[0].dependencies[0];
+        assert_eq!(d.name, "serde");
+        assert_eq!(d.requirement, "^1.0");
+        assert_eq!(d.features, "std");
+        assert_eq!(d.kind, "Normal");
+        assert!(d.optional);
+
+        // `package = "..."` renames: the row carries the real crate name, not the alias.
+        let d = &rows[1].dependencies[0];
+        assert_eq!(d.name, "tokio-renamed");
+        assert!(!d.optional);
+    }
+
+    #[test]
+    fn version_rows_handle_crates_without_dependencies() {
+        let c = fake_crate("bare", &[("1.0.0", false, &[])]);
+        let rows = version_rows(&c);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].dependencies.is_empty());
+    }
+}

@@ -307,10 +307,165 @@ mod tests {
             split_full_name("serde-1.0.172-alpha.0"),
             Some(("serde", "1.0.172-alpha.0"))
         );
-        assert_eq!(split_full_name("serde-0.9.0-rc4"), Some(("serde", "0.9.0-rc4")));
+        assert_eq!(
+            split_full_name("serde-0.9.0-rc4"),
+            Some(("serde", "0.9.0-rc4"))
+        );
         assert_eq!(split_full_name("foo-2d-1.0.0"), Some(("foo-2d", "1.0.0")));
         assert_eq!(split_full_name("nodash"), None);
         assert_eq!(split_full_name("-1.0.0"), None);
+    }
+
+    /// Write a gzipped tarball `<name>-<version>.crate` containing `<name>-<version>/<files>`
+    /// at `dest`.
+    fn write_crate_tarball(dest: &Path, entry: &CrateEntry, files: &[(&str, &str)]) {
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(dest).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut tar = tar::Builder::new(gz);
+        for (name, body) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(
+                &mut header,
+                format!("{}/{name}", entry.full_name()),
+                body.as_bytes(),
+            )
+            .unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+
+    #[test]
+    fn crate_entry_accessors() {
+        let e = CrateEntry::new("foo-bar-1.2.3-beta.1").unwrap();
+        assert_eq!(e.name(), "foo-bar");
+        assert_eq!(e.version(), "1.2.3-beta.1");
+        assert_eq!(e.full_name(), "foo-bar-1.2.3-beta.1");
+        assert_eq!(e.filename(), "foo-bar-1.2.3-beta.1.crate");
+        assert_eq!(e, CrateEntry::from_parts("foo-bar", "1.2.3-beta.1"));
+        assert_eq!(CrateEntry::from("foo-bar-1.2.3-beta.1"), e);
+        assert!(matches!(
+            CrateEntry::new("noversion"),
+            Err(Error::CrateNameError(_))
+        ));
+    }
+
+    #[test]
+    fn locate_tries_every_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = CrateEntry::from_parts("serde", "1.0.0");
+        assert!(matches!(
+            e.locate(tmp.path()),
+            Err(Error::CrateFileNotFound)
+        ));
+
+        // Flat layout.
+        let flat = tmp.path().join("serde-1.0.0.crate");
+        std::fs::write(&flat, b"").unwrap();
+        assert_eq!(e.locate(tmp.path()).unwrap(), flat);
+
+        // Shard-only layout wins over flat.
+        let shard = tmp.path().join("se/rd/serde-1.0.0.crate");
+        std::fs::create_dir_all(shard.parent().unwrap()).unwrap();
+        std::fs::write(&shard, b"").unwrap();
+        assert_eq!(e.locate(tmp.path()).unwrap(), shard);
+
+        // Name directory wins over both.
+        let named = tmp.path().join("se/rd/serde/serde-1.0.0.crate");
+        std::fs::create_dir_all(named.parent().unwrap()).unwrap();
+        std::fs::write(&named, b"").unwrap();
+        assert_eq!(e.locate(tmp.path()).unwrap(), named);
+
+        // Mixed-case names shard by their lowercase form.
+        let upper = CrateEntry::from_parts("Serde", "1.0.0");
+        assert_eq!(
+            upper.candidate_paths(tmp.path())[0],
+            tmp.path().join("se/rd/serde/Serde-1.0.0.crate")
+        );
+    }
+
+    #[test]
+    fn crate_fs_extracts_caches_and_evicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crates = tmp.path().join("crates");
+        let sources = tmp.path().join("sources");
+        std::fs::create_dir_all(&crates).unwrap();
+        std::fs::create_dir_all(&sources).unwrap();
+
+        let entry = CrateEntry::from_parts("demo", "0.1.0");
+        write_crate_tarball(
+            &entry.candidate_paths(&crates)[0],
+            &entry,
+            &[
+                ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+                ("src/lib.rs", ""),
+            ],
+        );
+
+        let mut fs = CrateFs::new(CrateFsConfig::with_paths(&crates, &sources)).unwrap();
+        let extracted = fs.open("demo-0.1.0").unwrap().path().to_path_buf();
+        assert_eq!(extracted, sources.join("demo-0.1.0"));
+        assert_eq!(
+            std::fs::read_to_string(extracted.join("Cargo.toml")).unwrap(),
+            "[package]\nname = \"demo\"\n"
+        );
+        assert!(extracted.join("src/lib.rs").is_file());
+
+        // Second open hits the cache (same path, no re-extraction needed).
+        assert_eq!(fs.open_entry(entry.clone()).unwrap().path(), extracted);
+
+        // Closing evicts and deletes the extraction we created.
+        fs.close("demo-0.1.0").unwrap();
+        assert!(!extracted.exists());
+        assert!(matches!(fs.close("demo-0.1.0"), Err(Error::CrateNotFound)));
+
+        // Missing archive.
+        assert!(matches!(
+            fs.open("absent-1.0.0"),
+            Err(Error::CrateFileNotFound)
+        ));
+    }
+
+    #[test]
+    fn crate_cache_keeps_preexisting_extractions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crates = tmp.path().join("crates");
+        let sources = tmp.path().join("sources");
+        std::fs::create_dir_all(&crates).unwrap();
+        let pre = sources.join("demo-0.1.0");
+        std::fs::create_dir_all(&pre).unwrap();
+
+        let entry = CrateEntry::from_parts("demo", "0.1.0");
+        {
+            let cache = CrateCache::new(&entry, &crates, &sources).unwrap();
+            assert_eq!(cache.path(), pre);
+        }
+        assert!(pre.exists(), "pre-existing extraction must survive drop");
+    }
+
+    #[test]
+    fn crate_cache_rejects_archives_with_the_wrong_top_level_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crates = tmp.path().join("crates");
+        let sources = tmp.path().join("sources");
+        std::fs::create_dir_all(&sources).unwrap();
+
+        let entry = CrateEntry::from_parts("demo", "0.1.0");
+        // Archive is named for demo-0.1.0 but unpacks to other-9.9.9/.
+        write_crate_tarball(
+            &entry.candidate_paths(&crates)[2],
+            &CrateEntry::from_parts("other", "9.9.9"),
+            &[("Cargo.toml", "")],
+        );
+        assert!(matches!(
+            CrateCache::new(&entry, &crates, &sources),
+            Err(Error::ExtractionFailed)
+        ));
     }
 
     #[test]

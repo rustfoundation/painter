@@ -351,14 +351,95 @@ fn export_all_csv<P: AsRef<Path>>(bc_root: P) -> Result<(), Error> {
 mod tests {
     use super::*;
 
+    fn test_data() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data")
+    }
+
+    #[test]
+    fn extract_calls_reads_checked_in_bitcode() {
+        let calls = extract_calls(test_data()).unwrap();
+        assert!(!calls.is_empty(), "no call edges in test_data/*.bc");
+        for (caller, callee) in &calls {
+            assert_ne!(caller, "");
+            assert!(
+                callee_crate(callee).is_some(),
+                "std/core/intrinsic callee leaked through the filter: {callee}"
+            );
+        }
+        // The serde fixture calls into serde itself; demangled names must be legible paths.
+        assert!(calls.iter().any(|(_, callee)| callee.starts_with("serde::")
+            || callee.contains(" as serde::")
+            || callee.contains("<serde::")));
+    }
+
+    #[test]
+    fn extract_calls_on_an_empty_dir_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), "not bitcode").unwrap();
+        assert_eq!(
+            extract_calls(tmp.path()).unwrap(),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn count_unsafe_result_parses_tool_output_and_sums() {
+        let json = r#"{
+            "functions": {"safe": 10, "unsafe_": 1},
+            "exprs": {"safe": 100, "unsafe_": 2},
+            "item_impls": {"safe": 5, "unsafe_": 0},
+            "item_traits": {"safe": 1, "unsafe_": 0},
+            "methods": {"safe": 20, "unsafe_": 3}
+        }"#;
+        let r: CountUnsafeResult = serde_json::from_str(json).unwrap();
+        assert!(r.has_unsafe());
+        assert_eq!(r.total_unsafe(), 6);
+
+        let safe: CountUnsafeResult = serde_json::from_str(
+            r#"{"functions":{"safe":1,"unsafe_":0},"exprs":{"safe":1,"unsafe_":0},
+                "item_impls":{"safe":0,"unsafe_":0},"item_traits":{"safe":0,"unsafe_":0},
+                "methods":{"safe":0,"unsafe_":0}}"#,
+        )
+        .unwrap();
+        assert!(!safe.has_unsafe());
+        assert_eq!(safe.total_unsafe(), 0);
+    }
+
+    #[test]
+    fn export_crate_csv_writes_one_row_per_call() {
+        // Copy the fixture so the CSV lands in a scratch dir named like a crate version.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("serde-1.0.0");
+        std::fs::create_dir(&dir).unwrap();
+        for e in std::fs::read_dir(test_data())
+            .unwrap()
+            .filter_map(Result::ok)
+        {
+            if e.path().extension().is_some_and(|x| x == "bc") {
+                std::fs::copy(e.path(), dir.join(e.file_name())).unwrap();
+            }
+        }
+        export_crate_csv(&dir).unwrap();
+        let csv = std::fs::read_to_string(dir.join("calls.csv")).unwrap();
+        let calls = extract_calls(&dir).unwrap();
+        assert_eq!(csv.lines().count(), calls.len());
+        assert!(csv.lines().all(|l| l.starts_with("serde-1.0.0,")));
+    }
+
     #[test]
     fn crate_of_handles_plain_and_trait_impl_paths() {
-        assert_eq!(crate_of("serde::de::Deserialize::deserialize"), Some("serde"));
+        assert_eq!(
+            crate_of("serde::de::Deserialize::deserialize"),
+            Some("serde")
+        );
         assert_eq!(
             crate_of("<serde::de::WithDecimalPoint as core::fmt::Display>::fmt"),
             Some("serde")
         );
-        assert_eq!(crate_of("<&T as serde::Serialize>::serialize"), Some("serde"));
+        assert_eq!(
+            crate_of("<&T as serde::Serialize>::serialize"),
+            Some("serde")
+        );
         assert_eq!(crate_of("<[u8] as core::fmt::Debug>::fmt"), Some("core"));
         assert_eq!(crate_of("alloc::vec::Vec<T>::push"), Some("alloc"));
         assert_eq!(crate_of("__rust_alloc"), None);

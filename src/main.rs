@@ -341,3 +341,157 @@ async fn main() -> Result<(), Error> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Args {
+        Args::try_parse_from(std::iter::once("painter").chain(args.iter().copied())).unwrap()
+    }
+
+    const DB: [&str; 6] = ["-d", "bolt://127.0.0.1:7687", "-u", "neo4j", "-p", "pw"];
+    const ROOTS: [&str; 6] = ["-s", "/src", "-c", "/crates", "-b", "/bc"];
+
+    #[test]
+    fn roots_args_convert_to_roots() {
+        let args = parse(&[&["compile-check"][..], &DB, &ROOTS].concat());
+        let Command::CompileCheck {
+            roots, verbose, db, ..
+        } = args.command
+        else {
+            panic!("wrong command")
+        };
+        assert!(!verbose);
+        assert_eq!(db.host, "bolt://127.0.0.1:7687");
+        let roots = Roots::from(roots);
+        assert_eq!(roots.sources_root, PathBuf::from("/src"));
+        assert_eq!(roots.compressed_root, PathBuf::from("/crates"));
+        assert_eq!(roots.bytecodes_root, Some(PathBuf::from("/bc")));
+    }
+
+    #[test]
+    fn compile_all_jobs_flag() {
+        let args = parse(
+            &[
+                &["compile-all", "-j", "4", "--toolchain", "1.96.1"][..],
+                &ROOTS,
+            ]
+            .concat(),
+        );
+        let Command::CompileAll {
+            jobs,
+            toolchain,
+            update_only,
+            ..
+        } = args.command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(jobs, Some(4));
+        assert_eq!(toolchain, "1.96.1");
+        assert!(update_only);
+
+        let args = parse(&[&["compile-all"][..], &ROOTS].concat());
+        let Command::CompileAll {
+            jobs, toolchain, ..
+        } = args.command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(jobs, None);
+        assert_eq!(toolchain, compile::DEFAULT_TOOLCHAIN);
+
+        let zero = [&["compile-all", "-j", "0"][..], &ROOTS].concat();
+        assert!(Args::try_parse_from(std::iter::once("painter").chain(zero)).is_err());
+    }
+
+    #[test]
+    fn bytecodes_root_is_optional_at_parse_time() {
+        let args = parse(&["compile", "serde-1.0.0", "-s", "/src", "-c", "/crates"]);
+        let Command::Compile {
+            roots,
+            crate_fullname,
+            ..
+        } = args.command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(crate_fullname, "serde-1.0.0");
+        assert!(matches!(
+            Roots::from(roots).bytecodes_root(),
+            Err(Error::MissingBytecodesPath)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rules_args_pick_the_right_policy() {
+        let rules = |extra: &[&str]| {
+            let args = parse(&[&["plan"][..], extra].concat());
+            let Command::Plan { rules } = args.command else {
+                panic!("wrong command")
+            };
+            rules
+        };
+
+        // Nothing: whole index.
+        let r = rules(&[]).into_rules().unwrap();
+        assert_eq!(r.candidate_crates().await.unwrap(), None);
+
+        // --only alone: named crates, order preserved.
+        let r = rules(&["--only", "serde", "--only", "tokio"])
+            .into_rules()
+            .unwrap();
+        assert_eq!(
+            r.candidate_crates().await.unwrap(),
+            Some(vec!["serde".to_string(), "tokio".to_string()])
+        );
+
+        // --newer-than switches to ecosyste.ms rules; with --only the candidate set still needs
+        // no network. An invalid date is rejected up front.
+        let r = rules(&["--only", "serde", "--newer-than", "2024-01-01"])
+            .into_rules()
+            .unwrap();
+        assert_eq!(
+            r.candidate_crates().await.unwrap(),
+            Some(vec!["serde".to_string()])
+        );
+        assert!(matches!(
+            rules(&["--newer-than", "someday"]).into_rules(),
+            Err(Error::RulesError(_))
+        ));
+    }
+
+    #[test]
+    fn rules_args_parse_numeric_selectors() {
+        let args = parse(&[
+            "plan",
+            "--top-downloads",
+            "10",
+            "--top-reverse-deps",
+            "20",
+            "--top-maintainers",
+            "3",
+            "--all-versions",
+        ]);
+        let Command::Plan { rules } = args.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(rules.top_downloads, Some(10));
+        assert_eq!(rules.top_reverse_deps, Some(20));
+        assert_eq!(rules.top_maintainers, Some(3));
+        assert!(rules.all_versions);
+        assert_eq!(
+            rules.ecosystems_url,
+            libpainter::ecosystems::DEFAULT_BASE_URL
+        );
+    }
+
+    #[test]
+    fn import_crates_requires_a_name() {
+        let none = [&["import-crates"][..], &DB].concat();
+        assert!(Args::try_parse_from(std::iter::once("painter").chain(none)).is_err());
+        let args = parse(&[&["import-crates"][..], &DB, &["serde"]].concat());
+        assert!(matches!(args.command, Command::ImportCrates { names, .. } if names == ["serde"]));
+    }
+}

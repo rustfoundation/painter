@@ -729,3 +729,46 @@ impl Db {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_semver_accepts_strict_and_lenient_versions() {
+        let v = parse_semver("1.2.3").unwrap();
+        assert_eq!((v.major, v.minor, v.patch), (1, 2, 3));
+        // lenient: missing patch
+        let v = parse_semver("1.2").unwrap();
+        assert_eq!((v.major, v.minor, v.patch), (1, 2, 0));
+        // prerelease and build metadata survive
+        let v = parse_semver("1.0.0-alpha.1+build.5").unwrap();
+        assert_eq!(v.pre.as_str(), "alpha.1");
+        assert_eq!(v.build.as_str(), "build.5");
+    }
+
+    #[test]
+    fn parse_semver_falls_back_to_digit_stripping() {
+        // Not valid even for lenient_semver, but the index contains strings like this: the
+        // fallback keeps only the digits of the patch component.
+        assert!(lenient_semver::parse("1.2.3!!").is_err());
+        let v = parse_semver("1.2.3!!").unwrap();
+        assert_eq!((v.major, v.minor, v.patch), (1, 2, 3));
+        assert!(matches!(
+            parse_semver("1.x.3!!"),
+            Err(Error::InvalidSemver(_))
+        ));
+        assert!(matches!(
+            parse_semver("not.a.version"),
+            Err(Error::InvalidSemver(_))
+        ));
+        assert!(matches!(parse_semver(""), Err(Error::InvalidSemver(_))));
+    }
+
+    #[test]
+    fn crate_db_status_defaults_empty() {
+        let s = CrateDbStatus::default();
+        assert!(s.versions.is_empty());
+        assert!(s.exported.is_empty());
+    }
+}

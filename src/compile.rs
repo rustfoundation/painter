@@ -330,3 +330,112 @@ pub async fn compile_all<P: AsRef<Path> + Send + Sync>(
 
     Ok(())
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+
+    /// Environment variable overriding the toolchain used by tests that really invoke cargo.
+    pub const TEST_TOOLCHAIN_ENV: &str = "PAINTER_TEST_TOOLCHAIN";
+
+    /// Toolchain used by tests that really invoke cargo. Its LLVM must not be newer than the
+    /// LLVM `llvm-ir` links against or the emitted bitcode is unreadable (e.g. Rust 1.99 ships
+    /// LLVM 23, which LLVM 22 rejects with "Invalid record"). 1.96.1 ships LLVM 22.
+    pub fn test_toolchain() -> String {
+        std::env::var(TEST_TOOLCHAIN_ENV).unwrap_or_else(|_| "1.96.1".to_string())
+    }
+
+    /// Write a minimal library crate `<name>-<version>` under `root` with one cross-function
+    /// call that survives optimisation, and return its directory.
+    pub fn write_fixture_crate(root: &Path, name: &str, version: &str) -> std::path::PathBuf {
+        let dir = root.join(format!("{name}-{version}"));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n\n[lib]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "#[inline(never)]\npub fn callee(x: u32) -> u32 { x.wrapping_mul(3) }\n\
+             pub fn caller(x: u32) -> u32 { callee(x) + 1 }\n",
+        )
+        .unwrap();
+        dir
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{test_toolchain, write_fixture_crate};
+    use super::*;
+
+    #[test]
+    fn default_options() {
+        let o = CompileOptions::default();
+        assert!(o.update_only);
+        assert_eq!(o.toolchain, DEFAULT_TOOLCHAIN);
+        assert_eq!(o.rules_concurrency, 16);
+        assert_eq!(o.jobs, None);
+    }
+
+    #[test]
+    fn compile_crate_emits_bitcode_and_cleans_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = write_fixture_crate(tmp.path(), "painter_fixture", "0.1.0");
+        let bc_root = tmp.path().join("bc");
+
+        compile_crate(
+            "painter_fixture",
+            "0.1.0",
+            &src,
+            &bc_root,
+            &test_toolchain(),
+        )
+        .unwrap();
+
+        let out = bc_root.join("painter_fixture-0.1.0");
+        let bcs: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "bc"))
+            .collect();
+        assert!(!bcs.is_empty(), "no .bc copied into {}", out.display());
+        assert!(!src.join("target").exists(), "cargo clean did not run");
+
+        // The bitcode is readable by the linked LLVM and contains the intra-crate call.
+        let calls = crate::analysis::extract_calls(&out).unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|(src, dst)| src.contains("caller") && dst.contains("callee")),
+            "caller->callee edge missing from {calls:?}"
+        );
+    }
+
+    #[test]
+    fn compile_crate_reports_build_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = write_fixture_crate(tmp.path(), "broken", "0.1.0");
+        std::fs::write(src.join("src/lib.rs"), "pub fn nope() -> u32 { \"str\" }\n").unwrap();
+        let bc_root = tmp.path().join("bc");
+
+        let err = compile_crate("broken", "0.1.0", &src, &bc_root, &test_toolchain()).unwrap_err();
+        assert!(matches!(err, Error::CompileFailed(_)), "{err}");
+        assert!(
+            !bc_root.join("broken-0.1.0").exists(),
+            "no output dir on failure"
+        );
+    }
+
+    #[test]
+    fn clean_fails_outside_a_cargo_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            clean(tmp.path(), &test_toolchain()),
+            Err(Error::CleanFailure(_))
+        ));
+    }
+}
