@@ -13,6 +13,8 @@ import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
 import { config, describeConfig } from './config.mjs';
 import { collectGraph } from './graph.mjs';
+import { createLodJobs } from './lod/jobs.mjs';
+import { LodIndex } from './lod/index.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const distDir = path.resolve(here, '..', 'dist');
@@ -566,6 +568,163 @@ api.get(
   }),
 );
 
+// ---------------------------------------------------------------------------
+// Level-of-detail map: precompute jobs
+// ---------------------------------------------------------------------------
+
+// In-memory viewport index. Loaded lazily on first use and reloaded after a
+// job finishes; `lodState` tells the UI whether a build exists / is loading.
+let lodIndex = null;
+let lodLoading = null;
+let lodLoadError = null;
+
+const loadLodIndex = () => {
+  if (lodLoading) return lodLoading;
+  lodLoadError = null;
+  const started = Date.now();
+  log('lod index: loading');
+  lodLoading = LodIndex.load(driver, config.neo4j.database, { timeoutMs: config.lod.timeoutMs, maxLevel: config.lod.maxLevel })
+    .then((idx) => {
+      lodIndex = idx;
+      log(idx ? `lod index: ${idx.count.toLocaleString()} crates, ${idx.edgeCount.toLocaleString()} edges in ${Date.now() - started} ms` : 'lod index: no build in database');
+      return idx;
+    })
+    .catch((err) => {
+      lodLoadError = err.message;
+      log(`lod index: load failed: ${err.message}`);
+      throw err;
+    })
+    .finally(() => {
+      lodLoading = null;
+    });
+  return lodLoading;
+};
+
+const lodJobs = createLodJobs({
+  config,
+  log,
+  onFinished: () => {
+    lodIndex = null;
+    loadLodIndex().catch(() => undefined);
+  },
+});
+
+/** Resolve the index or send a 503 describing why it is not available. Returns null after responding. */
+const requireLod = async (res) => {
+  if (lodIndex) return lodIndex;
+  if (!lodLoading) loadLodIndex().catch(() => undefined);
+  const running = lodJobs.status().running;
+  res.status(503).json({
+    error: lodLoadError
+      ? `LOD index failed to load: ${lodLoadError}`
+      : running
+        ? `LOD ${running.kind} in progress (${running.phase})`
+        : lodLoading
+          ? 'LOD index is loading'
+          : 'no LOD build exists; POST /api/lod/rebuild first',
+    loading: Boolean(lodLoading),
+    running,
+  });
+  return null;
+};
+
+/**
+ * Viewport query for the Map view. Query: x0,y0,x1,y1 (layout coords), budget.
+ * Returns GraphPayload-shaped nodes (Crate or Cluster) and aggregated DEPENDS_ON rels.
+ */
+api.get(
+  '/lod/viewport',
+  wrap(async (req, res) => {
+    const idx = await requireLod(res);
+    if (!idx) return;
+    const num = (k) => Number.parseFloat(req.query[k]);
+    const bbox = { x0: num('x0'), y0: num('y0'), x1: num('x1'), y1: num('y1') };
+    if (![bbox.x0, bbox.y0, bbox.x1, bbox.y1].every(Number.isFinite)) {
+      // No bbox: the whole map.
+      Object.assign(bbox, { x0: idx.bounds.minX, y0: idx.bounds.minY, x1: idx.bounds.maxX, y1: idx.bounds.maxY });
+    }
+    const budget = Math.max(10, Math.min(Number.parseInt(req.query.budget ?? '', 10) || config.lod.budget, 5000));
+    const minCell = Math.max(0, Number.parseFloat(req.query.minCell ?? '') || 0);
+    res.json(idx.viewport(bbox, { budget, minCell }));
+  }),
+);
+
+/** Where a crate sits on the map, for "jump to". 404 if unknown or unpositioned. */
+api.get(
+  '/lod/locate',
+  wrap(async (req, res) => {
+    const idx = await requireLod(res);
+    if (!idx) return;
+    const name = String(req.query.name ?? '').trim();
+    const hit = idx.locate(name);
+    if (!hit) return res.status(404).json({ error: `crate '${name}' is not on the map` });
+    res.json(hit);
+  }),
+);
+
+/** Name search over positioned crates (in memory; no database round trip). */
+api.get(
+  '/lod/search',
+  wrap(async (req, res) => {
+    const idx = await requireLod(res);
+    if (!idx) return;
+    const q = String(req.query.q ?? '').trim();
+    res.json({ names: q ? idx.search(q, clampLimit(req.query.limit, 20)) : [] });
+  }),
+);
+
+/** Build/update job state plus the persisted LodMeta. */
+api.get(
+  '/lod/status',
+  wrap(async (_req, res) => {
+    const meta = (await readGraph(`MATCH (m:LodMeta {id: 'default'}) RETURN properties(m) AS m`)).rows[0]?.m ?? null;
+    const unpositioned = (await readGraph(`MATCH (c:Crate) WHERE c.lod_x IS NULL RETURN count(c) AS n`)).rows[0]?.n ?? null;
+    // A build run outside this process (CLI, another instance) changes built_at: reload.
+    const dbBuiltAt = meta?.built_at ? String(meta.built_at) : null;
+    const idxBuiltAt = lodIndex?.meta?.built_at ? String(lodIndex.meta.built_at) : null;
+    if (!lodLoading && !lodJobs.status().running && ((lodIndex && dbBuiltAt !== idxBuiltAt) || (!lodIndex && dbBuiltAt))) {
+      log(`lod index: build changed (${idxBuiltAt} -> ${dbBuiltAt}), reloading`);
+      loadLodIndex().catch(() => undefined);
+    }
+    res.json({
+      ...lodJobs.status(),
+      meta,
+      unpositionedCrates: unpositioned,
+      index: lodIndex ? lodIndex.status() : null,
+      indexLoading: Boolean(lodLoading),
+      indexError: lodLoadError,
+      config: describeConfig().lod,
+    });
+  }),
+);
+
+/**
+ * Start a full rebuild (communities + layout + LOD_DEP edges).
+ * Body: { iterations?, reuseEdges?: bool (skip aggregation, use stored LOD_DEP), resume?: bool (continue from checkpoint) }.
+ * 409 if a job is running.
+ */
+api.post(
+  '/lod/rebuild',
+  wrap(async (req, res) => {
+    const iterations = Number.parseInt(req.body?.iterations ?? '', 10);
+    res.status(202).json(
+      lodJobs.rebuild({
+        ...(Number.isFinite(iterations) && iterations > 0 ? { iterations } : {}),
+        reuseEdges: req.body?.reuseEdges === true,
+        resume: req.body?.resume === true,
+      }),
+    );
+  }),
+);
+
+/** Place crates added since the last build (cheap, incremental). 409 if a job is running. */
+api.post(
+  '/lod/update',
+  wrap(async (_req, res) => {
+    res.status(202).json(lodJobs.update());
+  }),
+);
+
 /** Fetch a single node (with properties) by elementId. */
 api.get(
   '/node/:id',
@@ -610,7 +769,9 @@ app.use('/api', api);
 // eslint-disable-next-line no-unused-vars
 app.use('/api', (err, _req, res, _next) => {
   const status =
-    err.type === 'entity.parse.failed'
+    err.status && Number.isInteger(err.status)
+      ? err.status
+      : err.type === 'entity.parse.failed'
       ? 400
       : err.code === 'Neo.ClientError.Transaction.TransactionTimedOut'
         ? 504

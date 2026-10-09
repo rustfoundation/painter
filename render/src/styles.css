@@ -450,3 +450,9 @@ ul.legend li {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+hr.rule {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 14px 0;
+}

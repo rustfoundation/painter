@@ -19,6 +19,7 @@ import { Toolbar } from './components/Toolbar';
 import { DetailsPanel } from './components/DetailsPanel';
 import { CypherPanel } from './components/CypherPanel';
 import { StatusBar } from './components/StatusBar';
+import { MapView } from './components/MapView';
 
 const DEFAULT_OPTIONS: CrateLoadOptions = { versions: 'latest', deps: true, invokes: true, dependents: false, limit: 200 };
 const DEFAULT_DEPS_LIMIT = 5000;
@@ -48,6 +49,10 @@ export function App() {
   const [depsDepth, setDepsDepth] = useState(0);
   /** meta of the last deps-view load, for the status bar. */
   const [depsMeta, setDepsMeta] = useState<GraphPayload['meta'] | null>(null);
+  /** Map view: crate to jump to, element budget per viewport, last viewport meta. */
+  const [mapTarget, setMapTarget] = useState<{ name: string; nonce: number } | null>(null);
+  const [mapBudget, setMapBudget] = useState(600);
+  const [mapMeta, setMapMeta] = useState<{ mode: string; level: number; inView: number; total: number; nodes: number; rels: number; elapsedMs: number } | null>(null);
 
   const fitAll = useCallback(() => {
     const nvl = nvlRef.current;
@@ -180,8 +185,28 @@ export function App() {
 
   /** Toolbar Load: per-view behaviour. */
   const load = useCallback(
-    (input: string, exact = false) => (view === 'deps' ? loadChain(input, exact) : loadCrate(input)),
+    (input: string, exact = false) => {
+      if (view === 'map') {
+        setMapTarget({ name: input, nonce: Date.now() });
+        return Promise.resolve();
+      }
+      return view === 'deps' ? loadChain(input, exact) : loadCrate(input);
+    },
     [view, loadChain, loadCrate],
+  );
+
+  /** From the map: switch to Deps and draw the chain of one crate. */
+  const openInDeps = useCallback(
+    (name: string) => {
+      setView('deps');
+      setStore(emptyStore());
+      setSelectedId(null);
+      setError(null);
+      setDepsMeta(null);
+      // loadChain reads view-independent state, so it can run right after the switch.
+      void loadChain(name, true);
+    },
+    [loadChain],
   );
 
   const expand = useCallback(async (id: string, direction: 'in' | 'out' | 'both', types: ExpandType[]) => {
@@ -231,11 +256,19 @@ export function App() {
 
   const selected: GraphNode | GraphRel | null = selectedId ? (store.nodes.get(selectedId) ?? store.rels.get(selectedId) ?? null) : null;
 
+  // Debug hook for headless checks (same name the Map view uses).
+  useEffect(() => {
+    (window as unknown as { __painterNvl?: unknown }).__painterNvl = nvlRef.current;
+  });
+
   const nvlOptions = useMemo<NvlOptions>(
     () => ({
       layout: layout as Layout,
       renderer: 'canvas',
       initialZoom: 1,
+      minZoom: 0.05,
+      maxZoom: 20,
+      allowDynamicMinZoom: true,
       styling: {
         defaultNodeColor: '#888888',
         defaultRelationshipColor: '#666666',
@@ -262,7 +295,9 @@ export function App() {
       },
       onHover: true,
       onPan: true,
-      onZoom: true,
+      // Mouse-wheel / pinch zoom. The key must be `onZoomAndPan`; any other
+      // name leaves NVL's zoom interaction unattached.
+      onZoomAndPan: true,
       onDrag: true,
     }),
     [expand, view, store, loadDeps],
@@ -278,6 +313,8 @@ export function App() {
         onDepsLimitChange={setDepsLimit}
         depsDepth={depsDepth}
         onDepsDepthChange={setDepsDepth}
+        mapBudget={mapBudget}
+        onMapBudgetChange={setMapBudget}
         options={options}
         onOptionsChange={setOptions}
         onLoad={(n, exact) => void load(n, exact)}
@@ -289,6 +326,17 @@ export function App() {
         busy={busy}
       />
       <div className="main">
+        {view === 'map' ? (
+          <MapView
+            target={mapTarget}
+            budget={mapBudget}
+            onError={setError}
+            onBusy={setBusy}
+            onOpenInDeps={openInDeps}
+            onMeta={setMapMeta}
+          />
+        ) : (
+        <>
         <div className="canvas">
           {nodes.length === 0 && view === 'deps' ? (
             <div className="empty">
@@ -339,16 +387,19 @@ export function App() {
             busy={busy}
           />
         </aside>
+        </>
+        )}
       </div>
       <CypherPanel enabled={health?.config.allowCypher ?? true} busy={busy} onRun={runCypher} />
       <StatusBar
         view={view}
         depsMeta={depsMeta}
+        mapMeta={mapMeta}
         health={health}
         healthError={healthError}
         stats={stats}
-        nodeCount={nodes.length}
-        relCount={rels.length}
+        nodeCount={view === 'map' ? (mapMeta?.nodes ?? 0) : nodes.length}
+        relCount={view === 'map' ? (mapMeta?.rels ?? 0) : rels.length}
         hiddenRelTypes={hiddenRelTypes}
         onToggleRelType={(t) =>
           setHiddenRelTypes((h) => {

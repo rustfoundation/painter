@@ -52,12 +52,49 @@ export interface Health {
 }
 
 /** Which graph the UI shows. */
-export type View = 'default' | 'deps';
+export type View = 'default' | 'deps' | 'map';
 
 export const VIEWS: { id: View; label: string; title: string }[] = [
   { id: 'default', label: 'Default', title: 'Crates, versions, and their DEPENDS_ON / INVOKES edges' },
   { id: 'deps', label: 'Deps', title: 'Transitive crate-level dependency chain of every crate matching the filter' },
+  { id: 'map', label: 'Map', title: 'Whole ecosystem on a precomputed layout; zoom in to resolve clusters into crates' },
 ];
+
+/** Map view: one viewport's worth of elements from the LOD index. */
+export interface LodViewport {
+  mode: 'crates' | 'cells';
+  level: number;
+  nodes: GraphNode[];
+  rels: GraphRel[];
+  meta: {
+    inView: number;
+    total: number;
+    cells?: number;
+    elapsedMs: number;
+    relsTruncated: boolean;
+    bounds: { minX: number; minY: number; maxX: number; maxY: number };
+  };
+}
+
+export interface LodJob {
+  kind: 'build' | 'update';
+  startedAt: string;
+  phase: string;
+  done: number | null;
+  total: number | null;
+  message: string | null;
+}
+
+export interface LodStatus {
+  running: LodJob | null;
+  last: { kind: string; startedAt: string; finishedAt: string; ok: boolean; error: string | null; elapsedMs: number } | null;
+  meta: Record<string, unknown> | null;
+  unpositionedCrates: number | null;
+  index: { loadedAt: string; crates: number; edges: number; bounds: LodViewport['meta']['bounds']; maxLevel: number } | null;
+  indexLoading: boolean;
+  indexError: string | null;
+  config: { iterations: number; budget: number; maxLevel: number };
+}
 
 export interface Stats {
   crates: number;
@@ -137,6 +174,19 @@ export const api = {
     if (crate) params.set('crate', crate);
     return request<GraphPayload>(`/api/graph/deps?${params}`);
   },
+  lodStatus: () => request<LodStatus>('/api/lod/status'),
+  lodRebuild: (opts: { iterations?: number; reuseEdges?: boolean; resume?: boolean } = {}) =>
+    request<LodStatus>('/api/lod/rebuild', json(opts)),
+  lodUpdate: () => request<LodStatus>('/api/lod/update', json({})),
+  lodViewport: (bbox: { x0: number; y0: number; x1: number; y1: number } | null, budget: number, minCell = 0) => {
+    const params = new URLSearchParams({ budget: String(budget), minCell: String(minCell) });
+    if (bbox) for (const k of ['x0', 'y0', 'x1', 'y1'] as const) params.set(k, String(bbox[k]));
+    return request<LodViewport>(`/api/lod/viewport?${params}`);
+  },
+  lodLocate: (name: string) =>
+    request<{ name: string; x: number; y: number; community: number; degree: number }>(`/api/lod/locate?name=${encodeURIComponent(name)}`),
+  lodSearch: (q: string, limit = 15) =>
+    request<{ names: string[] }>(`/api/lod/search?q=${encodeURIComponent(q)}&limit=${limit}`).then((r) => r.names),
   expand: (id: string, direction: 'in' | 'out' | 'both', types: ExpandType[], limit = 100) =>
     request<GraphPayload>('/api/graph/expand', json({ id, direction, types, limit })),
   cypher: (query: string, params: Record<string, unknown> = {}) =>

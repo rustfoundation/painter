@@ -11,6 +11,9 @@ interface Props {
   /** Deps view: max hops from the roots, 0 = unlimited. */
   depsDepth: number;
   onDepsDepthChange: (n: number) => void;
+  /** Map view: max elements drawn per viewport. */
+  mapBudget: number;
+  onMapBudgetChange: (n: number) => void;
   options: CrateLoadOptions;
   onOptionsChange: (o: CrateLoadOptions) => void;
   /** `exact` is set when the user picked a suggestion, so a 3+ character name is not treated as a partial filter. */
@@ -25,7 +28,7 @@ interface Props {
 }
 
 export function Toolbar(props: Props) {
-  const { view, onViewChange, depsLimit, depsMaxLimit, onDepsLimitChange, depsDepth, onDepsDepthChange } = props;
+  const { view, onViewChange, depsLimit, depsMaxLimit, onDepsLimitChange, depsDepth, onDepsDepthChange, mapBudget, onMapBudgetChange } = props;
   /** Deps view: partial matching (and suggestions) only from this many characters. */
   const MIN_PARTIAL = 3;
   const { options, onOptionsChange, onLoad, loadedName, onClear, onFit, layout, onLayoutChange, busy } = props;
@@ -47,8 +50,7 @@ export function Toolbar(props: Props) {
       return;
     }
     debounce.current = window.setTimeout(() => {
-      api
-        .searchCrates(query.trim())
+      (view === 'map' ? api.lodSearch(query.trim()) : api.searchCrates(query.trim()))
         .then((names) => {
           setSuggestions(names);
           setActive(-1);
@@ -88,7 +90,13 @@ export function Toolbar(props: Props) {
       <div className="search">
         <input
           type="text"
-          placeholder={view === 'deps' ? 'Crate name, or 3+ chars to match many…' : 'Crate name or part of one… (e.g. serd)'}
+          placeholder={
+            view === 'deps'
+              ? 'Crate name, or 3+ chars to match many…'
+              : view === 'map'
+                ? 'Find a crate on the map…'
+                : 'Crate name or part of one… (e.g. serd)'
+          }
           value={query}
           onChange={(e) => {
             setQuery(e.target.value);
@@ -129,8 +137,23 @@ export function Toolbar(props: Props) {
         onClick={() => submit(query)}
         title={view === 'deps' ? 'Exact crate name if one exists; otherwise (3+ chars) every crate containing the text' : undefined}
       >
-        {busy ? 'Loading…' : 'Load'}
+        {busy ? 'Loading…' : view === 'map' ? 'Go to' : 'Load'}
       </button>
+
+      {view === 'map' && (
+        <label className="opt" title="Maximum clusters or crates drawn for one viewport">
+          max visible
+          <input
+            type="number"
+            min={50}
+            max={5000}
+            step={50}
+            value={mapBudget}
+            onChange={(e) => onMapBudgetChange(Math.min(5000, Math.max(50, Number(e.target.value) || 50)))}
+            className="limit wide"
+          />
+        </label>
+      )}
 
       {view === 'deps' && (
         <>

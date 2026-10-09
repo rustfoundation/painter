@@ -1,171 +1,266 @@
 # painter-render
 
-A small web UI that renders the painter crates.io graph with the
-[Neo4j Visualization Library (NVL)](https://neo4j.com/docs/nvl/current/).
-It is self-contained: nothing here depends on the Rust code, only on the graph
-schema painter writes (`Crate`, `Version`, `VERSION_OF`, `DEPENDS_ON`,
-`INVOKES`).
+Web UI for the painter graph, built on the
+[Neo4j Visualization Library](https://neo4j.com/docs/nvl/current/). Standalone
+from the Rust side; the only contract is the graph schema painter writes
+(`Crate`, `Version`, `VERSION_OF`, `DEPENDS_ON`, `INVOKES`).
+
+Two pieces, one container:
+
+- `server/`: Node + Express. Owns the Neo4j driver, runs every query read-only,
+  serves the JSON API under `/api` and the built UI from `dist/`. The browser
+  never talks to Neo4j.
+- `src/`: React + NVL, built with Vite.
 
 ```
 render/
-  server/          Node (Express) server: owns the Neo4j driver, exposes /api, serves dist/
-    config.mjs     all runtime configuration, read from the environment
-    graph.mjs      neo4j-driver records -> JSON {nodes, rels, rows}
-    index.mjs      routes
-  src/             React + NVL frontend (Vite, TypeScript)
-  Dockerfile       two-stage build, final image runs `node server/index.mjs`
+  server/
+    config.mjs        every setting, read from env at startup
+    graph.mjs         neo4j records -> {nodes, rels, rows}
+    index.mjs         routes
+    lod/              Map view precompute (layout + communities) and viewport index
+      build.mjs       full build / incremental update pipeline
+      index.mjs       in-memory viewport index
+      jobs.mjs        one-at-a-time job runner (worker thread)
+      worker.mjs      worker entry
+      cli.mjs         npm run lod:*
+      neo4j-io.mjs    streaming reads, batched writes
+  src/
+    App.tsx           view switching, Default and Deps canvases
+    components/       Toolbar, DetailsPanel, CypherPanel, StatusBar, MapView
+    api.ts            API client + types
+    graph.ts          store -> NVL elements, colours
+  Dockerfile          two-stage; final image runs `node server/index.mjs`
 ```
 
-The browser never talks to Neo4j directly. The server holds the credentials
-and runs every query in a read-only transaction.
+## From scratch
 
-## Configuration
+Prereqs: Node 22+, Docker with compose, a Neo4j with painter data (the repo's
+`docker-compose.yaml` neo4j service, or any bolt endpoint).
 
-Everything is an environment variable, read once at startup
-(`server/config.mjs`). Defaults match the `neo4j` service in the repo's
-`docker-compose.yaml` exposed on localhost.
+Compose, everything:
 
-| Variable                      | Default                   | Meaning                                                     |
-| ----------------------------- | ------------------------- | ----------------------------------------------------------- |
-| `NEO4J_URI`                   | `bolt://localhost:7687`   | Bolt URI of the Neo4j instance                              |
-| `NEO4J_USER`                  | `neo4j`                   |                                                             |
-| `NEO4J_PASSWORD`              | `changeme123`             |                                                             |
-| `NEO4J_DATABASE`              | `neo4j`                   |                                                             |
-| `NEO4J_MAX_ROWS`              | `2000`                    | Hard cap on rows/limits for every query, including ad-hoc   |
-| `NEO4J_QUERY_TIMEOUT_MS`      | `30000`                   | Transaction timeout                                         |
-| `NEO4J_CONNECT_RETRIES`       | `0` (forever)             | Startup connectivity retries before exiting                 |
-| `NEO4J_CONNECT_RETRY_DELAY_MS`| `3000`                    |                                                             |
-| `RENDER_ALLOW_CYPHER`         | `true`                    | Set `false` to disable the ad-hoc Cypher panel              |
-| `RENDER_DEPS_MAX_EDGES`       | `50000`                   | Cap on crate→crate edges per Deps-view response             |
-| `RENDER_DEPS_DEFAULT_EDGES`   | `5000`                    | Deps-view edge limit when the request gives none            |
-| `RENDER_DEPS_CACHE_MS`        | `600000`                  | In-memory cache lifetime for the whole-graph Deps query     |
-| `RENDER_DEPS_TIMEOUT_MS`      | `180000`                  | Transaction timeout for the whole-graph Deps query          |
-| `PORT`                        | `8080`                    | HTTP port                                                   |
-| `HOST`                        | `0.0.0.0`                 | Bind address                                                |
+```
+docker compose up -d --build        # neo4j on 7474/7687, UI on http://localhost:8080
+```
 
-See `.env.example`.
+The `render` service points at `bolt://neo4j:7687` over the compose network.
+It starts serving before Neo4j is ready and retries in the background; the
+status bar and `GET /api/health` tell you when it is actually connected.
 
-## Running against localhost (development)
+Rebuild and redeploy only the UI, leaving neo4j (and anything importing into
+it) alone:
 
-Requires Node 22+. With the repo's Neo4j up (`docker compose up -d neo4j`):
+```
+docker compose up -d --build --no-deps render
+```
+
+Local dev against the compose neo4j on localhost:
 
 ```
 cd render
 npm install
-npm run dev
+npm run dev          # API on :8080 with --watch, Vite on :5173 proxying /api
 ```
 
-`npm run dev` starts the API server on `:8080` (with `node --watch`) and the
-Vite dev server on `:5173`, which proxies `/api` to the server. Open
-http://localhost:5173. Override the server address for Vite with
-`RENDER_API_URL`, and the Neo4j address for the server with `NEO4J_URI`, e.g.
+Single process serving the built UI:
 
 ```
-NEO4J_URI=bolt://some-host:7687 NEO4J_PASSWORD=secret npm run dev
+npm run build && npm start
 ```
 
-Production-style, single process on `:8080` serving the built UI:
+Any other Neo4j: set `NEO4J_URI` / `NEO4J_PASSWORD` (env or compose). From a
+container to a Neo4j on the host, use `bolt://host.docker.internal:7687` and on
+Linux add `--add-host=host.docker.internal:host-gateway`.
 
-```
-npm run build
-npm start
-```
+Database side: create the constraints and indexes in `docker/queries.md`.
+`idx_crate_name_text` is what makes partial-name search fast; the Map build
+creates its own `lod_*` indexes.
 
-## Running with Docker Compose
+To get the Map view working you also need the precompute, see below. The
+Default and Deps views work as soon as the graph has data.
 
-The repo's `docker-compose.yaml` defines a `render` service built from this
-directory and pointed at the `neo4j` service over the compose network:
+## Configuration
 
-```
-docker compose up -d --build
-# UI on http://localhost:8080, Neo4j Browser still on :7474
-```
+All env, read once at startup. Defaults match the compose neo4j exposed on
+localhost. `.env.example` lists them.
 
-To point the container at a different Neo4j, override the environment in
-compose or at run time:
-
-```
-docker build -t painter-render ./render
-docker run --rm -p 8080:8080 \
-  -e NEO4J_URI=bolt://host.docker.internal:7687 \
-  -e NEO4J_PASSWORD=changeme123 \
-  painter-render
-```
-
-(`--add-host=host.docker.internal:host-gateway` on Linux if you want the
-container to reach a Neo4j on the host.)
-
-The server starts serving immediately and keeps retrying the database in the
-background, so `render` can come up before `neo4j` is ready. The status bar
-in the UI (and `GET /api/health`) shows the real connection state.
+| Variable | Default | What |
+| --- | --- | --- |
+| `NEO4J_URI` | `bolt://localhost:7687` | |
+| `NEO4J_USER` | `neo4j` | |
+| `NEO4J_PASSWORD` | `changeme123` | |
+| `NEO4J_DATABASE` | `neo4j` | |
+| `NEO4J_MAX_ROWS` | `2000` | row/limit cap on every query, Cypher panel included |
+| `NEO4J_QUERY_TIMEOUT_MS` | `30000` | per-query transaction timeout |
+| `NEO4J_CONNECT_RETRIES` | `0` (forever) | startup connect retries before exiting |
+| `NEO4J_CONNECT_RETRY_DELAY_MS` | `3000` | |
+| `RENDER_ALLOW_CYPHER` | `true` | `false` disables the Cypher panel and `POST /api/cypher` |
+| `RENDER_DEPS_DEFAULT_EDGES` | `5000` | Deps edge cap when the request gives none |
+| `RENDER_DEPS_MAX_EDGES` | `50000` | hard cap on Deps edges per response |
+| `RENDER_DEPS_TIMEOUT_MS` | `180000` | timeout for the Deps queries |
+| `RENDER_DEPS_CACHE_MS` | `600000` | cache for the whole-graph `/api/graph/deps` answer |
+| `RENDER_LOD_ITERATIONS` | `300` | ForceAtlas2 iterations for a Map build |
+| `RENDER_LOD_TIMEOUT_MS` | `3600000` | timeout for the build's streaming reads/writes |
+| `RENDER_LOD_WORKER_HEAP_MB` | `8192` | heap cap for the in-server build worker |
+| `RENDER_LOD_CHECKPOINT` | `/tmp/painter-lod-checkpoint.json` | layout checkpoint file |
+| `RENDER_LOD_BUDGET` | `600` | default max elements per Map viewport |
+| `RENDER_LOD_MAX_LEVEL` | `12` | finest grid level of the viewport index |
+| `PORT` | `8080` | |
+| `HOST` | `0.0.0.0` | |
 
 ## Views
 
-The toolbar's **Views** switch picks which graph the canvas shows:
+All three views: scroll wheel (or pinch) zooms, drag pans, Fit reframes,
+Clear empties the canvas. Click a node or edge for its properties.
 
-- **Default**: crates, versions, and their `VERSION_OF` / `DEPENDS_ON` /
-  `INVOKES` edges, as described below.
-- **Deps**: crates only, as a transitive dependency chain. Type a crate name
-  and press Load. A crate with exactly that name is the only root when it
-  exists (`serde` is just serde). Otherwise, with 3 or more characters, every
-  crate whose name contains the text (case-insensitive) becomes a root
-  (`serde_js` is serde_json, serde_json5, ...). Every version of a crate is folded into its crate node and the
-  view draws one edge A → B when *any* version of A depends on B, following
-  the chain breadth-first until it ends, **max depth** is reached (0 =
-  unlimited), or **max edges** (default 5000) is hit; the status bar reports
-  which. The details panel can add a crate's direct dependents or
-  dependencies, or restart the chain from that crate. Edge width reflects the
-  number of versions declaring the dependency.
+### Default
 
-`RENDER_DEPS_MAX_EDGES` (default 50000) caps one response and
-`RENDER_DEPS_DEFAULT_EDGES` (default 5000) is the limit used when none is
-given. Each breadth-first level is one query with its own timeout
-(`RENDER_DEPS_TIMEOUT_MS`, default 3 minutes). `GET /api/graph/deps` (whole
-graph or one crate's direct neighbours, cached for `RENDER_DEPS_CACHE_MS`)
-remains available to API users but the UI no longer loads the whole graph.
+Crates, versions, and `VERSION_OF` / `DEPENDS_ON` / `INVOKES` edges.
 
-## Using the UI
+Type a crate name or part of one and Load. Matching is case-insensitive
+anywhere in the name, prefix first (`serd` -> serde, serde_json, ...); Load
+takes the top match and shows the resolved name. The toggles next to the box
+pick what comes back: latest version or all versions, outgoing `DEPENDS_ON`,
+outgoing `INVOKES`, incoming dependents, and a per-type limit.
 
-- Type a crate name, or part of one, and press Load. Suggestions and Load
-  both match case-insensitively anywhere in the name, prefix matches first
-  (`serd` → `serde`, `serde_json`, ...). Load picks the top match and shows
-  the resolved name in the box. Create the TEXT index from
-  `docker/queries.md` to keep `CONTAINS` fast on a full graph. Options next to the box
-  control what is fetched: latest or all versions, outgoing `DEPENDS_ON`,
-  outgoing `INVOKES`, incoming dependents, and a per-type limit.
-- Click a node or edge to see its properties. The side panel offers targeted
-  expansions (versions, dependencies, dependents, invokes/invoked-by).
-  Double-click a node to expand everything around it.
-- Relationship types can be hidden with the checkboxes in the status bar;
-  "edge labels" draws captions (requirement for `DEPENDS_ON`, call count for
-  `INVOKES`).
-- The Cypher panel at the bottom runs any read query. Every node,
-  relationship, or path in the result is merged into the current view, and
-  scalar columns are shown as a table.
+Side panel buttons expand one node (versions, dependencies, dependents,
+invokes / invoked by). Double-click expands everything around a node. Status
+bar checkboxes hide relationship types; "edge labels" draws requirement
+strings on `DEPENDS_ON` and call counts on `INVOKES`.
 
-"Latest" prefers `Version.latest = true` (written by
-`painter set-latest-versions`) and otherwise falls back to the highest semver
-triple, so it works on a graph where that stage has not run.
+"Latest" is `Version.latest = true` (from `painter set-latest-versions`) when
+present, else the highest semver triple.
 
-`INVOKES` is stored as one relationship per call site. The server collapses
-them into one edge per (`Version`, `Crate`) pair with a `count` and up to ten
-sample `targets`; those synthetic edges have ids starting with `agg:`. Ad-hoc
-Cypher returns the raw relationships.
+`INVOKES` is one relationship per call site in the graph. The server folds
+them into one edge per (`Version`, `Crate`) with a `count` and up to ten
+sample `targets`; ids of those edges start with `agg:`. The Cypher panel
+returns raw relationships.
+
+The Cypher panel at the bottom runs any read query. Nodes, relationships, and
+paths in the result are merged into the canvas; scalar columns show as a
+table.
+
+### Deps
+
+Crates only, as a transitive dependency chain. Versions are folded into their
+crate; an edge A -> B means some version of A depends on B.
+
+Type a name and Load. If a crate with exactly that name exists it is the only
+root (`serde` is serde). Otherwise, with 3+ characters, every crate whose name
+contains the text is a root (`serde_js` is serde_json, serde_json5, ...).
+Shorter text has to match exactly.
+
+The chain follows dependencies breadth-first until it ends, until **max
+depth** (0 = unlimited), or until **max edges** (default 5000). The status bar
+says which stopped it and how many roots there were. From the side panel:
+add a crate's direct dependents or dependencies, or restart the chain from
+that crate. Edge width is the number of versions declaring the dependency.
+
+Full-depth chains of big crates hit the edge cap fast because every historical
+version's dependencies are folded in. Depth 2 or 3 gives a readable picture.
+
+### Map
+
+The whole ecosystem on a precomputed layout, drawn at a level of detail that
+keeps the element count under **max visible** (default 600). Zoomed out you
+get clusters captioned with their crate count and largest crate; zoom in and
+they split until you are looking at individual crates. Colour is Louvain
+community. Click a cluster to zoom into it. "Go to" jumps to a crate. A
+crate's panel can open its chain in Deps.
+
+The side panel shows the build state and has **Update** and **Rebuild**.
+Without a build the view just says so.
+
+#### Map precompute
+
+Stored in the database, so every render instance shares it:
+
+- `Crate.lod_x`, `Crate.lod_y`: ForceAtlas2 position
+- `Crate.lod_community`, `Crate.lod_degree`: Louvain community id, crate-level degree
+- `(Crate)-[:LOD_DEP {versions}]->(Crate)`: one edge per crate pair, `versions` = how many versions declare it
+- `(:LodMeta {id:'default'})`: counts, bounds, timings, `built_at`
+
+Full build: stream every `DEPENDS_ON` once and aggregate to crate pairs,
+replace the `LOD_DEP` edges, Louvain, ForceAtlas2 (Barnes-Hut), write
+positions, write meta. Measured on 340k crates / 37M `DEPENDS_ON`:
+aggregation 2.5 min, edge write 5 min, Louvain 8 s, layout 300 iterations in
+25 min at about 2.5 GB. The layout is single-threaded.
+
+Update: for crates with no position yet (anything imported after the last
+build), aggregate just their edges, write their `LOD_DEP`, place them at the
+centroid of positioned neighbours. Seconds. Does not move existing crates and
+does not refresh edges between them; a full build does.
+
+CLI, same env as the server:
+
+```
+npm run lod:build -- --iterations 300        # full build
+npm run lod:build -- --reuse-edges --resume   # skip aggregation, continue the layout
+npm run lod:update
+npm run lod:status
+```
+
+`--reuse-edges` uses the `LOD_DEP` edges already stored instead of
+re-aggregating `DEPENDS_ON`; drop it after a large import. `--resume` starts
+from the checkpoint file (written every `--checkpoint-every` iterations,
+default 20) or, failing that, from the positions in the database, and runs
+only the remaining iterations. A crash costs at most one checkpoint interval.
+
+Keep it from eating the box:
+
+```
+NODE_OPTIONS=--max-old-space-size=6144 nice -n 19 ionice -c 3 npm run lod:build -- --reuse-edges --resume
+```
+
+Same thing from the UI (Rebuild with the two checkboxes) or the API
+(`POST /api/lod/rebuild` with `{iterations, reuseEdges, resume}`,
+`POST /api/lod/update`). Those run in a worker thread inside the render
+server, one job at a time (409 if one is running), heap-capped by
+`RENDER_LOD_WORKER_HEAP_MB`. The server keeps answering requests, polls
+progress into `GET /api/lod/status`, and reloads its viewport index when a
+job finishes or when it sees a new `built_at` from a CLI run.
+
+#### Map serving
+
+The server loads positions and `LOD_DEP` into typed arrays (14 s for the
+full graph). `GET /api/lod/viewport?x0&y0&x1&y1&budget&minCell` picks the
+finest grid level whose cells inside the bbox fit the budget and are at least
+`minCell` layout units wide (the client sets `minCell` from its zoom so
+clusters stay about 44 px apart), returns crates instead of clusters once few
+enough remain, and aggregates edges between visible elements, capped at the
+budget, strongest first. A dense viewport covering a few hundred thousand
+crates answers in 100-300 ms; the whole-map answer is cached per budget.
+
+The browser polls NVL's zoom/pan and refetches 180 ms after it settles.
+Element sizes are divided by the zoom so they stay constant on screen.
+`window.__painterNvl` and `window.__painterMap` expose the NVL instance and
+calibration for headless checks.
 
 ## API
 
-All responses are JSON. Graph payloads are
-`{ nodes: [{id, labels, properties}], rels: [{id, type, from, to, properties}], meta }`
-where `id` is the Neo4j `elementId`.
+JSON throughout. Graph payloads are
+`{nodes: [{id, labels, properties}], rels: [{id, type, from, to, properties}], meta}`;
+`id` is the Neo4j `elementId` except for synthetic aggregate edges (`agg:`,
+`dep:`) and Map elements (`crate:<name>`, `cell:<level>:<ix>:<iy>`).
 
-| Route                              | Description                                                   |
-| ---------------------------------- | ------------------------------------------------------------- |
-| `GET /api/health`                  | Connection state plus the effective (secret-free) config      |
-| `GET /api/stats`                   | Node and relationship counts                                  |
-| `GET /api/crates/search?q=&limit=` | Crate names starting with `q`                                 |
-| `GET /api/graph/crate/:name`       | Crate neighbourhood; see query params in `server/index.mjs`   |
-| `POST /api/graph/expand`           | `{id, direction, types, limit}` neighbours of a node          |
-| `GET /api/graph/deps`              | Crate-level graph; `crate=`, `direction=`, `limit=`            |
-| `GET /api/graph/deps/chain`        | Transitive crate-level chain; `q=`, `limit=`, `depth=` (Deps view) |
-| `GET /api/node/:id`                | Single node by elementId                                      |
-| `POST /api/cypher`                 | `{query, params}` read-only, row-capped                       |
+| Route | What |
+| --- | --- |
+| `GET /api/health` | connection state and effective config, no secrets |
+| `GET /api/stats` | node and relationship counts |
+| `GET /api/crates/search?q&limit` | crate names containing `q`, prefix first |
+| `GET /api/graph/crate/:name?versions&deps&invokes&dependents&limit` | Default view load; `name` may be partial, `meta.resolvedName` says what was picked |
+| `POST /api/graph/expand` | `{id, direction, types, limit}`: neighbours of a node |
+| `GET /api/graph/deps?crate&direction&limit` | crate-level direct neighbours; no `crate` = whole graph, capped and cached |
+| `GET /api/graph/deps/chain?q&limit&depth&exact` | Deps view: transitive chain, `meta.roots/depth/truncated` |
+| `GET /api/lod/status` | job state, `LodMeta`, index state, unpositioned count |
+| `POST /api/lod/rebuild` | `{iterations?, reuseEdges?, resume?}`; 202, or 409 if busy |
+| `POST /api/lod/update` | place new crates; 202, or 409 if busy |
+| `GET /api/lod/viewport?x0&y0&x1&y1&budget&minCell` | clusters or crates for a viewport; no bbox = whole map; 503 until a build is loaded |
+| `GET /api/lod/locate?name` | a crate's map position |
+| `GET /api/lod/search?q&limit` | crate names on the map, in memory |
+| `GET /api/node/:id` | one node by `elementId` |
+| `POST /api/cypher` | `{query, params}`, read-only, row-capped; 403 when disabled |
+
+Neo4j client errors come back as 400 with the Neo4j `code`; a query that
+exhausts its timeout comes back as 504.

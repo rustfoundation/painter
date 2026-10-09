@@ -17,6 +17,27 @@ export const COLORS = {
   unknownRel: '#666666',
 } as const;
 
+/** Stable, distinguishable colour for a Louvain community id. */
+export const communityColor = (id: number): string => {
+  if (id < 0) return '#6b7280';
+  const golden = 0.618033988749895;
+  const h = ((id * golden) % 1) * 360;
+  const s = (62 + (id % 3) * 8) / 100;
+  const l = (52 + ((id >> 2) % 3) * 6) / 100;
+  // HSL -> hex. NVL parses colours with `color-string`, which does not accept
+  // the space-separated hsl() syntax, so emit hex.
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  const [r1, g1, b1] =
+    h < 60 ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x] : h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
+  const hex = (v: number) =>
+    Math.round((v + m) * 255)
+      .toString(16)
+      .padStart(2, '0');
+  return `#${hex(r1)}${hex(g1)}${hex(b1)}`;
+};
+
 export interface GraphStore {
   nodes: Map<string, GraphNode>;
   rels: Map<string, GraphRel>;

@@ -55,7 +55,6 @@ Relationships:
     - Source analysis via `syn`
     - Debug symbol analysis
     - Addition of metadata to `rustc` for better reliability
-- UI Frontend for graph exploration
 - Better parameters around best-guess of invoked crate version, or grouping possible versions in the graph
 
 # Quick Start
@@ -69,6 +68,21 @@ supported LLVM version of `llvm-sys` and `llvm-ir`. This will be updated as work
 A docker-compose is available for a default Neo4j instance that can be used for testing and local use. 
 Note or change the default testing username/password.
 - `docker compose up`
+
+This also starts the graph UI on http://localhost:8080 (the `render` service).
+See [render/README.md](render/README.md) for the views, the Map precompute,
+and how to rebuild just the UI container without touching neo4j.
+
+## Graph UI
+`render/` is a standalone web UI over the graph: a Node server that owns the
+Neo4j connection and serves a React/NVL front end. Three views: Default
+(crates, versions, dependency and invoke edges around a crate), Deps
+(transitive crate-level dependency chain for a name or partial name), and Map
+(the whole ecosystem on a precomputed ForceAtlas2 layout with Louvain
+communities, drawn at a zoom-dependent level of detail). The Map needs a
+one-off precompute that writes `lod_*` properties and `LOD_DEP` edges into
+the database; `render/README.md` covers it, including the incremental update
+for crates imported after the build.
 
 ## Populating the crate index database
 The first step is populating your neo4j database with the up-to-date crate index. This is pulled from the live

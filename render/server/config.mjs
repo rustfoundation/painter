@@ -48,6 +48,23 @@ export const config = {
   depsCacheMs: int('RENDER_DEPS_CACHE_MS', 600_000),
   /** Transaction timeout for the whole-graph deps query, which scans every DEPENDS_ON edge. */
   depsTimeoutMs: int('RENDER_DEPS_TIMEOUT_MS', 180_000),
+  /**
+   * Level-of-detail map (precomputed layout + clustering; see server/lod/).
+   */
+  lod: {
+    /** ForceAtlas2 iterations for a full build. */
+    iterations: int('RENDER_LOD_ITERATIONS', 300),
+    /** Timeout for the streaming reads/writes of a build (whole DEPENDS_ON scan). */
+    timeoutMs: int('RENDER_LOD_TIMEOUT_MS', 3_600_000),
+    /** Heap for the build worker thread, MB. A full crates.io graph needs a few GB. */
+    workerHeapMb: int('RENDER_LOD_WORKER_HEAP_MB', 8192),
+    /** Max elements (cluster or crate nodes) returned for one viewport. */
+    budget: int('RENDER_LOD_BUDGET', 600),
+    /** Quadtree depth of the in-memory index. */
+    maxLevel: int('RENDER_LOD_MAX_LEVEL', 12),
+    /** Layout checkpoint file (positions every N iterations) so a crash can be resumed. */
+    checkpointPath: env('RENDER_LOD_CHECKPOINT', '/tmp/painter-lod-checkpoint.json'),
+  },
 };
 
 export const describeConfig = () => ({
@@ -63,4 +80,5 @@ export const describeConfig = () => ({
   allowCypher: config.allowCypher,
   depsMaxEdges: config.depsMaxEdges,
   depsDefaultEdges: config.depsDefaultEdges,
+  lod: { iterations: config.lod.iterations, budget: config.lod.budget, maxLevel: config.lod.maxLevel },
 });

@@ -10,10 +10,18 @@
     "dev:web": "vite",
     "build": "tsc --noEmit && vite build",
     "start": "node server/index.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "lod:build": "node server/lod/cli.mjs build",
+    "lod:update": "node server/lod/cli.mjs update",
+    "lod:status": "node server/lod/cli.mjs status"
   },
   "dependencies": {
     "express": "^5.1.0",
+    "graphology": "^0.26.0",
+    "graphology-communities-louvain": "^2.0.2",
+    "graphology-layout": "^0.6.1",
+    "graphology-layout-forceatlas2": "^0.10.1",
+    "graphology-types": "^0.24.8",
     "neo4j-driver": "^6.0.0"
   },
   "devDependencies": {

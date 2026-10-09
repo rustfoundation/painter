@@ -8,6 +8,12 @@ CREATE TEXT INDEX idx_crate_name_text IF NOT EXISTS FOR (n:Crate) ON (n.name)
 ```
 
 `idx_crate_name_text` backs the render UI's partial-name search (`CONTAINS`).
+The render UI's Map build creates `crate_lod_x` and `crate_lod_community`
+indexes itself and writes `Crate.lod_*` properties plus `LOD_DEP` edges; see
+`render/README.md`. Drop them with
+`MATCH ()-[r:LOD_DEP]->() DELETE r` (batched) and
+`MATCH (c:Crate) REMOVE c.lod_x, c.lod_y, c.lod_community, c.lod_degree` if
+you want them gone.
 
 ### Enterprise Indexes
 

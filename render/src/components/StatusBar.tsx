@@ -3,6 +3,7 @@ import type { GraphPayload, Health, Stats, View } from '../api';
 interface Props {
   view: View;
   depsMeta: GraphPayload['meta'] | null;
+  mapMeta: { mode: string; level: number; inView: number; total: number; nodes: number; rels: number; elapsedMs: number } | null;
   health: Health | null;
   healthError: string | null;
   stats: Stats | null;
@@ -18,7 +19,7 @@ interface Props {
 const fmtInt = (n: number | undefined) => (n === undefined ? '…' : n.toLocaleString());
 
 export function StatusBar(props: Props) {
-  const { view, depsMeta, health, healthError, stats, nodeCount, relCount, hiddenRelTypes, onToggleRelType, showRelCaptions, onToggleRelCaptions, error } = props;
+  const { view, depsMeta, mapMeta, health, healthError, stats, nodeCount, relCount, hiddenRelTypes, onToggleRelType, showRelCaptions, onToggleRelCaptions, error } = props;
   const connected = health?.ok === true;
   return (
     <div className="statusbar">
@@ -41,6 +42,15 @@ export function StatusBar(props: Props) {
       <span>
         view: {nodeCount} nodes · {relCount} rels
       </span>
+      {view === 'map' && mapMeta && (
+        <>
+          <span className="sep" />
+          <span title="level-of-detail state for the current viewport">
+            map: {mapMeta.mode === 'cells' ? `clusters at grid level ${mapMeta.level}` : 'individual crates'} · {fmtInt(mapMeta.inView)} of{' '}
+            {fmtInt(mapMeta.total)} crates in view · {fmtInt(mapMeta.elapsedMs)} ms
+          </span>
+        </>
+      )}
       {view === 'deps' && depsMeta?.roots && (
         <>
           <span className="sep" />
@@ -53,7 +63,7 @@ export function StatusBar(props: Props) {
         </>
       )}
       <span className="sep" />
-      {(view === 'deps' ? ['DEPENDS_ON'] : ['VERSION_OF', 'DEPENDS_ON', 'INVOKES']).map((t) => (
+      {(view === 'map' ? [] : view === 'deps' ? ['DEPENDS_ON'] : ['VERSION_OF', 'DEPENDS_ON', 'INVOKES']).map((t) => (
         <label key={t} className="opt">
           <input type="checkbox" checked={!hiddenRelTypes.has(t)} onChange={() => onToggleRelType(t)} /> {t}
         </label>
