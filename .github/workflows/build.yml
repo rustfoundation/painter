@@ -1,0 +1,37 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.profile }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup
+      - name: cargo build (${{ matrix.profile }})
+        run: |
+          if [ "${{ matrix.profile }}" = "release" ]; then
+            cargo build --release --all-targets
+          else
+            cargo build --all-targets
+          fi
+      - name: binary runs
+        run: |
+          if [ "${{ matrix.profile }}" = "release" ]; then
+            target/release/painter --help
+          else
+            target/debug/painter --help
+          fi

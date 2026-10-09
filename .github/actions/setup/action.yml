@@ -1,0 +1,55 @@
+name: Set up painter build environment
+description: >
+  Install LLVM 22 (the version `Cargo.toml` selects through the `llvm-22` feature), the
+  requested Rust toolchain, and a cargo cache.
+
+inputs:
+  toolchain:
+    description: rustup toolchain to install and make default
+    required: false
+    default: stable
+  components:
+    description: comma-separated rustup components (e.g. clippy, rustfmt)
+    required: false
+    default: ""
+  extra-toolchains:
+    description: space-separated additional rustup toolchains to install (not made default)
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install LLVM 22
+      shell: bash
+      run: |
+        set -euo pipefail
+        wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+        chmod +x /tmp/llvm.sh
+        sudo /tmp/llvm.sh 22
+        # llvm-sys links LLVM statically: it needs the dev package, Polly, and LLVM's system libs.
+        sudo apt-get install -y --no-install-recommends \
+          llvm-22-dev libpolly-22-dev zlib1g-dev libzstd-dev libtinfo-dev libxml2-dev
+        echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
+        echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
+        /usr/lib/llvm-22/bin/llvm-config --version
+
+    - name: Install Rust ${{ inputs.toolchain }}
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+
+    - name: Install extra Rust toolchains
+      if: inputs.extra-toolchains != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+        for tc in ${{ inputs.extra-toolchains }}; do
+          rustup toolchain install "$tc" --profile minimal
+        done
+
+    - name: Cache cargo artifacts
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: llvm22-${{ inputs.toolchain }}

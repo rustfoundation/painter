@@ -90,6 +90,13 @@ crate index and populates the appropriate nodes and relationships. Crates, versi
 are populated at this step.
 - `cargo +nightly run --release -- create-fresh-db -d bolt://127.0.0.1:7687 -u neo4j -p changeme123`
 
+## Continuous integration
+GitHub Actions runs three workflows on every push to `main` and every pull request: `lint`
+(`cargo fmt -- --check`, `cargo clippy --all-targets -- -D warnings`), `build` (debug and release,
+all targets), and `test` (`cargo test --all-targets`). They install LLVM 22 from apt.llvm.org and
+stable Rust; the compile tests additionally use Rust 1.96.1 because its LLVM matches the one
+`llvm-ir` links against. Run the same commands locally before pushing.
+
 ## Run the analysis
 This will populate the database with all invocation relationships. These exist as a representation of a given 
 version calling a given crate. We cannot definitively say what version of what crate is invoked, so the node relationshp

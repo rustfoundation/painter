@@ -1,0 +1,36 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # Formatting needs no LLVM or submodules; keep this job fast.
+      # No `--all`: that would also format the vendored llvm-ir submodules (path deps).
+      - run: cargo fmt -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup
+        with:
+          components: clippy
+      # painter sources already `#![deny(clippy::all, clippy::pedantic)]`; `-D warnings` also
+      # fails on rustc warnings in the lib, bin, and test targets.
+      - run: cargo clippy --all-targets -- -D warnings

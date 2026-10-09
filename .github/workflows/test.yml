@@ -1,0 +1,26 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Tests that really run `cargo rustc --emit=llvm-bc` use this toolchain. Its LLVM must not be
+  # newer than LLVM 22 (what `llvm-ir` links against) or the bitcode is unreadable; 1.96.1 ships
+  # LLVM 22, while current stable (1.99) ships LLVM 23.
+  PAINTER_TEST_TOOLCHAIN: "1.96.1"
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup
+        with:
+          extra-toolchains: ${{ env.PAINTER_TEST_TOOLCHAIN }}
+      - run: cargo test --all-targets
