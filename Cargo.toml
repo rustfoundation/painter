@@ -43,7 +43,6 @@ lenient_semver = { version = "0.4" }
 # serialization
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.7" }
-csv = { version = "1.2" }
 serde_json = "1"
 
 # Compression

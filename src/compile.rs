@@ -10,28 +10,28 @@ use walkdir::WalkDir;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    ///
+    /// Filesystem failure while copying bitcode.
     #[error("IO Error: {0}")]
     IoError(#[from] std::io::Error),
-    ///
+    /// `cargo rustc` exited non-zero; carries its stderr.
     #[error("Crate compilation failed:\n{0}")]
     CompileFailed(String),
-    ///
+    /// `cargo clean` exited non-zero.
     #[error("Clean stage failed")]
     CleanFailure(std::process::Output),
     /// The bounded compile pool could not be built.
     #[error("Thread pool error: {0}")]
     ThreadPool(#[from] rayon::ThreadPoolBuildError),
-    ///
+    /// Bitcode could not be parsed.
     #[error("LLVM IR failure: {0}")]
     LLVMError(String),
-    ///
+    /// The crates.io index could not be opened or walked.
     #[error("Indexing Error: {0}")]
     IndexError(#[from] crates_index::Error),
-    ///
-    #[error("Indexing Error: {0}")]
+    /// Crate extraction or lookup failure.
+    #[error("Crate FS Error: {0}")]
     CrateFsError(#[from] crate::crate_fs::Error),
-    ///
+    /// Build-rule resolution failure.
     #[error("Build rules error: {0}")]
     RulesError(#[from] crate::rules::Error),
 }

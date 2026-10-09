@@ -75,14 +75,17 @@ pub fn extract_calls<P: AsRef<Path>>(crate_bc_dir: P) -> Result<Vec<(String, Str
         let analysis = ModuleAnalysis::new(&module);
 
         let graph = analysis.call_graph();
-        graph.inner().all_edges().for_each(|(src_raw, dst_raw, _)| {
-            let src = format!("{:#}", demangle(src_raw));
-            let dst = format!("{:#}", demangle(dst_raw));
+        graph
+            .inner()
+            .all_edges()
+            .for_each(|(src_raw, dst_raw, ())| {
+                let src = format!("{:#}", demangle(src_raw));
+                let dst = format!("{:#}", demangle(dst_raw));
 
-            if callee_crate(&dst).is_some() {
-                calls.push((src, dst));
-            }
-        });
+                if callee_crate(&dst).is_some() {
+                    calls.push((src, dst));
+                }
+            });
     }
 
     Ok(calls)
@@ -107,10 +110,10 @@ pub async fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P, db: Arc<Db>) -> Re
     // A re-import replaces the version's whole invoke graph: `insert_invokes` deletes the
     // existing `[:INVOKES]` edges and creates the new ones in one transaction.
     if db.has_any_invoke(crate_name, crate_version).await? {
-        log::info!("{}: replacing existing invoke graph", crate_fullname);
+        log::info!("{crate_fullname}: replacing existing invoke graph");
     }
 
-    log::trace!("Importing: {}", crate_name);
+    log::trace!("Importing: {crate_name}");
 
     // `extract_calls` only keeps callees with a recordable crate.
     let rows: Vec<(String, String, String)> = calls
@@ -121,8 +124,9 @@ pub async fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P, db: Arc<Db>) -> Re
         })
         .collect();
 
-    db.insert_invokes((crate_name, crate_version), &rows).await?;
-    log::info!("{}: imported {} invocations", crate_fullname, rows.len());
+    db.insert_invokes((crate_name, crate_version), &rows)
+        .await?;
+    log::info!("{crate_fullname}: imported {} invocations", rows.len());
 
     Ok(())
 }
@@ -195,17 +199,22 @@ impl CountUnsafeResult {
     }
 }
 
-pub async fn count_unsafe_crate_extract(
-    c: Crate,
-    roots: Roots,
-    db: Arc<Db>,
-) -> Result<(), Error> {
+/// Extract every version of `c` from the compressed root into the sources root, run
+/// `count-unsafe` over it, and store the totals on the `Version` node.
+///
+/// # Panics
+/// Panics if a `.crate` file cannot be opened, `count-unsafe` cannot be spawned, or its output
+/// is not the expected JSON.
+///
+/// # Errors
+/// Currently infallible; database failures are logged per version.
+pub async fn count_unsafe_crate_extract(c: Crate, roots: Roots, db: Arc<Db>) -> Result<(), Error> {
     let compressed_root = &roots.compressed_root;
     let sources_root = &roots.sources_root;
 
     for v in c.versions() {
         let crate_fullname = format!("{}-{}", v.name(), v.version());
-        let crate_path = compressed_root.join(format!("{}.crate", &crate_fullname));
+        let crate_path = compressed_root.join(format!("{crate_fullname}.crate"));
 
         // Lets work off the tgz for now, since we cant extract
         // TODO: this needs to be unified to a file driver
@@ -215,7 +224,7 @@ pub async fn count_unsafe_crate_extract(
             let tar = flate2::read::GzDecoder::new(tar_gz);
             let mut archive = tar::Archive::new(tar);
             if archive.unpack(sources_root).is_ok() {
-                log::trace!("Extracted {}", &crate_fullname);
+                log::trace!("Extracted {crate_fullname}");
 
                 // Run our count
                 let output = std::process::Command::new("count-unsafe")
@@ -224,31 +233,39 @@ pub async fn count_unsafe_crate_extract(
                     .unwrap();
                 if output.status.success() {
                     let raw_json = std::str::from_utf8(&output.stdout).unwrap();
-                    log::trace!("{}", &raw_json);
+                    log::trace!("{raw_json}");
 
                     let unsafe_result: CountUnsafeResult = serde_json::from_str(raw_json).unwrap();
                     if unsafe_result.has_unsafe() {
-                        log::debug!("{} unsafe", &crate_fullname);
+                        log::debug!("{crate_fullname} unsafe");
                         if let Err(e) = db.set_unsafe(v.name(), v.version(), &unsafe_result).await {
-                            log::error!("set_unsafe failed for {}: {}", &crate_fullname, e);
+                            log::error!("set_unsafe failed for {crate_fullname}: {e}");
                         }
                     }
 
                     // Finally delete
                     //std::fs::remove_dir_all(extracted_path).unwrap();
-                    log::trace!("Deleted {}", &crate_fullname);
+                    log::trace!("Deleted {crate_fullname}");
                 }
             }
         }
     }
     Ok(())
 }
+/// Run `count-unsafe` over every already-extracted version of `c` in the sources root and store
+/// the totals on the `Version` node. Versions without an extracted directory are skipped.
+///
+/// # Panics
+/// Panics if `count-unsafe` cannot be spawned or its output is not the expected JSON.
+///
+/// # Errors
+/// Currently infallible; database failures are logged per version.
 pub async fn count_unsafe_crate(c: Crate, roots: Roots, db: Arc<Db>) -> Result<(), Error> {
     let sources_root = &roots.sources_root;
 
     for v in c.versions() {
         let crate_fullname = format!("{}-{}", v.name(), v.version());
-        let crate_path = sources_root.join(format!("{}", &crate_fullname));
+        let crate_path = sources_root.join(&crate_fullname);
 
         // Lets work off the tgz for now, since we cant extract
         // TODO: this needs to be unified to a file driver
@@ -260,13 +277,13 @@ pub async fn count_unsafe_crate(c: Crate, roots: Roots, db: Arc<Db>) -> Result<(
                 .unwrap();
             if output.status.success() {
                 let raw_json = std::str::from_utf8(&output.stdout).unwrap();
-                log::trace!("{}", &raw_json);
+                log::trace!("{raw_json}");
 
                 let unsafe_result: CountUnsafeResult = serde_json::from_str(raw_json).unwrap();
                 if unsafe_result.has_unsafe() {
-                    log::debug!("{} unsafe", &crate_fullname);
+                    log::debug!("{crate_fullname} unsafe");
                     if let Err(e) = db.set_unsafe(v.name(), v.version(), &unsafe_result).await {
-                        log::error!("set_unsafe failed for {}: {}", &crate_fullname, e);
+                        log::error!("set_unsafe failed for {crate_fullname}: {e}");
                     }
                 }
             }
@@ -275,6 +292,10 @@ pub async fn count_unsafe_crate(c: Crate, roots: Roots, db: Arc<Db>) -> Result<(
     Ok(())
 }
 
+/// Run [`count_unsafe_crate`] over every crate in the index, 128 crates at a time.
+///
+/// # Errors
+/// Returns `Error::IndexError` if the index cannot be opened.
 pub async fn count_unsafe(roots: &Roots, db: Arc<Db>) -> Result<(), Error> {
     let index = crate::index::open_index().map_err(crate::index::Error::from)?;
 
@@ -300,12 +321,13 @@ fn export_crate_csv<P: AsRef<Path>>(crate_bc_dir: P) -> Result<(), Error> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true)
             .open(crate_bc_dir.as_ref().join("calls.csv"))
             .unwrap();
 
-        calls.iter().enumerate().for_each(|(_, (src, dst))| {
+        for (src, dst) in &calls {
             writeln!(file, "{crate_fullname},{src},{dst}").unwrap();
-        });
+        }
     }
 
     Ok(())
@@ -347,10 +369,19 @@ mod tests {
     fn callee_crate_blocks_std_family_and_intrinsics() {
         assert_eq!(callee_crate("core::fmt::Write::write_char"), None);
         assert_eq!(callee_crate("std::io::Write::write"), None);
-        assert_eq!(callee_crate("<alloc::string::String as core::fmt::Write>::write_str"), None);
+        assert_eq!(
+            callee_crate("<alloc::string::String as core::fmt::Write>::write_str"),
+            None
+        );
         assert_eq!(callee_crate("llvm.memset.p0.i64"), None);
         assert_eq!(callee_crate("__rust_dealloc"), None);
-        assert_eq!(callee_crate("serde_json::ser::to_string"), Some("serde_json"));
-        assert_eq!(callee_crate("<T as serde::Serialize>::serialize"), Some("serde"));
+        assert_eq!(
+            callee_crate("serde_json::ser::to_string"),
+            Some("serde_json")
+        );
+        assert_eq!(
+            callee_crate("<T as serde::Serialize>::serialize"),
+            Some("serde")
+        );
     }
 }

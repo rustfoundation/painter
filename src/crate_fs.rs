@@ -33,9 +33,9 @@ impl CrateEntry {
     ///
     /// # Errors
     /// Returns `Error::CrateNameError` if no such split exists.
-    pub fn new(full_name: String) -> Result<Self, Error> {
-        let (name, version) = split_full_name(&full_name)
-            .ok_or_else(|| Error::CrateNameError(full_name.clone()))?;
+    pub fn new(full_name: &str) -> Result<Self, Error> {
+        let (name, version) = split_full_name(full_name)
+            .ok_or_else(|| Error::CrateNameError(full_name.to_string()))?;
         Ok(Self {
             name: name.to_string(),
             version: version.to_string(),
@@ -66,6 +66,7 @@ impl CrateEntry {
         &self.version
     }
 
+    #[must_use]
     pub fn filename(&self) -> String {
         format!("{}.crate", self.full_name())
     }
@@ -74,6 +75,7 @@ impl CrateEntry {
     /// first. Supports the crates.io-index style sharded layout
     /// (`1/<n>`, `2/<n>`, `3/<c>/<n>`, `<ab>/<cd>/<n>`) with the crate name as the leaf
     /// directory, the same layout without the name directory, and a flat directory.
+    #[must_use]
     pub fn candidate_paths(&self, crates_dir: &Path) -> Vec<PathBuf> {
         let name = self.name().to_ascii_lowercase();
         let file = self.filename();
@@ -123,7 +125,7 @@ where
     S: AsRef<str>,
 {
     fn from(rhv: S) -> CrateEntry {
-        Self::new(rhv.as_ref().to_string()).unwrap()
+        Self::new(rhv.as_ref()).unwrap()
     }
 }
 
@@ -133,6 +135,13 @@ pub struct CrateCache {
     no_delete: bool,
 }
 impl CrateCache {
+    /// Extract `entry` from `crates_dir` into `sources_dir`, or adopt an existing extraction
+    /// (which is then never deleted on drop).
+    ///
+    /// # Errors
+    /// Returns `Error::CrateFileNotFound` if the `.crate` is missing, `Error::IoError` if the
+    /// archive cannot be read or unpacked, or `Error::ExtractionFailed` if unpacking produced no
+    /// `<name>-<version>` directory.
     pub fn new<P>(entry: &CrateEntry, crates_dir: P, sources_dir: P) -> Result<Self, Error>
     where
         P: AsRef<Path>,
@@ -169,13 +178,14 @@ impl CrateCache {
         })
     }
 
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.extracted_path
     }
 }
 impl Drop for CrateCache {
     fn drop(&mut self) {
-        log::trace!("dropping {:?}", self);
+        log::trace!("dropping {self:?}");
         if !self.no_delete {
             std::fs::remove_dir_all(&self.extracted_path).unwrap();
         }
@@ -187,6 +197,10 @@ pub struct CrateFsConfig {
     pub extract_path: PathBuf,
 }
 impl CrateFsConfig {
+    /// Configure the `.crate` store and extraction directory.
+    ///
+    /// # Panics
+    /// Panics if either directory does not exist.
     pub fn with_paths<P1, P2>(crates_path: P1, extract_path: P2) -> Self
     where
         P1: Into<PathBuf>,
@@ -233,8 +247,13 @@ impl CrateFs {
             },
         )
     }
+    /// Evict `fullname` from the cache, deleting its extraction unless it pre-existed.
+    ///
+    /// # Errors
+    /// Returns `Error::CrateNameError` if `fullname` does not split, or `Error::CrateNotFound`
+    /// if it is not cached.
     pub fn close<S: AsRef<str>>(&mut self, fullname: S) -> Result<(), Error> {
-        let entry = CrateEntry::new(fullname.as_ref().to_string())?;
+        let entry = CrateEntry::new(fullname.as_ref())?;
 
         self.cache
             .remove(self.find_cache_index(&entry).ok_or(Error::CrateNotFound)?);
@@ -242,8 +261,13 @@ impl CrateFs {
         Ok(())
     }
 
+    /// Open (extracting if needed) the crate named `<name>-<version>`.
+    ///
+    /// # Errors
+    /// Returns `Error::CrateNameError` if `fullname` does not split, otherwise as
+    /// [`CrateFs::open_entry`].
     pub fn open<S: AsRef<str>>(&mut self, fullname: S) -> Result<&CrateCache, Error> {
-        let entry = CrateEntry::new(fullname.as_ref().to_string())?;
+        let entry = CrateEntry::new(fullname.as_ref())?;
         self.open_entry(entry)
     }
 
@@ -266,6 +290,7 @@ impl CrateFs {
         }
     }
 
+    #[must_use]
     pub fn config(&self) -> &CrateFsConfig {
         &self.config
     }

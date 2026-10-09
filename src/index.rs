@@ -136,7 +136,9 @@ const TRANSIENT_RETRIES: u32 = 6;
 /// failed transaction was rolled back, so a retry never duplicates data.
 fn is_transient(e: &crate::db::Error) -> bool {
     let msg = e.to_string();
-    msg.contains("Neo.TransientError") || msg.contains("DeadlockDetected") || msg.contains("ForsetiClient")
+    msg.contains("Neo.TransientError")
+        || msg.contains("DeadlockDetected")
+        || msg.contains("ForsetiClient")
 }
 
 /// Insert a crate and all of its versions with one database round trip, skipping versions that
@@ -289,7 +291,12 @@ pub async fn set_latest_versions(conn: Arc<Db>) -> Result<(), Error> {
     let do_crate = |c: Crate, db: Arc<Db>| async move {
         let latest = c.highest_version();
         if let Err(e) = db.set_latest(c.name(), latest.version()).await {
-            log::error!("set_latest failed for {}-{}: {}", c.name(), latest.version(), e);
+            log::error!(
+                "set_latest failed for {}-{}: {}",
+                c.name(),
+                latest.version(),
+                e
+            );
         }
     };
 

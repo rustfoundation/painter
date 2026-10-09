@@ -29,9 +29,7 @@ pub use rules::BuildRules;
 pub fn chunked<I: Iterator>(iter: I, size: usize) -> impl Iterator<Item = Vec<I::Item>> {
     let mut iter = iter.peekable();
     std::iter::from_fn(move || {
-        if iter.peek().is_none() {
-            return None;
-        }
+        iter.peek()?;
         Some(iter.by_ref().take(size).collect())
     })
 }
@@ -57,10 +55,12 @@ impl Roots {
     /// # Errors
     /// Returns [`Error::CrateFsError`] if the cache cannot be initialised.
     pub fn crate_fs(&self) -> Result<crate_fs::CrateFs, Error> {
-        Ok(crate_fs::CrateFs::new(crate_fs::CrateFsConfig::with_paths(
-            self.compressed_root.clone(),
-            self.sources_root.clone(),
-        ))?)
+        Ok(crate_fs::CrateFs::new(
+            crate_fs::CrateFsConfig::with_paths(
+                self.compressed_root.clone(),
+                self.sources_root.clone(),
+            ),
+        )?)
     }
 
     /// The bytecode output root.

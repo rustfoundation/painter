@@ -28,6 +28,7 @@ pub enum Error {
 /// crates to visit, then calls [`select_versions`](Self::select_versions) once per crate to
 /// learn which versions to build. Both are async so implementations can consult external data
 /// sources; they are invoked with bounded concurrency.
+#[allow(clippy::double_must_use)] // fires on the `async_trait` expansion, not on our code
 #[async_trait]
 pub trait BuildRules: Send + Sync {
     /// Names of crates to consider. `None` means every crate in the index.
@@ -177,7 +178,11 @@ impl BuildRules for EcosystemsRules {
         if let Some(n) = self.top_downloads {
             log::info!("ecosyste.ms: fetching top {n} crates by downloads");
             let pkgs = self.client.top_packages(PackageSort::Downloads, n).await?;
-            union_names(&mut names, &mut seen, pkgs.into_iter().map(|p| p.name).collect());
+            union_names(
+                &mut names,
+                &mut seen,
+                pkgs.into_iter().map(|p| p.name).collect(),
+            );
         }
         if let Some(n) = self.top_reverse_dependencies {
             log::info!("ecosyste.ms: fetching top {n} crates by reverse dependencies");
@@ -185,7 +190,11 @@ impl BuildRules for EcosystemsRules {
                 .client
                 .top_packages(PackageSort::DependentPackages, n)
                 .await?;
-            union_names(&mut names, &mut seen, pkgs.into_iter().map(|p| p.name).collect());
+            union_names(
+                &mut names,
+                &mut seen,
+                pkgs.into_iter().map(|p| p.name).collect(),
+            );
         }
         if let Some(n) = self.top_maintainers {
             log::info!("ecosyste.ms: ranking maintainers by downloads, taking top {n}");
@@ -197,7 +206,11 @@ impl BuildRules for EcosystemsRules {
                     m.total_downloads.unwrap_or(0),
                     pkgs.len()
                 );
-                union_names(&mut names, &mut seen, pkgs.into_iter().map(|p| p.name).collect());
+                union_names(
+                    &mut names,
+                    &mut seen,
+                    pkgs.into_iter().map(|p| p.name).collect(),
+                );
             }
         }
 
@@ -244,7 +257,11 @@ mod tests {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         union_names(&mut out, &mut seen, vec!["a".into(), "b".into()]);
-        union_names(&mut out, &mut seen, vec!["b".into(), "c".into(), "a".into()]);
+        union_names(
+            &mut out,
+            &mut seen,
+            vec!["b".into(), "c".into(), "a".into()],
+        );
         assert_eq!(out, vec!["a", "b", "c"]);
     }
 }

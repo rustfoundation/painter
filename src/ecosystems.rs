@@ -135,8 +135,8 @@ impl EcosystemsClient {
                 return Ok(resp.json::<T>().await?);
             }
             attempt += 1;
-            let retryable = status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                || status.is_server_error();
+            let retryable =
+                status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
             if !retryable || attempt > MAX_RETRIES {
                 return Err(Error::Status {
                     status,

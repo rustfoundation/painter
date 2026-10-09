@@ -27,6 +27,7 @@ struct Args {
 /// Clap argument object for specifying the root paths to be used for this work session.
 /// See [`libpainter::Roots`] for the meaning of each directory.
 #[derive(clap::Args, Debug, Clone)]
+#[allow(clippy::struct_field_names)] // mirrors `libpainter::Roots`
 struct RootsArgs {
     /// Root directory containing the extracted sources tree.
     #[arg(short = 's', value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
@@ -230,11 +231,12 @@ enum Command {
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 32)]
+#[allow(clippy::too_many_lines)] // one arm per subcommand
 async fn main() -> Result<(), Error> {
     env_logger::init();
 
     let args = Args::parse();
-    log::trace!("{:?}", args);
+    log::trace!("{args:?}");
 
     match args.command {
         Command::CreateFreshDb { db, only } => {
@@ -257,7 +259,7 @@ async fn main() -> Result<(), Error> {
             let roots = Roots::from(roots);
             let bc_root = roots.bytecodes_root()?.clone();
             let mut fs = roots.crate_fs()?;
-            let entry = libpainter::crate_fs::CrateEntry::new(crate_fullname)?;
+            let entry = libpainter::crate_fs::CrateEntry::new(&crate_fullname)?;
             let src_path = fs.open_entry(entry.clone())?.path().to_path_buf();
             compile::compile_crate(entry.name(), entry.version(), src_path, bc_root, &toolchain)?;
         }

@@ -213,7 +213,12 @@ impl Db {
     ///
     /// # Errors
     /// This function will return an `painter::db::Error` in the event of a database error.
-    pub async fn insert_crate_versions(&self, name: &str, rows: &[VersionRow]) -> Result<(), Error> {
+    #[allow(clippy::too_many_lines)]
+    pub async fn insert_crate_versions(
+        &self,
+        name: &str,
+        rows: &[VersionRow],
+    ) -> Result<(), Error> {
         let parsed: Vec<(&VersionRow, semver::Version)> = rows
             .iter()
             .filter_map(|row| match parse_semver(&row.version) {
@@ -234,17 +239,46 @@ impl Db {
         }
 
         let versions: Vec<&str> = parsed.iter().map(|(r, _)| r.version.as_str()).collect();
-        let majors: Vec<i64> = parsed.iter().map(|(_, sv)| i64::try_from(sv.major).unwrap_or(i64::MAX)).collect();
-        let minors: Vec<i64> = parsed.iter().map(|(_, sv)| i64::try_from(sv.minor).unwrap_or(i64::MAX)).collect();
-        let patches: Vec<i64> = parsed.iter().map(|(_, sv)| i64::try_from(sv.patch).unwrap_or(i64::MAX)).collect();
+        let majors: Vec<i64> = parsed
+            .iter()
+            .map(|(_, sv)| i64::try_from(sv.major).unwrap_or(i64::MAX))
+            .collect();
+        let minors: Vec<i64> = parsed
+            .iter()
+            .map(|(_, sv)| i64::try_from(sv.minor).unwrap_or(i64::MAX))
+            .collect();
+        let patches: Vec<i64> = parsed
+            .iter()
+            .map(|(_, sv)| i64::try_from(sv.patch).unwrap_or(i64::MAX))
+            .collect();
         let builds: Vec<&str> = parsed.iter().map(|(_, sv)| sv.build.as_str()).collect();
         let pres: Vec<&str> = parsed.iter().map(|(_, sv)| sv.pre.as_str()).collect();
         // Per-version dependency columns: outer index = version, inner = dependency.
-        let dep_names: Vec<Vec<&str>> = parsed.iter().map(|(r, _)| r.dependencies.iter().map(|d| d.name.as_str()).collect()).collect();
-        let dep_reqs: Vec<Vec<&str>> = parsed.iter().map(|(r, _)| r.dependencies.iter().map(|d| d.requirement.as_str()).collect()).collect();
-        let dep_features: Vec<Vec<&str>> = parsed.iter().map(|(r, _)| r.dependencies.iter().map(|d| d.features.as_str()).collect()).collect();
-        let dep_kinds: Vec<Vec<&str>> = parsed.iter().map(|(r, _)| r.dependencies.iter().map(|d| d.kind.as_str()).collect()).collect();
-        let dep_optional: Vec<Vec<bool>> = parsed.iter().map(|(r, _)| r.dependencies.iter().map(|d| d.optional).collect()).collect();
+        let dep_names: Vec<Vec<&str>> = parsed
+            .iter()
+            .map(|(r, _)| r.dependencies.iter().map(|d| d.name.as_str()).collect())
+            .collect();
+        let dep_reqs: Vec<Vec<&str>> = parsed
+            .iter()
+            .map(|(r, _)| {
+                r.dependencies
+                    .iter()
+                    .map(|d| d.requirement.as_str())
+                    .collect()
+            })
+            .collect();
+        let dep_features: Vec<Vec<&str>> = parsed
+            .iter()
+            .map(|(r, _)| r.dependencies.iter().map(|d| d.features.as_str()).collect())
+            .collect();
+        let dep_kinds: Vec<Vec<&str>> = parsed
+            .iter()
+            .map(|(r, _)| r.dependencies.iter().map(|d| d.kind.as_str()).collect())
+            .collect();
+        let dep_optional: Vec<Vec<bool>> = parsed
+            .iter()
+            .map(|(r, _)| r.dependencies.iter().map(|d| d.optional).collect())
+            .collect();
 
         self.conn
             .run(
@@ -522,9 +556,11 @@ impl Db {
     {
         self.conn
             .run(
-                query("MATCH (:Version { name: $name, version: $version })-[r:INVOKES]->() DELETE r")
-                    .param("name", name.as_ref())
-                    .param("version", version.as_ref()),
+                query(
+                    "MATCH (:Version { name: $name, version: $version })-[r:INVOKES]->() DELETE r",
+                )
+                .param("name", name.as_ref())
+                .param("version", version.as_ref()),
             )
             .await?;
         Ok(())
