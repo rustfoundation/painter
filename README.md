@@ -39,7 +39,12 @@ Nodes:
 Relationships:
 - `(Version)-[:VERSION_OF]->(Crate)`
 - `(Version)-[:DEPENDS_ON {requirement, features, kind, optional}]->(Crate)`
-- `(Version)-[:INVOKES { caller, callee }]->(Crate)`
+- `(Version)-[:INVOKES { callsite, target }]->(Crate)`
+
+Re-running the export for a version that already has `INVOKES` edges replaces
+them: the old edges are deleted and the new set created in one transaction, so
+re-importing never duplicates and a version with no cross-crate calls ends up
+with none.
 
 ## Current Limitations
 - Only crates which can have a local build complete are currently imported. Work is underway to expand support, but this greatly limits us in cases such as local dependency requirements, custom build steps, etc.
@@ -120,7 +125,12 @@ Nodes:
 Relationships:
 - `(Version)-[:VERSION_OF]->(Crate)`
 - `(Version)-[:DEPENDS_ON {requirement, features, kind, optional}]->(Crate)`
-- `(Version)-[:INVOKES { caller, callee }]->(Crate)`
+- `(Version)-[:INVOKES { callsite, target }]->(Crate)`
+
+Re-running the export for a version that already has `INVOKES` edges replaces
+them: the old edges are deleted and the new set created in one transaction, so
+re-importing never duplicates and a version with no cross-crate calls ends up
+with none.
 
 ## [Code of Conduct][code-of-conduct]
 
