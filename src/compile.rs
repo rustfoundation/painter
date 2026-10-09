@@ -4,6 +4,7 @@ use crate::crate_fs::{CrateEntry, CrateFs};
 use crate::index::open_index;
 use crate::rules::BuildRules;
 use crates_index::Crate;
+use rayon::prelude::*;
 use std::{path::Path, sync::Mutex};
 use walkdir::WalkDir;
 
@@ -200,16 +201,19 @@ fn compile_version(
 
 /// Ask `rules` which versions of each crate to build, with bounded concurrency. Rule failures
 /// for an individual crate are logged and that crate is skipped.
-async fn select_work<I>(
-    crates: I,
+async fn select_work(
+    mut crates: tokio::sync::mpsc::Receiver<Crate>,
     rules: &dyn BuildRules,
     concurrency: usize,
-) -> Vec<(String, String)>
-where
-    I: Iterator<Item = Crate>,
-{
+) -> Vec<(String, String)> {
+    let concurrency = concurrency.max(1);
     let mut work = Vec::new();
-    for chunk in crate::chunked(crates, concurrency.max(1)) {
+    let mut chunk = Vec::with_capacity(concurrency);
+    loop {
+        chunk.clear();
+        if crates.recv_many(&mut chunk, concurrency).await == 0 {
+            break;
+        }
         let tasks = chunk.iter().map(|c| rules.select_versions(c));
         for (c, selected) in chunk.iter().zip(futures::future::join_all(tasks).await) {
             match selected {
@@ -225,29 +229,57 @@ where
     work
 }
 
+/// How many parsed index entries may be queued between the index walk and the rules.
+const PLAN_QUEUE: usize = 4096;
+
 /// Build the list of `(name, version)` pairs that `rules` selects from the index.
+///
+/// # Panics
+/// Panics if the index walk task panics.
 ///
 /// # Errors
 /// Returns `Error::IndexError` if the crates.io index cannot be opened, or `Error::RulesError`
 /// if the rules cannot produce their candidate set.
-pub async fn plan(rules: &dyn BuildRules, concurrency: usize) -> Result<Vec<(String, String)>, Error> {
+pub async fn plan(
+    rules: &dyn BuildRules,
+    concurrency: usize,
+) -> Result<Vec<(String, String)>, Error> {
     let index = open_index()?;
+    let (tx, rx) = tokio::sync::mpsc::channel(PLAN_QUEUE);
 
-    let work = if let Some(names) = rules.candidate_crates().await? {
+    // The index walk parses git blobs and is CPU bound; run it on rayon (one repository handle
+    // per worker) and stream crates to the rules through a bounded channel.
+    let walker = if let Some(names) = rules.candidate_crates().await? {
         log::info!("rules selected {} candidate crates", names.len());
-        let crates = names.iter().filter_map(|name| {
-            let c = index.crate_(name);
-            if c.is_none() {
-                // Expected with ecosyste.ms data: it keeps records of crates deleted from crates.io.
-                log::warn!("Crate not found in index, skipping: {name}");
+        tokio::task::spawn_blocking(move || {
+            for name in names {
+                match index.crate_(&name) {
+                    Some(c) => {
+                        if tx.blocking_send(c).is_err() {
+                            return;
+                        }
+                    }
+                    // Expected with ecosyste.ms data: it keeps records of crates deleted from
+                    // crates.io.
+                    None => log::warn!("Crate not found in index, skipping: {name}"),
+                }
             }
-            c
-        });
-        select_work(crates, rules, concurrency).await
+        })
     } else {
         log::info!("rules apply to every crate in the index");
-        select_work(index.crates(), rules, concurrency).await
+        tokio::task::spawn_blocking(move || {
+            index.crates_parallel().for_each(|c| match c {
+                Ok(c) => {
+                    // The receiver only goes away when the consumer gave up; nothing to do.
+                    let _ = tx.blocking_send(c);
+                }
+                Err(e) => log::error!("index walk failed: {e}"),
+            });
+        })
     };
+
+    let work = select_work(rx, rules, concurrency).await;
+    walker.await.expect("index walk task panicked");
 
     log::info!("planned {} crate versions to build", work.len());
     Ok(work)
