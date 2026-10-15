@@ -1,7 +1,7 @@
 ```
 CREATE CONSTRAINT const_crate_name IF NOT EXISTS FOR (n:Crate) REQUIRE n.name IS UNIQUE
 CREATE CONSTRAINT FOR (n:Version) REQUIRE (n.name, n.version) IS UNIQUE
-CREATE INDEX idx_invoke FOR ()-[r:INVOKES]-() ON (r.caller, r.callee)
+CREATE INDEX idx_invoke IF NOT EXISTS FOR ()-[r:INVOKES]-() ON (r.callsite, r.target)
 CREATE INDEX idx_is_latest FOR (n:Version) ON (n.latest)
 CREATE INDEX idx_unsafe_total FOR (n:Version) ON (n.unsafe_total)
 CREATE TEXT INDEX idx_crate_name_text IF NOT EXISTS FOR (n:Crate) ON (n.name)

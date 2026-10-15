@@ -1,51 +1,64 @@
 # Requirements
 
-- Rust nightly (2013-07-26)
-- Rust 1.60 toolchain 
-- LLVM 14.x
-- Docker 
+- Rust stable or nightly, to build painter
+- A second Rust toolchain with the `cargo` component, to compile the ecosystem (`--toolchain`, default `1.67`)
+- LLVM 22 with development headers
+- Docker
 
 # Installing Rust toolchains
-Note that we require using nightly for some features, *as well as* having rustc 1.60 installed for analysis. This means 
-you'll need to install two rust toolchains.
+
+Painter itself builds on stable. Crates are compiled with a separate toolchain chosen with
+`--toolchain`; its bitcode must be readable by the LLVM painter links against, so it must not ship a
+newer LLVM than 22. Rust 1.96.1 (LLVM 22) works; Rust 1.99 (LLVM 23) does not, and reading its
+bitcode makes `llvm-ir` print `error: Invalid record` and exit.
 
 ```
-rustup toolchain install nightly
-rustup toolchain install 1.60
+rustup toolchain install stable
+rustup toolchain install 1.96.1
 ```
 
-# Building and using LLVM
+# Installing LLVM
 
-Different environments will run into issues with the local version of llvm. Using painter requires llvm 14.x to be installed
-for the current version of `rustc` we operate with (1.60). If painter does not work with your OS version of LLVM,
-you may need to build a local vendored copy of LLVM to use. 
+`Cargo.toml` enables the `llvm-22` feature of `llvm-ir-analysis`, which uses `llvm-sys` 221. The
+feature must match the major version of the installed LLVM. `llvm-sys` finds `llvm-config` on
+`PATH`, or under `LLVM_SYS_221_PREFIX` when that is set.
 
-Assumed Example Build Directory Layout
-```
-    /tmp/llvm14-src
-    /tmp/llvm14-bin
-    /tmp/llvm14-build
-```
+Debian / Ubuntu, from [apt.llvm.org](https://apt.llvm.org) (what CI uses):
 
-*Building and Installing LLVM*
 ```
-cd /tmp
-git clone --depth=1 -b release/14.x https://github.com/llvm/llvm-project.git llvm14-src
-mkdir llvm14-build && mkdir llvm14-bin
-pushd llvm14-build
-  cmake ../llvm14-src/llvm
-  cmake --build .
-  cmake -DCMAKE_INSTALL_PREFIX=../llvm14-bin -P cmake_install.cmake
-popd
+wget https://apt.llvm.org/llvm.sh
+sudo bash llvm.sh 22
+sudo apt-get install llvm-22-dev libpolly-22-dev zlib1g-dev libzstd-dev libtinfo-dev libxml2-dev
+export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 ```
 
-## Build Painter
+To build LLVM from source instead:
 
-Once you have a local built copy of LLVM, you'll need to specify the location of the installation via 
-the `LLVM_SYS_140_PREFIX` environment variable.
+```
+git clone --depth=1 -b release/22.x https://github.com/llvm/llvm-project.git llvm22-src
+cmake -S llvm22-src/llvm -B llvm22-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$PWD/llvm22-bin
+cmake --build llvm22-build --target install
+export LLVM_SYS_221_PREFIX=$PWD/llvm22-bin
+```
+
+The vendored `llvm-ir` fork has features `llvm-9` through `llvm-22`; to use another LLVM, change
+the `llvm-22` feature in `Cargo.toml` and the matching `LLVM_SYS_<ver>_PREFIX` variable.
+
+# Build Painter
+
+`llvm-ir` and `llvm-ir-analysis` are git submodules, so clone recursively (or run
+`git submodule update --init` in an existing clone).
 
 ```
 git clone --recurse-submodules https://github.com/rustfoundation/painter
 cd painter
-LLVM_SYS_140_PREFIX=/tmp/llvm14-bin cargo build
+cargo build --release
+```
+
+Checks CI runs on every pull request:
+
+```
+cargo fmt -- --check
+cargo clippy --all-targets -- -D warnings
+PAINTER_TEST_TOOLCHAIN=1.96.1 cargo test --all-targets
 ```

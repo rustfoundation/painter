@@ -42,26 +42,29 @@ in the graph-imports directory.
 
 ## Bytecode Analysis
 We then determine the call graph of every crate by these steps:
-1. Build the crate with default features and flags with `--emit=llvm-bc`
+1. Build the crate's library with default features, in release mode with debug info and LTO off,
+   emitting LLVM bitcode: `cargo +<toolchain> rustc --release --lib -- -g --emit=llvm-bc -C lto=off --cap-lints=warn`
 2. We then analyze the bytecode of every successfully compiled crate, extracting all
    invoke instruction variants in the LLVM bitcode. This renders a complete list of all
    `(function)->(function)` invocations within a given crate. We also demangle these and
    then filter out various cases such as runtimes, the std and core libraries, and other cases.
 3. This list of `(function)->(function)` relationships is then imported into the database,
    represented as a given `(Version)` node of a crate `[:INVOKES]` a specific `(Crate)` node.
-   In the future, we hope to be able to group or narrow versions of crates being invoked but
+   The callee crate is the first path segment of the demangled callee symbol. In the future, we hope to be able to group or narrow versions of crates being invoked but
    this has not been implemented.
 
 # Database Representation
 
 Nodes:
-- `(Version { name, version, major, minor, patch, build, pre })`
-- `(Crate {name })`
+- `(Crate { name })`
+- `(Version { name, version, semver_major, semver_minor, semver_patch, semver_build, semver_pre })`,
+  plus `latest` (from `set-latest-versions`) and `unsafe_*` / `safe_*` counts (from `count-unsafe`)
 
 Relationships:
-- `(Version)-[:VERSION_OF]->(Crate)`
-- `(Version)-[:DEPENDS_ON {requirement, features, kind, optional}]->(Crate)`
-- `(Version)-[:INVOKES { callsite, target }]->(Crate)`
+- `(Crate)-[:VERSION_OF]->(Version)` (note the direction: from the crate to its version)
+- `(Version)-[:DEPENDS_ON { requirement, features, kind, optional }]->(Crate)`
+- `(Version)-[:INVOKES { callsite, target }]->(Crate)`: one edge per call site; `callsite` is the
+  calling function, `target` the called function, both demangled
 
 Re-running the export for a version that already has `INVOKES` edges replaces
 them: the old edges are deleted and the new set created in one transaction, so
@@ -71,7 +74,7 @@ with none.
 ## Current Limitations
 - Only crates which can have a local build complete are currently imported. Work is underway to expand support, but this greatly limits us in cases such as local dependency requirements, custom build steps, etc.
 - We do not currently determine the version of a invoked callee
-- LTO and optimizers are disabled to prevent inlining, but many cases exist in which the invocation is lost at a bytecode level. Source analysis can improve this. Examples of cases where an invoke is likely lost:
+- LTO is disabled to limit inlining, but crates are built in release mode, so the optimizer still inlines and many invocations are lost at the bytecode level. Generic code is only present where it is instantiated, so a mostly generic library records few calls of its own. Source analysis can improve this. Examples of cases where an invoke is likely lost:
     - Dynamic function calls (pointers, vtables, etc.)
     - Inlining
 
@@ -86,36 +89,127 @@ with none.
 
 # Quick Start
 
-See [BUILDING.md](BUILDING.md) for build specific instructions.
+## Requirements
+- Rust stable or nightly to build painter itself.
+- LLVM 22 with development headers. `llvm-sys` finds `llvm-config` on `PATH`; point it elsewhere
+  with `LLVM_SYS_221_PREFIX=/path/to/llvm-22`. The LLVM version is selected by the `llvm-22`
+  feature of `llvm-ir-analysis` in `Cargo.toml` and must match the installed LLVM major version.
+- A second Rust toolchain, with the `cargo` component, to compile the ecosystem (`--toolchain`,
+  default `1.67`). Its bitcode must be readable by LLVM 22, so it must not ship a newer LLVM:
+  Rust 1.96 works, Rust 1.99 (LLVM 23) does not.
+- A git clone of the crates.io index (`https://github.com/rust-lang/crates.io-index`), passed with
+  `PAINTER_INDEX_PATH`. Without it, painter clones the full git index under `~/.cargo`.
+- The `.crate` files to analyse, either flat (`serde-1.0.0.crate`) or sharded like the index
+  (`se/rd/serde/serde-1.0.0.crate`), for example a mirror made with
+  [walterhpearce/crates-spider](https://github.com/walterhpearce/crates-spider.git).
+- Docker, for Neo4j and the graph UI.
+- [`count-unsafe`](https://crates.io/crates/count-unsafe) on `PATH`, only for the `count-unsafe` step.
 
-**NOTE**: Requires rustc 1.60 for building the crate ecosystem and painter itself requires `nightly`; this is needed due to matching the LLVM IR version with the currently 
-supported LLVM version of `llvm-sys` and `llvm-ir`. This will be updated as work to integrate newer LLVM versions is done.
+## Build
+```
+git clone --recurse-submodules https://github.com/rustfoundation/painter
+cd painter
+cargo build --release
+rustup toolchain install 1.96.1   # or any toolchain for --toolchain, see above
+```
+
+The `llvm-ir` and `llvm-ir-analysis` directories are git submodules; in an existing clone run
+`git submodule update --init`. [BUILDING.md](BUILDING.md) has more on installing LLVM.
 
 ## Start the docker neo4j instance
-A docker-compose is available for a default Neo4j instance that can be used for testing and local use. 
-Note or change the default testing username/password.
-- `docker compose up`
+A docker-compose is available for a default Neo4j instance that can be used for testing and local use.
+The default credentials are `neo4j` / `changeme123`; change them in `docker-compose.yaml`
+(`NEO4J_AUTH` for neo4j, `NEO4J_PASSWORD` for the UI).
+- `docker compose up -d`
 
 This also starts the graph UI on http://localhost:8080 (the `render` service).
 See [render/README.md](render/README.md) for the views, the Map precompute,
 and how to rebuild just the UI container without touching neo4j.
 
+Before the first import, create the constraints and indexes listed at the top of
+[docker/queries.md](docker/queries.md) (in the Neo4j browser at http://localhost:7474, or
+`cypher-shell`). The import relies on the `Crate.name` uniqueness constraint to avoid duplicates.
+
 ## Graph UI
 `render/` is a standalone web UI over the graph: a Node server that owns the
-Neo4j connection and serves a React/NVL front end. Three views: Default
+Neo4j connection and serves a React/NVL front end. Four views: Default
 (crates, versions, dependency and invoke edges around a crate), Deps
-(transitive crate-level dependency chain for a name or partial name), and Map
+(transitive crate-level dependency chain for a name or partial name), Map
 (the whole ecosystem on a precomputed ForceAtlas2 layout with Louvain
-communities, drawn at a zoom-dependent level of detail). The Map needs a
-one-off precompute that writes `lod_*` properties and `LOD_DEP` edges into
-the database; `render/README.md` covers it, including the incremental update
-for crates imported after the build.
+communities, drawn at a zoom-dependent level of detail), and Callers (a table
+of every crate version and function that calls a given function, directly or
+transitively). The Map needs a one-off precompute that writes `lod_*` properties
+and `LOD_DEP` edges into the database; `render/README.md` covers it, including
+the incremental update for crates imported after the build.
 
 ## Populating the crate index database
-The first step is populating your neo4j database with the up-to-date crate index. This is pulled from the live
-crate index and populates the appropriate nodes and relationships. Crates, versions and dependency relationships 
-are populated at this step.
-- `cargo +nightly run --release -- create-fresh-db -d bolt://127.0.0.1:7687 -u neo4j -p changeme123`
+The first step is populating your neo4j database from the crate index. Crates, versions and
+dependency relationships are populated at this step. Every command below reads the index from
+`PAINTER_INDEX_PATH`; keep that clone current with `git pull`.
+```
+export PAINTER_INDEX_PATH=/path/to/crates.io-index
+cargo run --release -- create-fresh-db -d bolt://127.0.0.1:7687 -u neo4j -p changeme123
+cargo run --release -- set-latest-versions -d bolt://127.0.0.1:7687 -u neo4j -p changeme123
+```
+`create-fresh-db` skips versions that already exist, so an interrupted run can be restarted; add
+`--only <CRATE>` (repeatable) to import specific crates. `import-crates <CRATE>...` refreshes
+named crates in an existing database. `set-latest-versions` marks each crate's highest version
+with `latest = true`, which the UI and the queries below use; re-run it after importing new versions.
+
+## Run the analysis
+This will populate the database with all invocation relationships. These exist as a representation of a given
+version calling a given crate. We cannot definitively say what version of what crate is invoked, so the relationship
+exists as `(Version)-[:INVOKES]->(Crate)`.
+
+Painter extracts each `.crate` file from `-c` into `-s` as `{crate}-{version}/` itself and writes
+bitcode to `-b` in the same layout. `-s`, `-b`, and `-c` are the same three roots for every command.
+```
+export PAINTER_INDEX_PATH=/path/to/crates.io-index
+cargo run --release -- compile-all --toolchain 1.96.1 -s sources -c crates -b bytecodes
+cargo run --release -- export-all-neo4j -s sources -c crates -b bytecodes -d bolt://127.0.0.1:7687 -u neo4j -p changeme123
+cargo run --release -- count-unsafe -s sources -c crates -d bolt://127.0.0.1:7687 -u neo4j -p changeme123
+```
+- `compile-all` builds the highest version of every crate in the index by default. Narrow or widen
+  it with `--only <CRATE>` (repeatable), `--all-versions`, `--top-downloads N`, `--top-reverse-deps N`,
+  `--top-maintainers N`, and `--newer-than YYYY-MM-DD` (the `--top-*` and `--newer-than` rules query
+  [ecosyste.ms](https://packages.ecosyste.ms)); `-j N` caps concurrent crates. Versions that already have
+  a directory under `-b` are skipped; delete it to rebuild. `plan` with the same flags prints the selection without compiling.
+- `export-all-neo4j` exports every bytecode directory under `-b`. Each version logs
+  `imported N invocations`; failures are logged at ERROR.
+- `compile-check` takes the same roots, database, and rule flags as `compile-all` and prints how many
+  selected crates/versions have bytecode, a `Version` node, and `INVOKES` edges; `-v` lists every
+  incomplete version:
+  `cargo run --release -- compile-check -s sources -c crates -b bytecodes -d bolt://127.0.0.1:7687 -u neo4j -p changeme123`
+
+Set `RUST_LOG=info` to see progress.
+
+## Querying
+Open the Neo4j browser at http://localhost:7474 (or use `cypher-shell`, or the Cypher panel in
+the graph UI). Some starting points:
+```
+// Crates that depend on serde in any version
+MATCH (c:Crate)-[:VERSION_OF]->(:Version)-[:DEPENDS_ON]->(:Crate {name: 'serde'})
+RETURN count(DISTINCT c) AS dependents
+
+// Latest version of a crate
+MATCH (:Crate {name: 'serde'})-[:VERSION_OF]->(v:Version) WHERE v.latest RETURN v.version
+
+// Crates a version calls into, by number of call sites
+MATCH (:Version {name: 'rocket', version: '0.5.1'})-[:INVOKES]->(t:Crate)
+RETURN t.name AS crate, count(*) AS calls ORDER BY calls DESC
+
+// Direct callers of one function
+MATCH (v:Version)-[i:INVOKES]->(:Crate) WHERE i.target = 'bytes::bytes::Bytes::copy_from_slice'
+RETURN v.name, v.version, i.callsite
+
+// Latest versions with the most unsafe code (after count-unsafe)
+MATCH (v:Version) WHERE v.latest AND v.unsafe_total > 0
+RETURN v.name, v.version, v.unsafe_total ORDER BY v.unsafe_total DESC LIMIT 20
+```
+Remember the `VERSION_OF` direction, `(Crate)-[:VERSION_OF]->(Version)`. To reach a crate's versions,
+go through its `Crate` node as above: matching `(:Version {name: ...})` without a version cannot use
+the `(name, version)` index and scans every version. [docker/queries.md](docker/queries.md) has more
+examples.
 
 ## Continuous integration
 GitHub Actions runs three workflows on every push to `main` and every pull request: `lint`
@@ -124,35 +218,9 @@ all targets), and `test` (`cargo test --all-targets`). They install LLVM 22 from
 stable Rust; the compile tests additionally use Rust 1.96.1 because its LLVM matches the one
 `llvm-ir` links against. Run the same commands locally before pushing.
 
-## Run the analysis
-This will populate the database with all invocation relationships. These exist as a representation of a given 
-version calling a given crate. We cannot definitively say what version of what crate is invoked, so the node relationshp
-exists at `(Version)-[INVOKES]->(Crate)`
-- Extract all crate files to a working folder, where names are {crate}-{version}. This can be done with any number of tools
-in the ecosystem for mirroring. For this project we wrote [walterhpearce/crates-spider](https://github.com/walterhpearce/crates-spider.git)
-- `cargo +nightly run --release -- compile-all -s cargo_sources -b cargo_bytecodes`
-- `cargo +nightly run --release -- export-all-neo4j -s /storage/crates/sources -b cargo_bytecodes -d bolt://127.0.0.1:7687 -u neo4j -p changeme123` 
-- `cargo +nightly run --release -- count-unsafe -s cargo_sources -c cargo_crates -d bolt://127.0.0.1:7687 -u neo4j -p changeme123`
-- `cargo +nightly run --release -- compile-check -s cargo_sources -c cargo_crates -b cargo_bytecodes -d bolt://127.0.0.1:7687 -u neo4j -p changeme123`
-  prints how many selected crates/versions have bytecode, a `Version` node, and `INVOKES` edges; takes the
-  same rule flags as `compile-all` (`--all-versions`, `--only`, `--top-*`), and `-v` lists every incomplete version.
 ### Database 
 
 Current `crates.io` graph snapshot: *Coming Soon*
-
-Nodes:
-- `(Version { name, version, major, minor, patch, build, pre })`
-- `(Crate {name })`
-
-Relationships:
-- `(Version)-[:VERSION_OF]->(Crate)`
-- `(Version)-[:DEPENDS_ON {requirement, features, kind, optional}]->(Crate)`
-- `(Version)-[:INVOKES { callsite, target }]->(Crate)`
-
-Re-running the export for a version that already has `INVOKES` edges replaces
-them: the old edges are deleted and the new set created in one transaction, so
-re-importing never duplicates and a version with no cross-crate calls ends up
-with none.
 
 ## [Code of Conduct][code-of-conduct]
 
