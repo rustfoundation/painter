@@ -1,4 +1,4 @@
-use neo4rs::{query, Graph, Node, Query, Row};
+use neo4rs::{Graph, Node, Query, Row, query};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;

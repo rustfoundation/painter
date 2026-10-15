@@ -239,11 +239,7 @@ impl CrateFs {
     fn find_cache_index(&self, entry: &CrateEntry) -> Option<usize> {
         self.cache.iter().enumerate().find_map(
             |(i, (e, _))| {
-                if *e == *entry {
-                    Some(i)
-                } else {
-                    None
-                }
+                if *e == *entry { Some(i) } else { None }
             },
         )
     }

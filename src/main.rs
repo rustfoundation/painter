@@ -2,12 +2,11 @@
 
 use clap::{Parser, Subcommand};
 use libpainter::{
-    analysis, check, compile,
+    Error, Roots, analysis, check, compile,
     db::Db,
     ecosystems::EcosystemsClient,
     index,
     rules::{BuildEverything, BuildRules, EcosystemsRules, NamedCrates},
-    Error, Roots,
 };
 use rayon::prelude::*;
 use std::{

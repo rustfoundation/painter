@@ -280,8 +280,8 @@ impl EcosystemsClient {
 mod tests {
     use super::*;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

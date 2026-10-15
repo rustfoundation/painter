@@ -45,20 +45,16 @@ pub async fn update_missing_versions(conn: Arc<Db>) -> Result<(), Error> {
     let index = open_index()?;
 
     let do_crate = |c: Crate, db: Arc<Db>| async move {
-        if let Ok(res) = db.crate_exists(c.name()).await {
-            if res {
-                //log::info!("Missing crate: {}", c.name());
-                //if let Err(e) = insert_fresh_crate(c.clone(), db.clone()).await {
-                //    log::error!("Failed crate: {}", c.name());
-                //    log::error!("Failed crate: {}", e);
-                //}
+        if let Ok(true) = db.crate_exists(c.name()).await {
+            //log::info!("Missing crate: {}", c.name());
+            //if let Err(e) = insert_fresh_crate(c.clone(), db.clone()).await {
+            //    log::error!("Failed crate: {}", c.name());
+            //    log::error!("Failed crate: {}", e);
+            //}
 
-                for v in c.versions() {
-                    if let Ok(res) = db.version_exists(v.name(), v.version()).await {
-                        if !res {
-                            log::info!("Missing version: {}-{}", v.name(), v.version());
-                        }
-                    }
+            for v in c.versions() {
+                if let Ok(false) = db.version_exists(v.name(), v.version()).await {
+                    log::info!("Missing version: {}-{}", v.name(), v.version());
                 }
             }
         }
@@ -86,12 +82,10 @@ pub async fn update_missing_crates(conn: Arc<Db>) -> Result<(), Error> {
     let index = open_index()?;
 
     let do_crate = |c: Crate, db: Arc<Db>| async move {
-        if let Ok(res) = db.crate_exists(c.name()).await {
-            if !res {
-                println!("Missing crate: {}", c.name());
-                if let Err(e) = insert_fresh_crate(c.clone(), db.clone()).await {
-                    log::error!("Failed crate: {}: {e}", c.name());
-                }
+        if let Ok(false) = db.crate_exists(c.name()).await {
+            println!("Missing crate: {}", c.name());
+            if let Err(e) = insert_fresh_crate(c.clone(), db.clone()).await {
+                log::error!("Failed crate: {}: {e}", c.name());
             }
         }
     };

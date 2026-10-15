@@ -377,11 +377,15 @@ mod tests {
             .map(|s| format!("{}-{}", s.name, s.version))
             .collect();
         assert_eq!(missing, ["a-1.0.1", "b-0.1.0", "c-2.0.0"]);
-        assert!(report
-            .render_missing()
-            .contains("b-0.1.0\tmissing: bytecode,db"));
-        assert!(report
-            .render_missing()
-            .contains("c-2.0.0\tmissing: invokes"));
+        assert!(
+            report
+                .render_missing()
+                .contains("b-0.1.0\tmissing: bytecode,db")
+        );
+        assert!(
+            report
+                .render_missing()
+                .contains("c-2.0.0\tmissing: invokes")
+        );
     }
 }

@@ -1,5 +1,5 @@
-use crate::{db::Db, Error, Roots};
-use llvm_ir_analysis::{llvm_ir::Module, ModuleAnalysis};
+use crate::{Error, Roots, db::Db};
+use llvm_ir_analysis::{ModuleAnalysis, llvm_ir::Module};
 use rayon::prelude::*;
 use rustc_demangle::demangle;
 
