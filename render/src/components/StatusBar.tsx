@@ -39,9 +39,11 @@ export function StatusBar(props: Props) {
         {fmtInt(stats?.invokes)} INVOKES
       </span>
       <span className="sep" />
-      <span>
-        view: {nodeCount} nodes · {relCount} rels
-      </span>
+      {view !== 'callers' && (
+        <span>
+          view: {nodeCount} nodes · {relCount} rels
+        </span>
+      )}
       {view === 'map' && mapMeta && (
         <>
           <span className="sep" />
@@ -62,6 +64,8 @@ export function StatusBar(props: Props) {
           </span>
         </>
       )}
+      {view !== 'callers' && (
+      <>
       <span className="sep" />
       {(view === 'map' ? [] : view === 'deps' ? ['DEPENDS_ON'] : ['VERSION_OF', 'DEPENDS_ON', 'INVOKES']).map((t) => (
         <label key={t} className="opt">
@@ -71,6 +75,8 @@ export function StatusBar(props: Props) {
       <label className="opt">
         <input type="checkbox" checked={showRelCaptions} onChange={onToggleRelCaptions} /> edge labels
       </label>
+      </>
+      )}
       <span className="spacer" />
       {error && <span className="error">{error}</span>}
     </div>

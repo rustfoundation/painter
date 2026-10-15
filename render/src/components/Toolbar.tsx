@@ -87,6 +87,8 @@ export function Toolbar(props: Props) {
           </button>
         ))}
       </div>
+      {view !== 'callers' && (
+      <>
       <div className="search">
         <input
           type="text"
@@ -139,6 +141,8 @@ export function Toolbar(props: Props) {
       >
         {busy ? 'Loading…' : view === 'map' ? 'Go to' : 'Load'}
       </button>
+      </>
+      )}
 
       {view === 'map' && (
         <label className="opt" title="Maximum clusters or crates drawn for one viewport">
@@ -216,6 +220,8 @@ export function Toolbar(props: Props) {
 
       <span className="spacer" />
 
+      {view !== 'callers' && (
+      <>
       <label className="opt">
         layout
         <select value={layout} onChange={(e) => onLayoutChange(e.target.value)}>
@@ -230,6 +236,8 @@ export function Toolbar(props: Props) {
       <button onClick={onClear} className="danger">
         Clear
       </button>
+      </>
+      )}
     </div>
   );
 }

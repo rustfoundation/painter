@@ -5,6 +5,8 @@ CREATE INDEX idx_invoke FOR ()-[r:INVOKES]-() ON (r.caller, r.callee)
 CREATE INDEX idx_is_latest FOR (n:Version) ON (n.latest)
 CREATE INDEX idx_unsafe_total FOR (n:Version) ON (n.unsafe_total)
 CREATE TEXT INDEX idx_crate_name_text IF NOT EXISTS FOR (n:Crate) ON (n.name)
+CREATE INDEX idx_invoke_target IF NOT EXISTS FOR ()-[r:INVOKES]-() ON (r.target)
+CREATE TEXT INDEX idx_invoke_target_text IF NOT EXISTS FOR ()-[r:INVOKES]-() ON (r.target)
 ```
 
 `idx_crate_name_text` backs the render UI's partial-name search (`CONTAINS`).

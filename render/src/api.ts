@@ -52,13 +52,67 @@ export interface Health {
 }
 
 /** Which graph the UI shows. */
-export type View = 'default' | 'deps' | 'map';
+export type View = 'default' | 'deps' | 'map' | 'callers';
 
 export const VIEWS: { id: View; label: string; title: string }[] = [
   { id: 'default', label: 'Default', title: 'Crates, versions, and their DEPENDS_ON / INVOKES edges' },
   { id: 'deps', label: 'Deps', title: 'Transitive crate-level dependency chain of every crate matching the filter' },
   { id: 'map', label: 'Map', title: 'Whole ecosystem on a precomputed layout; zoom in to resolve clusters into crates' },
+  { id: 'callers', label: 'Callers', title: 'Table of every crate version and function that calls a function, directly or through other functions' },
 ];
+
+/** Callers view: one function that reaches the searched function. */
+export interface CallerRow {
+  /** Call levels from the searched function; 1 = calls it directly. */
+  depth: number;
+  crate: string;
+  version: string;
+  function: string;
+  /** The function this row calls on the way to the searched one. */
+  calls: string;
+  /** False when a version was pinned but the caller has no direct DEPENDS_ON to check it against. */
+  verified: boolean;
+  /** This function, then each callee down to the searched function. */
+  path: string[];
+}
+
+export interface CallersResult {
+  rows: CallerRow[];
+  meta: {
+    crate: string;
+    version: string | null;
+    fn: string;
+    exact: boolean;
+    /** Functions of the crate the search matched (one for an exact search). */
+    targets: string[];
+    maxDepth: number;
+    depth: number;
+    limit: number;
+    truncated: boolean;
+    /** Nothing further out calls any row: the walk ended before max depth. */
+    exhausted: boolean;
+    unverified: number;
+    /** Edges dropped because the caller's requirement excludes the pinned version. */
+    rejected: number;
+    elapsedMs: number;
+  };
+}
+
+export interface CallersQuery {
+  crate: string;
+  version: string | null;
+  fn: string;
+  exact: boolean;
+  depth: number;
+  limit: number;
+}
+
+export interface CrateVersion {
+  version: string;
+  latest: boolean;
+  /** Has outgoing INVOKES, i.e. painter exported its call graph. */
+  exported: boolean;
+}
 
 /** Map view: one viewport's worth of elements from the LOD index. */
 export interface LodViewport {
@@ -187,6 +241,17 @@ export const api = {
     request<{ name: string; x: number; y: number; community: number; degree: number }>(`/api/lod/locate?name=${encodeURIComponent(name)}`),
   lodSearch: (q: string, limit = 15) =>
     request<{ names: string[] }>(`/api/lod/search?q=${encodeURIComponent(q)}&limit=${limit}`).then((r) => r.names),
+  searchFunctions: (crate: string, q: string, limit = 20) =>
+    request<{ functions: { name: string; calls: number }[] }>(
+      `/api/functions/search?${new URLSearchParams({ crate, q, limit: String(limit) })}`,
+    ).then((r) => r.functions),
+  crateVersions: (name: string) =>
+    request<{ versions: CrateVersion[] }>(`/api/crates/${encodeURIComponent(name)}/versions`).then((r) => r.versions),
+  callers: (q: CallersQuery) => {
+    const params = new URLSearchParams({ crate: q.crate, fn: q.fn, match: q.exact ? 'exact' : 'contains', depth: String(q.depth), limit: String(q.limit) });
+    if (q.version) params.set('version', q.version);
+    return request<CallersResult>(`/api/callers?${params}`);
+  },
   expand: (id: string, direction: 'in' | 'out' | 'both', types: ExpandType[], limit = 100) =>
     request<GraphPayload>('/api/graph/expand', json({ id, direction, types, limit })),
   cypher: (query: string, params: Record<string, unknown> = {}) =>

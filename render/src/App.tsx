@@ -20,6 +20,7 @@ import { DetailsPanel } from './components/DetailsPanel';
 import { CypherPanel } from './components/CypherPanel';
 import { StatusBar } from './components/StatusBar';
 import { MapView } from './components/MapView';
+import { CallersView } from './components/CallersView';
 
 const DEFAULT_OPTIONS: CrateLoadOptions = { versions: 'latest', deps: true, invokes: true, dependents: false, limit: 200 };
 const DEFAULT_DEPS_LIMIT = 5000;
@@ -326,7 +327,9 @@ export function App() {
         busy={busy}
       />
       <div className="main">
-        {view === 'map' ? (
+        {view === 'callers' ? (
+          <CallersView busy={busy} onBusy={setBusy} onError={setError} />
+        ) : view === 'map' ? (
           <MapView
             target={mapTarget}
             budget={mapBudget}

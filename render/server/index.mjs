@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
 import { config, describeConfig } from './config.mjs';
 import { collectGraph } from './graph.mjs';
+import { findCallers, normCrate } from './callers.mjs';
 import { createLodJobs } from './lod/jobs.mjs';
 import { LodIndex } from './lod/index.mjs';
 
@@ -563,6 +564,119 @@ api.get(
         truncated,
         crates: g.nodes.length,
         edges: g.rels.length,
+      },
+    });
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// Callers view: reverse call graph over INVOKES (see callers.mjs)
+// ---------------------------------------------------------------------------
+
+/**
+ * INVOKES edges point at the crate named by the symbol path, which spells
+ * `my-crate` as `my_crate`; accept either spelling for the callee crate.
+ */
+const crateSpellings = (name) => [...new Set([name, normCrate(name), name.replace(/_/g, '-')])];
+
+/**
+ * Functions of a crate that something calls: distinct INVOKES targets into
+ * it whose name contains `q` (case-insensitive), most-called first. Names
+ * ending in `q` rank first so `spawn` finds `tokio::task::spawn::spawn`.
+ */
+const searchFunctions = async (crate, q, limit) =>
+  readGraph(
+    `MATCH (t:Crate) WHERE t.name IN $names
+     MATCH (t)<-[i:INVOKES]-(:Version)
+     WHERE $q = '' OR toLower(i.target) CONTAINS $q
+     WITH i.target AS name, count(*) AS calls
+     ORDER BY toLower(name) ENDS WITH $q DESC, calls DESC, size(name)
+     RETURN name, calls LIMIT $limit`,
+    { names: crateSpellings(crate), q: q.toLowerCase(), limit: neo4j.int(limit) },
+  ).then((g) => g.rows);
+
+/** `?crate&q&limit`: function-name suggestions for the Callers view. */
+api.get(
+  '/functions/search',
+  wrap(async (req, res) => {
+    const crate = String(req.query.crate ?? '').trim();
+    if (!crate) return res.status(400).json({ error: 'crate is required' });
+    res.json({ functions: await searchFunctions(crate, String(req.query.q ?? '').trim(), clampLimit(req.query.limit, 20)) });
+  }),
+);
+
+/** Every version of a crate, newest first (semver triple, then pre-releases last). */
+api.get(
+  '/crates/:name/versions',
+  wrap(async (req, res) => {
+    const g = await readGraph(
+      `MATCH (c:Crate {name: $name})-[:VERSION_OF]-(v:Version)
+       RETURN v.version AS version, coalesce(v.latest, false) AS latest, EXISTS { (v)-[:INVOKES]->() } AS exported
+       ORDER BY v.semver_major DESC, v.semver_minor DESC, v.semver_patch DESC, coalesce(v.semver_pre, '') = '' DESC, v.version DESC`,
+      { name: String(req.params.name) },
+    );
+    res.json({ versions: g.rows });
+  }),
+);
+
+/**
+ * Who calls a function, directly or transitively.
+ *
+ * Query params:
+ *   crate   = crate that defines the function (required)
+ *   fn      = function: the full demangled name, or text contained in it (required)
+ *   match   = exact | contains   (default contains; contains takes every matching
+ *             target into the crate, up to 500)
+ *   version = pin the crate version; callers must be that version (same crate) or
+ *             declare a DEPENDS_ON requirement that admits it. Empty = any version.
+ *   depth   = max call levels to walk outwards (default 3, max 10)
+ *   limit   = max rows (default and cap NEO4J_MAX_ROWS)
+ */
+api.get(
+  '/callers',
+  wrap(async (req, res) => {
+    const crate = String(req.query.crate ?? '').trim();
+    const fn = String(req.query.fn ?? '').trim();
+    if (!crate || !fn) return res.status(400).json({ error: 'crate and fn are required' });
+    const version = String(req.query.version ?? '').trim() || null;
+    const exact = req.query.match === 'exact';
+    const maxDepth = Math.min(10, Math.max(1, Number.parseInt(req.query.depth ?? '3', 10) || 3));
+    const limit = clampLimit(req.query.limit, config.neo4j.maxRows);
+    const started = Date.now();
+
+    if (version) {
+      const found = await readGraph(`MATCH (c:Crate)-[:VERSION_OF]-(v:Version {version: $version}) WHERE c.name IN $names RETURN v LIMIT 1`, {
+        names: crateSpellings(crate),
+        version,
+      });
+      if (!found.nodes.length) return res.status(404).json({ error: `no version ${version} of crate '${crate}'` });
+    }
+
+    const targets = exact ? [fn] : (await searchFunctions(crate, fn, 500)).map((f) => f.name);
+    if (!targets.length) {
+      return res.status(404).json({
+        error: `nothing calls a function of '${crate}' containing '${fn}' (INVOKES only records calls into crates painter has exported callers for)`,
+      });
+    }
+
+    const read = (cypher, params) => readGraph(cypher, params).then((g) => g.rows);
+    const result = await findCallers(read, { crate, version, targets, maxDepth, limit });
+    res.json({
+      rows: result.rows,
+      meta: {
+        crate,
+        version,
+        fn,
+        exact,
+        targets,
+        maxDepth,
+        depth: result.depth,
+        limit,
+        truncated: result.truncated,
+        exhausted: result.exhausted,
+        unverified: result.unverified,
+        rejected: result.rejected,
+        elapsedMs: Date.now() - started,
       },
     });
   }),
