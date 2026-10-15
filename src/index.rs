@@ -6,6 +6,9 @@ use std::sync::Arc;
 /// How many crates are written to the database concurrently by the bulk import.
 pub const IMPORT_CONCURRENCY: usize = 32;
 
+/// Crates whose `latest` flag is being written at once.
+const SET_LATEST_CONCURRENCY: usize = 64;
+
 /// Environment variable naming a local clone of the crates.io git index.
 pub const INDEX_PATH_ENV: &str = "PAINTER_INDEX_PATH";
 
@@ -128,43 +131,17 @@ pub fn version_rows(c: &Crate) -> Vec<VersionRow> {
         .collect()
 }
 
-/// Attempts made for one crate before giving up on transient database errors.
-const TRANSIENT_RETRIES: u32 = 6;
-
-/// Whether a database error is transient (deadlock between concurrent writers merging the same
-/// `Crate` nodes, or any other `Neo.TransientError`) and the write can simply be retried. The
-/// failed transaction was rolled back, so a retry never duplicates data.
-fn is_transient(e: &crate::db::Error) -> bool {
-    let msg = e.to_string();
-    msg.contains("Neo.TransientError")
-        || msg.contains("DeadlockDetected")
-        || msg.contains("ForsetiClient")
-}
-
 /// Insert a crate and all of its versions with one database round trip, skipping versions that
-/// already exist, so an interrupted import can be resumed by re-running it. Transient errors are
-/// retried with exponential backoff.
+/// already exist, so an interrupted import can be resumed by re-running it. Transient errors
+/// (deadlocks between writers merging the same `Crate` nodes) are retried inside [`Db`].
 ///
 /// # Errors
 /// Returns `Error::DatabaseError` on a failed query.
 pub async fn insert_fresh_crate(c: Crate, db: Arc<Db>) -> Result<(), Error> {
     log::trace!("+Crate({}) with {} versions", c.name(), c.versions().len());
     let rows = version_rows(&c);
-    let mut attempt = 0;
-    loop {
-        match db.insert_crate_versions(c.name(), &rows).await {
-            Ok(()) => return Ok(()),
-            Err(e) if is_transient(&e) && attempt < TRANSIENT_RETRIES => {
-                attempt += 1;
-                // 50ms, 100ms, 200ms, ... plus jitter derived from the name so retries spread out.
-                let jitter = u64::try_from(c.name().len() % 7).unwrap_or(0) * 10;
-                let wait = std::time::Duration::from_millis(50 * (1 << attempt) + jitter);
-                log::debug!("{}: transient error, retry {attempt} in {wait:?}", c.name());
-                tokio::time::sleep(wait).await;
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
+    db.insert_crate_versions(c.name(), &rows).await?;
+    Ok(())
 }
 
 /// Idempotently import (or refresh) a single crate and all of its versions from the index.
@@ -280,36 +257,63 @@ pub async fn create_fresh_db<S: AsRef<str>>(conn: Arc<Db>, only: &[S]) -> Result
     Ok(())
 }
 
+/// Flag the highest version of every crate in the index with `latest = true` and clear it on
+/// the others. The index is walked on rayon (`crates_parallel`) and streamed through a bounded
+/// channel while `SET_LATEST_CONCURRENCY` crates are written at once; failures are logged and
+/// counted.
+///
+/// # Errors
+/// Returns `Error::IndexError` if the crates.io index cannot be opened.
 ///
 /// # Panics
-/// asdf
-/// # Errors
-/// asdf
+/// Panics if the index walk task panics.
 pub async fn set_latest_versions(conn: Arc<Db>) -> Result<(), Error> {
+    use rayon::prelude::*;
+
     let index = open_index()?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Crate>(4096);
+    let walker = tokio::task::spawn_blocking(move || {
+        index.crates_parallel().for_each(|c| match c {
+            Ok(c) => {
+                let _ = tx.blocking_send(c);
+            }
+            Err(e) => log::error!("index walk failed: {e}"),
+        });
+    });
 
-    let do_crate = |c: Crate, db: Arc<Db>| async move {
-        let latest = c.highest_version();
-        if let Err(e) = db.set_latest(c.name(), latest.version()).await {
-            log::error!(
-                "set_latest failed for {}-{}: {}",
-                c.name(),
-                latest.version(),
-                e
-            );
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    let mut chunk = Vec::with_capacity(SET_LATEST_CONCURRENCY);
+    loop {
+        chunk.clear();
+        if rx.recv_many(&mut chunk, SET_LATEST_CONCURRENCY).await == 0 {
+            break;
         }
-    };
-
-    let iter = crate::chunked(index.crates(), 64);
-    for chunk in iter {
-        let tasks: Vec<_> = chunk
-            .into_iter()
-            .map(|c| do_crate(c, conn.clone()))
-            .collect();
-
-        futures::future::join_all(tasks).await;
+        let tasks = chunk.iter().map(|c| {
+            let db = conn.clone();
+            async move {
+                let latest = c.highest_version();
+                db.set_latest(c.name(), latest.version())
+                    .await
+                    .map_err(|e| format!("{}-{}: {e}", c.name(), latest.version()))
+            }
+        });
+        for result in futures::future::join_all(tasks).await {
+            match result {
+                Ok(()) => done += 1,
+                Err(msg) => {
+                    failed += 1;
+                    log::error!("set_latest failed for {msg}");
+                }
+            }
+        }
+        if ((done + failed) / SET_LATEST_CONCURRENCY).is_multiple_of(16) {
+            log::info!("set latest on {done} crates ({failed} failed)");
+        }
     }
+    walker.await.expect("index walk task panicked");
 
+    log::info!("set-latest-versions finished: {done} crates, {failed} failed");
     Ok(())
 }
 

@@ -1,5 +1,6 @@
-use neo4rs::{query, Graph, Node};
+use neo4rs::{query, Graph, Node, Query, Row};
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -71,10 +72,63 @@ pub struct CrateDbStatus {
     pub exported: std::collections::HashSet<String>,
 }
 
+/// Attempts made for one write before giving up on a transient error.
+const WRITE_RETRIES: u32 = 6;
+
+/// Whether a database error is transient (a deadlock between concurrent writers touching the
+/// same nodes or index entries, or any other `Neo.TransientError`) and the write can simply be
+/// retried. Neo4j rolls the failed transaction back, so a retry never duplicates data.
+#[must_use]
+pub fn is_transient(e: &Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("Neo.TransientError")
+        || msg.contains("DeadlockDetected")
+        || msg.contains("ForsetiClient")
+}
+
+/// Exponential backoff for retry `attempt` (1-based): 100ms, 200ms, 400ms, ... plus up to 50ms
+/// of jitter so writers that deadlocked against each other do not retry in lockstep.
+fn backoff(attempt: u32) -> Duration {
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos() % 50));
+    Duration::from_millis(50 * (1u64 << attempt.min(10)) + jitter)
+}
+
 pub struct Db {
     conn: Arc<Graph>,
 }
 impl Db {
+    /// Run a write query that returns nothing, retrying transient failures with backoff. See
+    /// [`is_transient`].
+    async fn write(&self, q: Query) -> Result<(), Error> {
+        self.write_first_row(q).await.map(|_| ())
+    }
+
+    /// Run a write query and return its first row, if any. The whole result is consumed inside
+    /// the retry loop, so a transient failure surfaced while streaming rows is retried too.
+    async fn write_first_row(&self, q: Query) -> Result<Option<Row>, Error> {
+        let mut attempt = 0;
+        loop {
+            match self.write_once(q.clone()).await {
+                Ok(row) => return Ok(row),
+                Err(e) if is_transient(&e) && attempt < WRITE_RETRIES => {
+                    attempt += 1;
+                    let wait = backoff(attempt);
+                    log::debug!("transient database error, retry {attempt} in {wait:?}: {e}");
+                    tokio::time::sleep(wait).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn write_once(&self, q: Query) -> Result<Option<Row>, Error> {
+        let mut stream = self.conn.execute(q).await?;
+        let first = stream.next().await?;
+        while stream.next().await?.is_some() {}
+        Ok(first)
+    }
     #[allow(clippy::must_use_candidate)]
     pub fn inner(&self) -> Arc<Graph> {
         self.conn.clone()
@@ -129,9 +183,7 @@ impl Db {
         src_crate: (&str, &str),
         dst_crate: &str,
     ) -> Result<(), Error> {
-        self
-            .conn
-            .execute(
+        self.write(
                 query(
                     "MATCH (srcVersion:Version { name: $src_crate, version: $src_version }) 
                         MATCH (dstCrate:Crate { name: $dst_crate }) 
@@ -144,7 +196,7 @@ impl Db {
                 .param("caller", caller)
                 .param("callee", callee),
             )
-            .await?.next().await?;
+            .await?;
 
         Ok(())
     }
@@ -177,8 +229,7 @@ impl Db {
         let targets: Vec<&str> = calls.iter().map(|c| c.1.as_str()).collect();
         let dsts: Vec<&str> = calls.iter().map(|c| c.2.as_str()).collect();
 
-        self.conn
-            .run(
+        self.write(
                 query(
                     "MATCH (srcVersion:Version { name: $src_crate, version: $src_version })
                      OPTIONAL MATCH (srcVersion)-[old:INVOKES]->()
@@ -232,8 +283,7 @@ impl Db {
 
         if parsed.is_empty() {
             // Still make sure the crate node exists.
-            self.conn
-                .run(query("MERGE (:Crate { name: $name })").param("name", name))
+            self.write(query("MERGE (:Crate { name: $name })").param("name", name))
                 .await?;
             return Ok(());
         }
@@ -280,10 +330,9 @@ impl Db {
             .map(|(r, _)| r.dependencies.iter().map(|d| d.optional).collect())
             .collect();
 
-        self.conn
-            .run(
-                query(
-                    "MERGE (crate:Crate { name: $name })
+        self.write(
+            query(
+                "MERGE (crate:Crate { name: $name })
                      WITH crate
                      UNWIND range(0, size($versions) - 1) AS i
                      WITH crate, i
@@ -307,21 +356,21 @@ impl Db {
                          kind: $dep_kinds[i][j],
                          optional: $dep_optional[i][j]
                      }]->(d)",
-                )
-                .param("name", name)
-                .param("versions", versions)
-                .param("majors", majors)
-                .param("minors", minors)
-                .param("patches", patches)
-                .param("builds", builds)
-                .param("pres", pres)
-                .param("dep_names", dep_names)
-                .param("dep_reqs", dep_reqs)
-                .param("dep_features", dep_features)
-                .param("dep_kinds", dep_kinds)
-                .param("dep_optional", dep_optional),
             )
-            .await?;
+            .param("name", name)
+            .param("versions", versions)
+            .param("majors", majors)
+            .param("minors", minors)
+            .param("patches", patches)
+            .param("builds", builds)
+            .param("pres", pres)
+            .param("dep_names", dep_names)
+            .param("dep_reqs", dep_reqs)
+            .param("dep_features", dep_features)
+            .param("dep_kinds", dep_kinds)
+            .param("dep_optional", dep_optional),
+        )
+        .await?;
 
         Ok(())
     }
@@ -396,23 +445,20 @@ impl Db {
         src_crate: (&str, &str),
         dst_crate: &str,
     ) -> Result<(), Error> {
-        self.conn
-            .execute(
-                query(
-                    "MATCH (srcVersion:Version { name: $src_crate, version: $src_version }) 
+        self.write(
+            query(
+                "MATCH (srcVersion:Version { name: $src_crate, version: $src_version }) 
                         MATCH (dstCrate:Crate { name: $dst_crate }) 
                         MERGE (srcVersion)-[:INVOKES {caller: $caller, callee: $callee}]->(dstCrate)
                     ",
-                )
-                .param("src_crate", src_crate.0)
-                .param("src_version", src_crate.1)
-                .param("dst_crate", dst_crate)
-                .param("caller", caller)
-                .param("callee", callee),
             )
-            .await?
-            .next()
-            .await?;
+            .param("src_crate", src_crate.0)
+            .param("src_version", src_crate.1)
+            .param("dst_crate", dst_crate)
+            .param("caller", caller)
+            .param("callee", callee),
+        )
+        .await?;
 
         Ok(())
     }
@@ -453,9 +499,8 @@ impl Db {
         let semver = parse_semver(version)?;
 
         let version_id = {
-            let mut result = self
-                .conn
-                .execute(
+            let row = self
+                .write_first_row(
                     query(
                         "MERGE (crate:Crate { name: $name }) 
                      MERGE (version:Version {name: $name, version: $version, 
@@ -489,11 +534,8 @@ impl Db {
                 )
                 .await?;
 
-            let version_node: Node = result
-                .next()
-                .await
-                .unwrap()
-                .unwrap()
+            let version_node: Node = row
+                .expect("MERGE returns the version")
                 .get("version")
                 .unwrap();
 
@@ -502,8 +544,7 @@ impl Db {
 
         for depend in depends_on {
             self
-                .conn
-                .execute(
+                .write(
                     query(
                         "MATCH (version:Version) WHERE ID(version) = $version_id
                          MERGE (depend:Crate { name: $depend })
@@ -516,7 +557,7 @@ impl Db {
                         .param("kind", depend.3.as_ref())
                         .param("optional", depend.4.as_ref())
                 )
-                .await?.next().await?;
+                .await?;
         }
 
         Ok(())
@@ -554,15 +595,12 @@ impl Db {
         S1: AsRef<str>,
         S2: AsRef<str>,
     {
-        self.conn
-            .run(
-                query(
-                    "MATCH (:Version { name: $name, version: $version })-[r:INVOKES]->() DELETE r",
-                )
+        self.write(
+            query("MATCH (:Version { name: $name, version: $version })-[r:INVOKES]->() DELETE r")
                 .param("name", name.as_ref())
                 .param("version", version.as_ref()),
-            )
-            .await?;
+        )
+        .await?;
         Ok(())
     }
 
@@ -590,37 +628,27 @@ impl Db {
             .is_some())
     }
 
-    ///
-    /// # Panics
+    /// Mark `version` as the latest of crate `name` and clear the flag on its other versions,
+    /// in one statement. Versions are reached through the `Crate` node: a name-only
+    /// `MATCH (v:Version { name })` cannot use the `(name, version)` constraint index and
+    /// label-scans every `Version` in the database.
     ///
     /// # Errors
-    ///
+    /// This function will return an `painter::db::Error` in the event of a database error.
     pub async fn set_latest<S1, S2>(&self, name: S1, version: S2) -> Result<(), Error>
     where
         S1: AsRef<str>,
         S2: AsRef<str>,
     {
-        // Clear all other latest for this name
-        self.conn
-            .execute(
-                query("MATCH (v:Version {name: $name }) SET v.latest = False")
-                    .param("name", name.as_ref()),
+        self.write(
+            query(
+                "MATCH (:Crate { name: $name })-[:VERSION_OF]->(v:Version)
+                 SET v.latest = (v.version = $version)",
             )
-            .await?
-            .next()
-            .await?;
-
-        self.conn
-            .execute(
-                query("MATCH (v:Version {name: $name, version: $version }) SET v.latest = True")
-                    .param("name", name.as_ref())
-                    .param("version", version.as_ref()),
-            )
-            .await?
-            .next()
-            .await?;
-
-        Ok(())
+            .param("name", name.as_ref())
+            .param("version", version.as_ref()),
+        )
+        .await
     }
 
     ///
@@ -687,8 +715,7 @@ impl Db {
         S2: AsRef<str>,
     {
         if self
-            .conn
-            .execute(
+            .write_first_row(
                 query(
                     "MATCH (v:Version {name:  $name, version: $version}) SET \
                 v.unsafe_total = $unsafe_total, \
@@ -718,8 +745,6 @@ impl Db {
                 .param("safe_traits", unsafe_result.item_traits.safe)
                 .param("safe_methods", unsafe_result.methods.safe),
             )
-            .await?
-            .next()
             .await?
             .is_none()
         {
@@ -763,6 +788,29 @@ mod tests {
             Err(Error::InvalidSemver(_))
         ));
         assert!(matches!(parse_semver(""), Err(Error::InvalidSemver(_))));
+    }
+
+    #[test]
+    fn is_transient_matches_deadlocks_only() {
+        let deadlock = Error::CrateNotFound(
+            "Neo.TransientError.Transaction.DeadlockDetected: ForsetiClient[...] can't acquire"
+                .into(),
+        );
+        assert!(is_transient(&deadlock));
+        assert!(is_transient(&Error::CrateNotFound(
+            "Neo.TransientError.General.MemoryPoolOutOfMemoryError".into()
+        )));
+        assert!(!is_transient(&Error::CrateNotFound("serde".into())));
+        assert!(!is_transient(&Error::InvalidSemver("1.x".into())));
+    }
+
+    #[test]
+    fn backoff_grows_and_is_capped() {
+        assert!(backoff(1) >= Duration::from_millis(100));
+        assert!(backoff(1) < Duration::from_millis(150));
+        assert!(backoff(3) >= Duration::from_millis(400));
+        // The shift is clamped so an absurd attempt count cannot overflow.
+        assert!(backoff(60) <= Duration::from_millis(51_250));
     }
 
     #[test]
