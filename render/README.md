@@ -17,6 +17,7 @@ render/
   server/
     config.mjs        every setting, read from env at startup
     graph.mjs         neo4j records -> {nodes, rels, rows}
+    callers.mjs       reverse call-graph walk for the Callers view, Cargo requirement matching
     index.mjs         routes
     lod/              Map view precompute (layout + communities) and viewport index
       build.mjs       full build / incremental update pipeline
@@ -27,7 +28,7 @@ render/
       neo4j-io.mjs    streaming reads, batched writes
   src/
     App.tsx           view switching, Default and Deps canvases
-    components/       Toolbar, DetailsPanel, CypherPanel, StatusBar, MapView
+    components/       Toolbar, DetailsPanel, CypherPanel, StatusBar, MapView, CallersView
     api.ts            API client + types
     graph.ts          store -> NVL elements, colours
   Dockerfile          two-stage; final image runs `node server/index.mjs`
@@ -74,8 +75,10 @@ container to a Neo4j on the host, use `bolt://host.docker.internal:7687` and on
 Linux add `--add-host=host.docker.internal:host-gateway`.
 
 Database side: create the constraints and indexes in `docker/queries.md`.
-`idx_crate_name_text` is what makes partial-name search fast; the Map build
-creates its own `lod_*` indexes.
+`idx_crate_name_text` is what makes partial-name search fast;
+`idx_invoke_target` is what makes the Callers view fast (without it each step
+expands every `INVOKES` edge into the callee crate, seconds for tokio). The Map
+build creates its own `lod_*` indexes.
 
 To get the Map view working you also need the precompute, see below. The
 Default and Deps views work as soon as the graph has data.
@@ -111,7 +114,7 @@ localhost. `.env.example` lists them.
 
 ## Views
 
-All three views: scroll wheel (or pinch) zooms, drag pans, Fit reframes,
+The graph views (Default, Deps, Map): scroll wheel (or pinch) zooms, drag pans, Fit reframes,
 Clear empties the canvas. Click a node or edge for its properties.
 
 ### Default
@@ -259,6 +262,9 @@ JSON throughout. Graph payloads are
 | `GET /api/lod/viewport?x0&y0&x1&y1&budget&minCell` | clusters or crates for a viewport; no bbox = whole map; 503 until a build is loaded |
 | `GET /api/lod/locate?name` | a crate's map position |
 | `GET /api/lod/search?q&limit` | crate names on the map, in memory |
+| `GET /api/crates/:name/versions` | a crate's versions, newest first, with `latest` and `exported` (has `INVOKES`) |
+| `GET /api/functions/search?crate&q&limit` | called functions of a crate containing `q`, most-called first |
+| `GET /api/callers?crate&fn&match&version&depth&limit` | Callers view: `rows` of `{depth, crate, version, function, calls, verified, path}`; `match=exact` or `contains` |
 | `GET /api/node/:id` | one node by `elementId` |
 | `POST /api/cypher` | `{query, params}`, read-only, row-capped; 403 when disabled |
 

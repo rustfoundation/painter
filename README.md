@@ -2,7 +2,29 @@
 
 Painter is an implementation of methodologies to build a graph database of dependencies and invocations between all crates within the crates.io ecosystem.
 
-![serde](/poc/serde.png)
+The graph can be explored with the web UI in `render/` (`docker compose up -d`,
+then http://localhost:8080; see [render/README.md](render/README.md)).
+
+**Default**: a crate's latest version with its dependencies and invocations.
+Clicking an `INVOKES` edge shows how many call sites it stands for and which
+functions are called (here `rocket@0.5.1` makes 1962 calls into `tokio`).
+
+![Default view: rocket and its DEPENDS_ON / INVOKES edges](docs/screenshots/default.png)
+
+**Deps**: the transitive crate-level dependency chain (here `axum`, two levels deep).
+
+![Deps view: transitive dependency chain of axum](docs/screenshots/deps.png)
+
+**Map**: all 339,715 crates on a precomputed layout, coloured by community;
+clusters split into individual crates as you zoom in.
+
+![Map view: the whole ecosystem clustered by community](docs/screenshots/map.png)
+
+**Callers**: every crate version and function that calls a given function,
+directly or through other functions, with the call chain for each row (here
+callers of `bytes::bytes::Bytes::copy_from_slice`).
+
+![Callers view: transitive callers of bytes::Bytes::copy_from_slice](docs/screenshots/callers.png)
 
 ## Index Importing
 The index is imported leveraging the `crates-index` crate. We iterate all version of
