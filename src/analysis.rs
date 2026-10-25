@@ -49,6 +49,52 @@ pub fn callee_crate(demangled: &str) -> Option<&str> {
     }
 }
 
+/// Bitcode modules [`export_crate_db`] parses at once. Parsing is CPU and memory heavy (a large
+/// crate's module takes gigabytes) and runs off the async runtime: parsed inline it stalled
+/// every other export in the same `join_all`, and Neo4j drops a connection that does not
+/// finish authenticating within 30 s.
+static PARSE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// Above this many `_` in a path segment, [`crate_name_candidates`] stops enumerating every
+/// `-`/`_` spelling and only tries all-`_` and all-`-`.
+const MAX_SEPARATOR_VARIANTS: usize = 6;
+
+/// Crate names that a crate's path segment in a demangled symbol (`ident`) can stand for.
+/// Rust writes the crate `foo-bar` as `foo_bar`, and crates.io treats `-` and `_` as the same
+/// in names, so every `_` may be either. `ident` itself comes first.
+#[must_use]
+pub fn crate_name_candidates(ident: &str) -> Vec<String> {
+    let seps: Vec<usize> = ident.match_indices('_').map(|(i, _)| i).collect();
+    if seps.is_empty() {
+        return vec![ident.to_string()];
+    }
+    if seps.len() > MAX_SEPARATOR_VARIANTS {
+        return vec![ident.to_string(), ident.replace('_', "-")];
+    }
+    (0..1u32 << seps.len())
+        .map(|mask| {
+            ident
+                .char_indices()
+                .map(|(at, c)| match seps.iter().position(|&s| s == at) {
+                    Some(bit) if mask & (1 << bit) != 0 => '-',
+                    _ => c,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The first of `ident`'s [`crate_name_candidates`] that is in `existing`.
+#[must_use]
+pub fn resolve_crate_name<S: std::hash::BuildHasher>(
+    ident: &str,
+    existing: &std::collections::HashSet<String, S>,
+) -> Option<String> {
+    crate_name_candidates(ident)
+        .into_iter()
+        .find(|c| existing.contains(c))
+}
+
 /// Extract all function calls/invocations within a bytecode file. Returns a `Vec<(String,String)>`
 /// of (caller, callee) demangled function names.
 ///
@@ -95,20 +141,30 @@ pub fn extract_calls<P: AsRef<Path>>(crate_bc_dir: P) -> Result<Vec<(String, Str
 /// call into the database.
 ///
 /// # Panics
-/// This function panics if extracting the filename of a crates full name from its path fails.
+/// This function panics if extracting the filename of a crates full name from its path fails,
+/// or if parsing the bitcode panics.
 ///
 /// # Errors
 /// Returns `painter::analysis::Error` on failure of database insertion.
 #[allow(clippy::needless_pass_by_value)]
 pub async fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P, db: Arc<Db>) -> Result<(), Error> {
-    let calls = extract_calls(&crate_bc_dir)?;
+    let calls = {
+        let _slot = PARSE_SLOTS
+            .acquire()
+            .await
+            .expect("semaphore is never closed");
+        let dir = crate_bc_dir.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || extract_calls(dir))
+            .await
+            .expect("bitcode parsing panicked")?
+    };
     let crate_fullname = crate_bc_dir.as_ref().file_name().unwrap().to_str().unwrap();
 
     let (crate_name, crate_version) = crate::crate_fs::split_full_name(crate_fullname)
         .ok_or_else(|| Error::CrateNameError(crate_fullname.to_string()))?;
 
     // A re-import replaces the version's whole invoke graph: `insert_invokes` deletes the
-    // existing `[:INVOKES]` edges and creates the new ones in one transaction.
+    // existing `[:INVOKES]` edges and creates the new ones.
     if db.has_any_invoke(crate_name, crate_version).await? {
         log::info!("{crate_fullname}: replacing existing invoke graph");
     }
@@ -116,13 +172,32 @@ pub async fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P, db: Arc<Db>) -> Re
     log::trace!("Importing: {crate_name}");
 
     // `extract_calls` only keeps callees with a recordable crate.
-    let rows: Vec<(String, String, String)> = calls
+    let mut rows: Vec<(String, String, String)> = calls
         .into_iter()
         .filter_map(|(caller, callee)| {
             let dst = callee_crate(&callee)?.to_string();
             Some((caller, callee, dst))
         })
         .collect();
+
+    // Map each callee crate as written in Rust paths (`num_traits`) to its `(Crate)` node's
+    // name (`num-traits`). Names that match no crate are left as they are and dropped by
+    // `insert_invokes`.
+    let idents: std::collections::BTreeSet<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+    let candidates: Vec<String> = idents
+        .iter()
+        .flat_map(|i| crate_name_candidates(i))
+        .collect();
+    let existing = db.existing_crate_names(&candidates).await?;
+    let resolved: std::collections::HashMap<String, String> = idents
+        .iter()
+        .filter_map(|i| Some((i.to_string(), resolve_crate_name(i, &existing)?)))
+        .collect();
+    for row in &mut rows {
+        if let Some(name) = resolved.get(&row.2) {
+            row.2.clone_from(name);
+        }
+    }
 
     db.insert_invokes((crate_name, crate_version), &rows)
         .await?;
@@ -354,6 +429,50 @@ mod tests {
 
     fn test_data() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data")
+    }
+
+    #[test]
+    fn crate_name_candidates_swap_every_separator() {
+        assert_eq!(crate_name_candidates("serde"), ["serde"]);
+        assert_eq!(
+            crate_name_candidates("num_traits"),
+            ["num_traits", "num-traits"]
+        );
+        let mut many = crate_name_candidates("a_b_c");
+        assert_eq!(many[0], "a_b_c");
+        many.sort();
+        assert_eq!(many, ["a-b-c", "a-b_c", "a_b-c", "a_b_c"]);
+        // Too many separators to enumerate: only the two uniform spellings.
+        assert_eq!(
+            crate_name_candidates("a_b_c_d_e_f_g_h"),
+            ["a_b_c_d_e_f_g_h", "a-b-c-d-e-f-g-h"]
+        );
+    }
+
+    #[test]
+    fn resolve_crate_name_prefers_an_exact_match() {
+        let existing: std::collections::HashSet<String> =
+            ["num-traits", "candle-core", "foo_bar", "foo-bar", "serde"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+        assert_eq!(
+            resolve_crate_name("num_traits", &existing).as_deref(),
+            Some("num-traits")
+        );
+        assert_eq!(
+            resolve_crate_name("candle_core", &existing).as_deref(),
+            Some("candle-core")
+        );
+        assert_eq!(
+            resolve_crate_name("foo_bar", &existing).as_deref(),
+            Some("foo_bar")
+        );
+        assert_eq!(
+            resolve_crate_name("serde", &existing).as_deref(),
+            Some("serde")
+        );
+        assert_eq!(resolve_crate_name("std_detect", &existing), None);
     }
 
     #[test]

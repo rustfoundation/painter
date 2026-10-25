@@ -75,6 +75,10 @@ pub struct CrateDbStatus {
 /// Attempts made for one write before giving up on a transient error.
 const WRITE_RETRIES: u32 = 6;
 
+/// `[:INVOKES]` edges created or deleted per transaction by [`Db::insert_invokes`] and
+/// [`Db::delete_invokes`].
+pub const INVOKES_PER_TX: usize = 10_000;
+
 /// Whether a database error is transient (a deadlock between concurrent writers touching the
 /// same nodes or index entries, or any other `Neo.TransientError`) and the write can simply be
 /// retried. Neo4j rolls the failed transaction back, so a retry never duplicates data.
@@ -201,12 +205,16 @@ impl Db {
         Ok(())
     }
 
-    /// Replace every invocation of one crate version in a single write query. Any `[:INVOKES]`
-    /// edges the version already has are deleted and the new ones created in the same
-    /// transaction, so re-importing a version never duplicates edges and the version's invoke
-    /// graph is either fully replaced or untouched. Each entry of `calls` is
-    /// `(caller, callee, callee_crate)`. Callee crates that do not exist as `(Crate)` nodes are
-    /// skipped by the `MATCH`.
+    /// Replace every invocation of one crate version. Any `[:INVOKES]` edges the version already
+    /// has are deleted first, so re-importing a version never duplicates edges. Each entry of
+    /// `calls` is `(caller, callee, callee_crate)`. Callee crates that do not exist as `(Crate)`
+    /// nodes are skipped by the `MATCH`.
+    ///
+    /// Deletes and creates run [`INVOKES_PER_TX`] edges per transaction: a crate such as `cargo`
+    /// has hundreds of thousands of calls, and one transaction for all of them kept Neo4j
+    /// committing on a single core for tens of minutes. The replacement is therefore not
+    /// atomic: if it fails part way the version is left with some of its new edges, and
+    /// re-importing it fixes that.
     ///
     /// An empty `calls` still wipes the existing edges, so a version that no longer has any
     /// cross-crate calls ends up with none.
@@ -220,21 +228,18 @@ impl Db {
         src_crate: (&str, &str),
         calls: &[(String, String, String)],
     ) -> Result<(), Error> {
-        if calls.is_empty() {
-            return self.delete_invokes(src_crate.0, src_crate.1).await;
-        }
+        self.delete_invokes(src_crate.0, src_crate.1).await?;
 
-        // neo4rs 0.6 does not expose its map type, so send three parallel lists and index them.
-        let callsites: Vec<&str> = calls.iter().map(|c| c.0.as_str()).collect();
-        let targets: Vec<&str> = calls.iter().map(|c| c.1.as_str()).collect();
-        let dsts: Vec<&str> = calls.iter().map(|c| c.2.as_str()).collect();
+        for chunk in calls.chunks(INVOKES_PER_TX) {
+            // neo4rs 0.6 does not expose its map type, so send three parallel lists and index
+            // them.
+            let callsites: Vec<&str> = chunk.iter().map(|c| c.0.as_str()).collect();
+            let targets: Vec<&str> = chunk.iter().map(|c| c.1.as_str()).collect();
+            let dsts: Vec<&str> = chunk.iter().map(|c| c.2.as_str()).collect();
 
-        self.write(
+            self.write(
                 query(
                     "MATCH (srcVersion:Version { name: $src_crate, version: $src_version })
-                     OPTIONAL MATCH (srcVersion)-[old:INVOKES]->()
-                     DELETE old
-                     WITH DISTINCT srcVersion
                      UNWIND range(0, size($callers) - 1) AS i
                      MATCH (dstCrate:Crate { name: $dsts[i] })
                      CREATE (srcVersion)-[:INVOKES { callsite: $callers[i], target: $callees[i] }]->(dstCrate)",
@@ -246,6 +251,7 @@ impl Db {
                 .param("dsts", dsts),
             )
             .await?;
+        }
 
         Ok(())
     }
@@ -595,13 +601,53 @@ impl Db {
         S1: AsRef<str>,
         S2: AsRef<str>,
     {
-        self.write(
-            query("MATCH (:Version { name: $name, version: $version })-[r:INVOKES]->() DELETE r")
-                .param("name", name.as_ref())
-                .param("version", version.as_ref()),
-        )
-        .await?;
-        Ok(())
+        // In bounded transactions; see `insert_invokes`.
+        let limit = i64::try_from(INVOKES_PER_TX).unwrap_or(i64::MAX);
+        loop {
+            let row = self
+                .write_first_row(
+                    query(
+                        "MATCH (:Version { name: $name, version: $version })-[r:INVOKES]->()
+                         WITH r LIMIT $limit
+                         DELETE r
+                         RETURN count(r) AS deleted",
+                    )
+                    .param("name", name.as_ref())
+                    .param("version", version.as_ref())
+                    .param("limit", limit),
+                )
+                .await?;
+            let deleted: i64 = row.and_then(|r| r.get("deleted")).unwrap_or(0);
+            if deleted < limit {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Which of `names` exist as `(Crate)` nodes. One indexed lookup per name, sent in chunks.
+    ///
+    /// # Errors
+    /// This function will return an `painter::db::Error` in the event of a database error.
+    pub async fn existing_crate_names(
+        &self,
+        names: &[String],
+    ) -> Result<std::collections::HashSet<String>, Error> {
+        let mut found = std::collections::HashSet::new();
+        for chunk in names.chunks(5000) {
+            let mut stream = self
+                .conn
+                .execute(
+                    query("UNWIND $names AS n MATCH (c:Crate { name: n }) RETURN c.name AS name")
+                        .param("names", chunk.to_vec()),
+                )
+                .await?;
+            while let Some(row) = stream.next().await? {
+                if let Some(name) = row.get::<String>("name") {
+                    found.insert(name);
+                }
+            }
+        }
+        Ok(found)
     }
 
     ///
@@ -617,7 +663,7 @@ impl Db {
         Ok(self
             .conn
             .execute(
-                query("MATCH (Version {name:  $name, version: $version })-[r:INVOKES]->() RETURN id(r) LIMIT 1")
+                query("MATCH (:Version { name: $name, version: $version })-[r:INVOKES]->() RETURN id(r) LIMIT 1")
                     .param("name", name.as_ref())
                     .param("version", version.as_ref()),
             )
