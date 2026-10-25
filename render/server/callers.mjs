@@ -1,10 +1,11 @@
-// Reverse call-graph search over INVOKES: who calls a function, directly or
+// Reverse call-graph search over CALLS: who calls a function, directly or
 // through other functions.
 //
-// INVOKES is `(Version)-[:INVOKES {callsite, target}]->(Crate)`: the caller
-// side is a concrete version, the callee side only a crate (painter never
-// resolves the callee's version). So "callers of f in crate C at version V"
-// is answered like this:
+// Calls are `(Version)-[:HAS_FN]->(:Fn)-[:CALLS]->(:Symbol)-[:IN]->(Crate)`,
+// with the calling function's name on `(:Fn)-[:IS]->(:Symbol)`. The caller
+// side is a concrete version, the callee side only a symbol of a crate
+// (painter never resolves the callee's version). So "callers of f in crate C
+// at version V" is answered like this:
 //
 //   * an edge from another version of C itself counts only if it is V
 //     (intra-crate calls);
@@ -130,25 +131,26 @@ export const requirementMatches = (requirement, version) => {
 // ---------------------------------------------------------------------------
 
 /**
- * Edges whose target is one of `targets`, from any version. Uses the
- * INVOKES(target) range index; without the hint the planner prefers the
- * crate seek and expands every edge into the crate (seconds for tokio).
+ * Calls whose target is one of `targets`, from any version. Starts from the
+ * Symbol.name uniqueness index, so each target is one seek plus its callers.
  */
 const GLOBAL_HOP = `
   UNWIND $targets AS tg
-  MATCH (v:Version)-[i:INVOKES]->(t:Crate)
-  USING INDEX i:INVOKES(target)
-  WHERE i.target = tg
+  MATCH (s:Symbol {name: tg})-[:IN]->(t:Crate)
+  MATCH (s)<-[:CALLS]-(f:Fn)<-[:HAS_FN]-(v:Version)
+  MATCH (f)-[:IS]->(cs:Symbol)
   OPTIONAL MATCH (v)-[d:DEPENDS_ON]->(t)
-  WITH v, i, t, collect(DISTINCT d.requirement) AS reqs
-  RETURN v.name AS name, v.version AS version, i.callsite AS callsite, i.target AS target, t.name AS crate, reqs`;
+  WITH v, cs, s, t, collect(DISTINCT d.requirement) AS reqs
+  RETURN v.name AS name, v.version AS version, cs.name AS callsite, s.name AS target, t.name AS crate, reqs`;
 
-/** Edges from specific versions whose target is one of that version's `targets`. */
+/** Calls from specific versions whose target is one of that version's `targets`. */
 const LOCAL_HOP = `
   UNWIND $locals AS l
-  MATCH (v:Version {name: l.name, version: l.version})-[i:INVOKES]->(t:Crate)
-  WHERE i.target IN l.targets
-  RETURN v.name AS name, v.version AS version, i.callsite AS callsite, i.target AS target, t.name AS crate, [] AS reqs`;
+  UNWIND l.targets AS tg
+  MATCH (s:Symbol {name: tg})-[:IN]->(t:Crate)
+  MATCH (s)<-[:CALLS]-(f:Fn)<-[:HAS_FN]-(v:Version {name: l.name, version: l.version})
+  MATCH (f)-[:IS]->(cs:Symbol)
+  RETURN v.name AS name, v.version AS version, cs.name AS callsite, s.name AS target, t.name AS crate, [] AS reqs`;
 
 const versionKey = (name, version) => `${name}@${version}`;
 

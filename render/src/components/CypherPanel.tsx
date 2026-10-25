@@ -19,9 +19,9 @@ MATCH (v)-[d:DEPENDS_ON]->(c)
 RETURN c, v, d`,
   },
   {
-    label: 'serde: who invokes it (aggregated)',
-    query: `MATCH (v:Version)-[i:INVOKES]->(c:Crate {name: 'serde'})
-WITH c, v, count(i) AS calls ORDER BY calls DESC LIMIT 50
+    label: 'serde: who calls it (aggregated)',
+    query: `MATCH (c:Crate {name: 'serde'})<-[:IN]-(:Symbol)<-[k:CALLS]-(:Fn)<-[:HAS_FN]-(v:Version)
+WITH c, v, count(k) AS calls ORDER BY calls DESC LIMIT 50
 MATCH (v)-[vo:VERSION_OF]-(vc:Crate)
 RETURN c, v, vc, vo, calls`,
   },

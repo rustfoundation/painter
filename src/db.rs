@@ -68,16 +68,112 @@ pub struct VersionRow {
 pub struct CrateDbStatus {
     /// Version strings with a `(Version)` node.
     pub versions: std::collections::HashSet<String>,
-    /// Version strings whose node has at least one outgoing `INVOKES` edge.
+    /// Version strings whose node has a call graph: at least one `[:HAS_FN]` function.
     pub exported: std::collections::HashSet<String>,
 }
 
 /// Attempts made for one write before giving up on a transient error.
 const WRITE_RETRIES: u32 = 6;
 
-/// `[:INVOKES]` edges created or deleted per transaction by [`Db::insert_invokes`] and
-/// [`Db::delete_invokes`].
-pub const INVOKES_PER_TX: usize = 10_000;
+/// `[:CALLS]` edges [`Db::insert_calls`] creates per transaction (rounded up to whole callers).
+pub const CALLS_PER_TX: usize = 10_000;
+
+/// `(:Fn)` nodes [`Db::delete_calls`] deletes per transaction, with all their relationships.
+pub const FNS_PER_DELETE_TX: usize = 1_000;
+
+/// One distinct call made by a crate version: function `caller` calls `callee`, a function of
+/// the crate whose `(Crate)` node is named `crate_name`.
+///
+/// `copies` is how many compiled (caller, callee) function pairs share these demangled names.
+/// Painter demangles without the symbol hash, and legacy Rust mangling does not encode
+/// generic arguments, so every monomorphised instance of a generic function (`foo::<u8>`,
+/// `foo::<String>`, ...) gets the same name; [`collapse_calls`] folds them into one row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallRow {
+    pub caller: String,
+    pub callee: String,
+    pub crate_name: String,
+    pub copies: i64,
+}
+
+/// Longest function name stored as is in `Symbol.name`. Neo4j's range indexes (the
+/// `Symbol.name` uniqueness constraint) reject values over about 8 KB, and deeply nested
+/// generic types produce names that long; see [`symbol_key`].
+pub const MAX_SYMBOL_NAME_BYTES: usize = 4096;
+
+/// Bytes of a long name kept at the front of its [`symbol_key`].
+const SYMBOL_KEY_PREFIX_BYTES: usize = 4000;
+
+/// The `Symbol.name` a function name is stored under, and the full name when that differs.
+///
+/// Names up to [`MAX_SYMBOL_NAME_BYTES`] are their own key. A longer name is keyed by its first
+/// 4000 bytes, `…#`, and the 64-bit FNV-1a hash of the whole name in hex; the full name goes in
+/// the unindexed `Symbol.full_name`. The key is deterministic, so every version that mentions
+/// the same long function `MERGE`s onto the same node, and the prefix still starts with the
+/// function's path (so its crate can be read from it).
+#[must_use]
+pub fn symbol_key(name: &str) -> (std::borrow::Cow<'_, str>, Option<&str>) {
+    if name.len() <= MAX_SYMBOL_NAME_BYTES {
+        return (std::borrow::Cow::Borrowed(name), None);
+    }
+    let mut cut = SYMBOL_KEY_PREFIX_BYTES;
+    while !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    (
+        std::borrow::Cow::Owned(format!("{}…#{hash:016x}", &name[..cut])),
+        Some(name),
+    )
+}
+
+/// Fold repeated `(caller, callee, callee crate)` triples into one [`CallRow`] each, counting
+/// the repeats in `copies`. Nothing but the multiplicity is lost: the repeats are identical
+/// once demangled.
+/// The result is sorted by caller, then callee, so each caller's calls are adjacent.
+#[must_use]
+pub fn collapse_calls<I>(calls: I) -> Vec<CallRow>
+where
+    I: IntoIterator<Item = (String, String, String)>,
+{
+    let mut counts = std::collections::BTreeMap::<(String, String, String), i64>::new();
+    for call in calls {
+        *counts.entry(call).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|((caller, callee, crate_name), copies)| CallRow {
+            caller,
+            callee,
+            crate_name,
+            copies,
+        })
+        .collect()
+}
+
+/// Split `calls` (sorted by caller, as [`collapse_calls`] returns them) into batches of whole
+/// callers holding about `per_batch` calls each. A caller is never split across batches, so a
+/// batch can exceed `per_batch` by one caller's calls.
+#[must_use]
+pub fn caller_batches(calls: &[CallRow], per_batch: usize) -> Vec<Vec<&[CallRow]>> {
+    let mut batches = Vec::new();
+    let mut batch: Vec<&[CallRow]> = Vec::new();
+    let mut size = 0;
+    for group in calls.chunk_by(|a, b| a.caller == b.caller) {
+        batch.push(group);
+        size += group.len();
+        if size >= per_batch {
+            batches.push(std::mem::take(&mut batch));
+            size = 0;
+        }
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
+}
 
 /// Whether a database error is transient (a deadlock between concurrent writers touching the
 /// same nodes or index entries, or any other `Neo.TransientError`) and the write can simply be
@@ -166,89 +262,87 @@ impl Db {
         Ok(Self { conn })
     }
 
-    /// Insert a new function invocation into the database. This creates the specified relationship
-    /// between a crates version `(Version)` node and a `(Crate)` node. This limitation currently
-    /// exists because unless a crate has been specified as a version-locked full semver dependency,
-    /// there is no true determination of what version it is calling.
+    /// Replace the call graph of one crate version. Every `(:Fn)` the version already has is
+    /// deleted first ([`Db::delete_calls`]), so re-importing a version never duplicates calls.
+    /// `calls` must be sorted by caller, as [`collapse_calls`] returns them, and every
+    /// `crate_name` should name an existing `(Crate)`; a call whose crate is missing is dropped
+    /// by the `MATCH`.
     ///
-    /// This may change in the future where we can specify a range of versions for an invocation.
+    /// ```text
+    /// (Version)-[:HAS_FN]->(:Fn)-[:IS]->(:Symbol {name: caller})
+    /// (:Fn)-[:CALLS {copies}]->(:Symbol {name: callee})-[:IN]->(Crate)
+    /// ```
     ///
-    /// `(Version)-[:INVOKES { caller, callee }]->(Crate)`
-    ///
-    /// # Panics
-    /// This function should not panic.
-    /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
-    #[allow(clippy::similar_names)]
-    pub async fn insert_invoke(
-        &self,
-        caller: &str,
-        callee: &str,
-        src_crate: (&str, &str),
-        dst_crate: &str,
-    ) -> Result<(), Error> {
-        self.write(
-                query(
-                    "MATCH (srcVersion:Version { name: $src_crate, version: $src_version }) 
-                        MATCH (dstCrate:Crate { name: $dst_crate }) 
-                        CREATE (srcVersion)-[:INVOKES {callsite: $caller, target: $callee}]->(dstCrate)
-                    ",
-                )
-                .param("src_crate", src_crate.0)
-                .param("src_version", src_crate.1)
-                .param("dst_crate", dst_crate)
-                .param("caller", caller)
-                .param("callee", callee),
-            )
-            .await?;
-
-        Ok(())
-    }
-
-    /// Replace every invocation of one crate version. Any `[:INVOKES]` edges the version already
-    /// has are deleted first, so re-importing a version never duplicates edges. Each entry of
-    /// `calls` is `(caller, callee, callee_crate)`. Callee crates that do not exist as `(Crate)`
-    /// nodes are skipped by the `MATCH`.
-    ///
-    /// Deletes and creates run [`INVOKES_PER_TX`] edges per transaction: a crate such as `cargo`
-    /// has hundreds of thousands of calls, and one transaction for all of them kept Neo4j
-    /// committing on a single core for tens of minutes. The replacement is therefore not
-    /// atomic: if it fails part way the version is left with some of its new edges, and
-    /// re-importing it fixes that.
-    ///
-    /// An empty `calls` still wipes the existing edges, so a version that no longer has any
-    /// cross-crate calls ends up with none.
-    ///
-    /// `(Version)-[:INVOKES { callsite, target }]->(Crate)`
+    /// `(:Symbol)` nodes are shared by every version that calls or defines the same function
+    /// and are `MERGE`d through the `Symbol.name` uniqueness constraint on their
+    /// [`symbol_key`] (see
+    /// `docker/queries.md`); so is a symbol's `IN` edge. Writes run [`CALLS_PER_TX`] calls per
+    /// transaction (whole callers each), so the replacement is not atomic: if it fails part way
+    /// the version keeps some of its new calls, and re-importing it fixes that. An empty
+    /// `calls` still deletes the old graph.
     ///
     /// # Errors
     /// This function will return an `painter::db::Error` in the event of a database error.
-    pub async fn insert_invokes(
+    pub async fn insert_calls(
         &self,
         src_crate: (&str, &str),
-        calls: &[(String, String, String)],
+        calls: &[CallRow],
     ) -> Result<(), Error> {
-        self.delete_invokes(src_crate.0, src_crate.1).await?;
+        self.delete_calls(src_crate.0, src_crate.1).await?;
 
-        for chunk in calls.chunks(INVOKES_PER_TX) {
-            // neo4rs 0.6 does not expose its map type, so send three parallel lists and index
-            // them.
-            let callsites: Vec<&str> = chunk.iter().map(|c| c.0.as_str()).collect();
-            let targets: Vec<&str> = chunk.iter().map(|c| c.1.as_str()).collect();
-            let dsts: Vec<&str> = chunk.iter().map(|c| c.2.as_str()).collect();
+        for batch in caller_batches(calls, CALLS_PER_TX) {
+            // neo4rs 0.6 does not expose its map type, so send parallel (nested) lists and
+            // index them: callers[i] calls callees[i][j] in crate dsts[i][j]. Names are sent
+            // as their `symbol_key`, with the full name alongside when it was shortened.
+            let from_keys: Vec<(std::borrow::Cow<'_, str>, Option<&str>)> =
+                batch.iter().map(|g| symbol_key(&g[0].caller)).collect();
+            let to_keys: Vec<Vec<(std::borrow::Cow<'_, str>, Option<&str>)>> = batch
+                .iter()
+                .map(|g| g.iter().map(|c| symbol_key(&c.callee)).collect())
+                .collect();
+            let from_fns: Vec<&str> = from_keys.iter().map(|k| k.0.as_ref()).collect();
+            // neo4rs 0.6 cannot send nulls in lists: "" stands for "not shortened".
+            let from_full: Vec<&str> = from_keys.iter().map(|k| k.1.unwrap_or("")).collect();
+            let to_fns: Vec<Vec<&str>> = to_keys
+                .iter()
+                .map(|g| g.iter().map(|k| k.0.as_ref()).collect())
+                .collect();
+            let to_full: Vec<Vec<&str>> = to_keys
+                .iter()
+                .map(|g| g.iter().map(|k| k.1.unwrap_or("")).collect())
+                .collect();
+            let dsts: Vec<Vec<&str>> = batch
+                .iter()
+                .map(|g| g.iter().map(|c| c.crate_name.as_str()).collect())
+                .collect();
+            let copies: Vec<Vec<i64>> = batch
+                .iter()
+                .map(|g| g.iter().map(|c| c.copies).collect())
+                .collect();
 
             self.write(
                 query(
-                    "MATCH (srcVersion:Version { name: $src_crate, version: $src_version })
+                    "MATCH (v:Version { name: $src_crate, version: $src_version })
                      UNWIND range(0, size($callers) - 1) AS i
-                     MATCH (dstCrate:Crate { name: $dsts[i] })
-                     CREATE (srcVersion)-[:INVOKES { callsite: $callers[i], target: $callees[i] }]->(dstCrate)",
+                     MERGE (cs:Symbol { name: $callers[i] })
+                       ON CREATE SET cs.full_name = nullIf($callers_full[i], '')
+                     CREATE (v)-[:HAS_FN]->(f:Fn)-[:IS]->(cs)
+                     WITH f, i
+                     UNWIND range(0, size($callees[i]) - 1) AS j
+                     MATCH (c:Crate { name: $dsts[i][j] })
+                     MERGE (ts:Symbol { name: $callees[i][j] })
+                       ON CREATE SET ts.full_name = nullIf($callees_full[i][j], '')
+                     MERGE (ts)-[:IN]->(c)
+                     CREATE (f)-[:CALLS { copies: $copies[i][j] }]->(ts)",
                 )
                 .param("src_crate", src_crate.0)
                 .param("src_version", src_crate.1)
-                .param("callers", callsites)
-                .param("callees", targets)
-                .param("dsts", dsts),
+                .param("callers", from_fns)
+                .param("callers_full", from_full)
+                .param("callees", to_fns)
+                .param("callees_full", to_full)
+                .param("dsts", dsts)
+                .param("copies", copies),
             )
             .await?;
         }
@@ -382,7 +476,7 @@ impl Db {
     }
 
     /// For each crate name that has a `(Crate)` node, list its `(Version)` nodes and which of
-    /// them carry `INVOKES` edges. Names with no `(Crate)` node are absent from the result.
+    /// them have a call graph (`HAS_FN`). Names with no `(Crate)` node are absent from the result.
     /// Versions are reached through `VERSION_OF` because the `(name, version)` constraint
     /// index cannot serve a name-only lookup, which would otherwise scan every `Version`.
     ///
@@ -403,7 +497,7 @@ impl Db {
                      OPTIONAL MATCH (c)-[:VERSION_OF]->(v:Version)
                      WITH name, v,
                           CASE WHEN v IS NULL THEN false
-                               ELSE EXISTS { (v)-[:INVOKES]->() } END AS exported
+                               ELSE EXISTS { (v)-[:HAS_FN]->() } END AS exported
                      RETURN name,
                             collect(v.version) AS versions,
                             collect(CASE WHEN exported THEN v.version END) AS exported",
@@ -426,47 +520,6 @@ impl Db {
             );
         }
         Ok(out)
-    }
-
-    /// Upserts a new function invocation into the database. This creates the specified relationship
-    /// between a crates version `(Version)` node and a `(Crate)` node. This limitation currently
-    /// exists because unless a crate has been specified as a version-locked full semver dependency,
-    /// there is no true determination of what version it is calling.
-    ///
-    /// If the current relationship already exists, a new one will *not* be created, hence the upsert.
-    ///
-    /// This may change in the future where we can specify a range of versions for an invocation.
-    ///
-    /// `(Version)-[:INVOKES { caller, callee }]->(Crate)`
-    ///
-    /// # Panics
-    /// This function should not panic.
-    /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
-    #[allow(clippy::similar_names)]
-    pub async fn upsert_invoke(
-        &self,
-        caller: &str,
-        callee: &str,
-        src_crate: (&str, &str),
-        dst_crate: &str,
-    ) -> Result<(), Error> {
-        self.write(
-            query(
-                "MATCH (srcVersion:Version { name: $src_crate, version: $src_version }) 
-                        MATCH (dstCrate:Crate { name: $dst_crate }) 
-                        MERGE (srcVersion)-[:INVOKES {caller: $caller, callee: $callee}]->(dstCrate)
-                    ",
-            )
-            .param("src_crate", src_crate.0)
-            .param("src_version", src_crate.1)
-            .param("dst_crate", dst_crate)
-            .param("caller", caller)
-            .param("callee", callee),
-        )
-        .await?;
-
-        Ok(())
     }
 
     /// Insert a new version of a crate into the database. This will create a new `(Version)` node,
@@ -591,26 +644,27 @@ impl Db {
             .is_some())
     }
 
-    /// Delete every `[:INVOKES]` edge of one crate version, leaving the `(Version)` node and all
-    /// other relationships in place.
+    /// Delete the call graph of one crate version: its `(:Fn)` nodes with their `HAS_FN`,
+    /// `IS`, and `CALLS` edges, [`FNS_PER_DELETE_TX`] functions per transaction. The
+    /// `(Version)` node, its other relationships, and the shared `(:Symbol)` nodes stay; a
+    /// symbol nothing refers to any more is left in place.
     ///
     /// # Errors
     /// This function will return an `painter::db::Error` in the event of a database error.
-    pub async fn delete_invokes<S1, S2>(&self, name: S1, version: S2) -> Result<(), Error>
+    pub async fn delete_calls<S1, S2>(&self, name: S1, version: S2) -> Result<(), Error>
     where
         S1: AsRef<str>,
         S2: AsRef<str>,
     {
-        // In bounded transactions; see `insert_invokes`.
-        let limit = i64::try_from(INVOKES_PER_TX).unwrap_or(i64::MAX);
+        let limit = i64::try_from(FNS_PER_DELETE_TX).unwrap_or(i64::MAX);
         loop {
             let row = self
                 .write_first_row(
                     query(
-                        "MATCH (:Version { name: $name, version: $version })-[r:INVOKES]->()
-                         WITH r LIMIT $limit
-                         DELETE r
-                         RETURN count(r) AS deleted",
+                        "MATCH (:Version { name: $name, version: $version })-[:HAS_FN]->(f:Fn)
+                         WITH f LIMIT $limit
+                         DETACH DELETE f
+                         RETURN count(f) AS deleted",
                     )
                     .param("name", name.as_ref())
                     .param("version", version.as_ref())
@@ -650,12 +704,13 @@ impl Db {
         Ok(found)
     }
 
+    /// Whether a crate version already has a call graph (at least one `[:HAS_FN]` function).
     ///
     /// # Panics
-    ///
+    /// Panics if the result stream fails after the query was accepted.
     /// # Errors
-    ///
-    pub async fn has_any_invoke<S1, S2>(&self, name: S1, version: S2) -> Result<bool, Error>
+    /// This function will return an `painter::db::Error` in the event of a database error.
+    pub async fn has_call_graph<S1, S2>(&self, name: S1, version: S2) -> Result<bool, Error>
     where
         S1: AsRef<str>,
         S2: AsRef<str>,
@@ -663,7 +718,7 @@ impl Db {
         Ok(self
             .conn
             .execute(
-                query("MATCH (:Version { name: $name, version: $version })-[r:INVOKES]->() RETURN id(r) LIMIT 1")
+                query("MATCH (:Version { name: $name, version: $version })-[:HAS_FN]->() RETURN 1 AS found LIMIT 1")
                     .param("name", name.as_ref())
                     .param("version", version.as_ref()),
             )
@@ -857,6 +912,90 @@ mod tests {
         assert!(backoff(3) >= Duration::from_millis(400));
         // The shift is clamped so an absurd attempt count cannot overflow.
         assert!(backoff(60) <= Duration::from_millis(51_250));
+    }
+
+    fn call(from: &str, to: &str, copies: i64) -> CallRow {
+        CallRow {
+            caller: from.into(),
+            callee: to.into(),
+            crate_name: "k".into(),
+            copies,
+        }
+    }
+
+    #[test]
+    fn collapse_calls_counts_copies_and_sorts_by_caller() {
+        let t = |a: &str, b: &str| (a.to_string(), b.to_string(), "k".to_string());
+        let calls = collapse_calls([
+            t("b", "x"),
+            t("a", "y"),
+            t("b", "x"),
+            t("a", "x"),
+            t("b", "x"),
+        ]);
+        assert_eq!(
+            calls,
+            vec![call("a", "x", 1), call("a", "y", 1), call("b", "x", 3)]
+        );
+    }
+
+    #[test]
+    fn collapse_calls_keeps_distinct_crates_apart() {
+        let calls = collapse_calls([
+            ("f".to_string(), "g".to_string(), "one".to_string()),
+            ("f".to_string(), "g".to_string(), "two".to_string()),
+        ]);
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|c| c.copies == 1));
+    }
+
+    #[test]
+    fn caller_batches_keep_callers_whole() {
+        let calls = vec![
+            call("a", "x", 1),
+            call("a", "y", 1),
+            call("b", "x", 1),
+            call("c", "x", 1),
+            call("c", "y", 1),
+            call("c", "z", 1),
+        ];
+        let batches = caller_batches(&calls, 2);
+        let callers: Vec<Vec<&str>> = batches
+            .iter()
+            .map(|b| b.iter().map(|g| g[0].caller.as_str()).collect())
+            .collect();
+        assert_eq!(callers, vec![vec!["a"], vec!["b", "c"]]);
+        assert_eq!(
+            batches.iter().flatten().map(|g| g.len()).sum::<usize>(),
+            calls.len()
+        );
+        assert_eq!(caller_batches(&[], 2).len(), 0);
+    }
+
+    #[test]
+    fn symbol_key_keeps_short_names_and_shortens_long_ones_deterministically() {
+        assert_eq!(
+            symbol_key("a::b"),
+            (std::borrow::Cow::Borrowed("a::b"), None)
+        );
+        let exact = "x".repeat(MAX_SYMBOL_NAME_BYTES);
+        assert_eq!(symbol_key(&exact).1, None);
+
+        let long = format!("serde::de::{}", "<T as Trait>".repeat(800));
+        let (key, full) = symbol_key(&long);
+        assert_eq!(full, Some(long.as_str()));
+        assert!(key.len() <= MAX_SYMBOL_NAME_BYTES);
+        assert!(key.starts_with("serde::de::"));
+        assert_eq!(symbol_key(&long).0, key);
+        let other = format!("{long}x");
+        assert_ne!(symbol_key(&other).0, key);
+    }
+
+    #[test]
+    fn symbol_key_cuts_on_a_char_boundary() {
+        let long = "é".repeat(MAX_SYMBOL_NAME_BYTES);
+        let (key, _) = symbol_key(&long);
+        assert!(key.starts_with(&"é".repeat(SYMBOL_KEY_PREFIX_BYTES / 2)));
     }
 
     #[test]

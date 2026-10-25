@@ -1,6 +1,6 @@
 // Callers view: pick a crate, optionally a version, and a function of it; get a
 // table of every crate version and function that calls it, directly or
-// through other functions (reverse walk over INVOKES, see server/callers.mjs).
+// through other functions (reverse walk over CALLS, see server/callers.mjs).
 
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError, type CallerRow, type CallersResult, type CrateVersion } from '../api';

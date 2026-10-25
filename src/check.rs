@@ -1,7 +1,8 @@
 //! `compile-check`: reconcile the crates.io index against the bytecode root and the database.
 //!
 //! For every crate version the build rules select, report whether it has a bytecode directory,
-//! a `(Version)` node in Neo4j, and `INVOKES` edges (i.e. `export-all-neo4j` has run over it).
+//! a `(Version)` node in Neo4j, and a call graph (`HAS_FN` functions, i.e. `export-all-neo4j`
+//! has run over it).
 
 use crate::{
     compile,
@@ -43,7 +44,7 @@ pub struct VersionStatus {
     pub bytecode: bool,
     /// A `(Version { name, version })` node exists.
     pub in_db: bool,
-    /// The `(Version)` node has at least one outgoing `INVOKES` edge.
+    /// The `(Version)` node has a call graph: at least one `[:HAS_FN]` function.
     pub exported: bool,
 }
 
@@ -153,7 +154,7 @@ impl Report {
             .unwrap();
         }
         out.push_str(
-            "\n`exported` = has INVOKES edges; versions with no cross-crate calls never gain any.\n\
+            "\n`exported` = has a call graph; versions with no cross-crate calls never gain one.\n\
              Crate rows count a crate only when every selected version qualifies.\n",
         );
         out
@@ -174,7 +175,7 @@ impl Report {
             if !s.in_db {
                 missing.push("db");
             } else if !s.exported {
-                missing.push("invokes");
+                missing.push("calls");
             }
             writeln!(
                 out,
@@ -227,7 +228,7 @@ pub fn scan_bytecodes(bc_root: &Path) -> Result<HashSet<(String, String)>, Error
 }
 
 /// Resolve `rules` against the index and check each selected version for bytecode, a database
-/// node, and exported `INVOKES` edges.
+/// node, and an exported call graph.
 ///
 /// # Panics
 /// Panics if the bytecode scan task panics.
@@ -387,10 +388,6 @@ mod tests {
                 .render_missing()
                 .contains("b-0.1.0\tmissing: bytecode,db")
         );
-        assert!(
-            report
-                .render_missing()
-                .contains("c-2.0.0\tmissing: invokes")
-        );
+        assert!(report.render_missing().contains("c-2.0.0\tmissing: calls"));
     }
 }

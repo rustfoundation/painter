@@ -6,8 +6,8 @@ The graph can be explored with the web UI in `render/` (`docker compose up -d`,
 then http://localhost:8080; see [render/README.md](render/README.md)).
 
 **Default**: a crate's latest version with its dependencies and invocations.
-Clicking an `INVOKES` edge shows how many call sites it stands for and which
-functions are called (here `rocket@0.5.1` makes 1962 calls into `tokio`).
+Clicking an `INVOKES` edge (calls from a version into a crate, aggregated by the UI) shows how
+many distinct calls it stands for and which functions are called.
 
 ![Default view: rocket and its DEPENDS_ON / INVOKES edges](docs/screenshots/default.png)
 
@@ -48,9 +48,10 @@ We then determine the call graph of every crate by these steps:
    invoke instruction variants in the LLVM bitcode. This renders a complete list of all
    `(function)->(function)` invocations within a given crate. We also demangle these and
    then filter out various cases such as runtimes, the std and core libraries, and other cases.
-3. This list of `(function)->(function)` relationships is then imported into the database,
-   represented as a given `(Version)` node of a crate `[:INVOKES]` a specific `(Crate)` node.
-   The callee crate is the first path segment of the demangled callee symbol. In the future, we hope to be able to group or narrow versions of crates being invoked but
+3. This list of `(function)->(function)` relationships is then imported into the database: each
+   calling function of a `(Version)` becomes an `(Fn)` that `[:CALLS]` the `(Symbol)` of each
+   function it calls, and a called symbol is `[:IN]` a `(Crate)`. The callee crate is the first
+   path segment of the demangled callee symbol. In the future, we hope to be able to group or narrow versions of crates being invoked but
    this has not been implemented.
 
 # Database Representation
@@ -63,13 +64,18 @@ Nodes:
 Relationships:
 - `(Crate)-[:VERSION_OF]->(Version)` (note the direction: from the crate to its version)
 - `(Version)-[:DEPENDS_ON { requirement, features, kind, optional }]->(Crate)`
-- `(Version)-[:INVOKES { callsite, target }]->(Crate)`: one edge per call site; `callsite` is the
-  calling function, `target` the called function, both demangled
+- `(Version)-[:HAS_FN]->(Fn)-[:IS]->(Symbol { name })`: a function of the version (the caller)
+- `(Fn)-[:CALLS { copies }]->(Symbol { name })-[:IN]->(Crate)`: a function it calls, in the crate
+  its path names. One `Fn` per (version, calling function), one `CALLS` per distinct call, one
+  `Symbol` per demangled function name shared by every version; `copies` counts the compiled
+  (caller, callee) pairs behind the call (monomorphised generics demangle to the same name)
 
-Re-running the export for a version that already has `INVOKES` edges replaces
-them: the old edges are deleted and the new set created in one transaction, so
-re-importing never duplicates and a version with no cross-crate calls ends up
-with none.
+Re-running the export for a version that already has a call graph replaces it:
+its `Fn` nodes are deleted and the new set created, so re-importing never
+duplicates and a version with no cross-crate calls ends up with none. Databases
+built before 2026-10-25 used `(Version)-[:INVOKES { callsite, target }]->(Crate)`,
+one edge per compiled pair; `painter export-for-import` converts them
+(see CLAUDE.md).
 
 ## Current Limitations
 - Only crates which can have a local build complete are currently imported. Work is underway to expand support, but this greatly limits us in cases such as local dependency requirements, custom build steps, etc.
@@ -159,7 +165,7 @@ with `latest = true`, which the UI and the queries below use; re-run it after im
 ## Run the analysis
 This will populate the database with all invocation relationships. These exist as a representation of a given
 version calling a given crate. We cannot definitively say what version of what crate is invoked, so the relationship
-exists as `(Version)-[:INVOKES]->(Crate)`.
+exists as `(Version)-[:HAS_FN]->(Fn)-[:CALLS]->(Symbol)-[:IN]->(Crate)`.
 
 Painter extracts each `.crate` file from `-c` into `-s` as `{crate}-{version}/` itself and writes
 bitcode to `-b` in the same layout. `-s`, `-b`, and `-c` are the same three roots for every command.
@@ -177,7 +183,7 @@ cargo run --release -- count-unsafe -s sources -c crates -d bolt://127.0.0.1:768
 - `export-all-neo4j` exports every bytecode directory under `-b`. Each version logs
   `imported N invocations`; failures are logged at ERROR.
 - `compile-check` takes the same roots, database, and rule flags as `compile-all` and prints how many
-  selected crates/versions have bytecode, a `Version` node, and `INVOKES` edges; `-v` lists every
+  selected crates/versions have bytecode, a `Version` node, and a call graph (`HAS_FN`); `-v` lists every
   incomplete version:
   `cargo run --release -- compile-check -s sources -c crates -b bytecodes -d bolt://127.0.0.1:7687 -u neo4j -p changeme123`
 
@@ -194,13 +200,14 @@ RETURN count(DISTINCT c) AS dependents
 // Latest version of a crate
 MATCH (:Crate {name: 'serde'})-[:VERSION_OF]->(v:Version) WHERE v.latest RETURN v.version
 
-// Crates a version calls into, by number of call sites
-MATCH (:Version {name: 'rocket', version: '0.5.1'})-[:INVOKES]->(t:Crate)
+// Crates a version calls into, by number of distinct calls
+MATCH (:Version {name: 'rocket', version: '0.5.1'})-[:HAS_FN]->(:Fn)-[:CALLS]->(:Symbol)-[:IN]->(t:Crate)
 RETURN t.name AS crate, count(*) AS calls ORDER BY calls DESC
 
 // Direct callers of one function
-MATCH (v:Version)-[i:INVOKES]->(:Crate) WHERE i.target = 'bytes::bytes::Bytes::copy_from_slice'
-RETURN v.name, v.version, i.callsite
+MATCH (:Symbol {name: 'bytes::bytes::Bytes::copy_from_slice'})<-[:CALLS]-(f:Fn)<-[:HAS_FN]-(v:Version)
+MATCH (f)-[:IS]->(caller:Symbol)
+RETURN v.name, v.version, caller.name
 
 // Latest versions with the most unsafe code (after count-unsafe)
 MATCH (v:Version) WHERE v.latest AND v.unsafe_total > 0

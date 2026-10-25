@@ -6,6 +6,7 @@
 //! - [`crate_fs`]: cached extraction of `.crate` tarballs
 //! - [`db`]: the Neo4j connection wrapper and all Cypher
 //! - [`check`]: reconcile index, bytecode root, and database (`compile-check`)
+//! - [`migrate`]: rebuild a database from the old `INVOKES` schema (`export-for-import`)
 #![deny(clippy::all, clippy::pedantic)]
 #![allow(clippy::enum_variant_names)]
 
@@ -17,6 +18,7 @@ pub mod db;
 pub mod ecosystems;
 pub mod error;
 pub mod index;
+pub mod migrate;
 pub mod rules;
 
 use std::path::PathBuf;

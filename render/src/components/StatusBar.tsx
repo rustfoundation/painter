@@ -36,7 +36,7 @@ export function StatusBar(props: Props) {
       <span className="sep" />
       <span title="totals in the database">
         db: {fmtInt(stats?.crates)} crates · {fmtInt(stats?.versions)} versions · {fmtInt(stats?.dependsOn)} DEPENDS_ON ·{' '}
-        {fmtInt(stats?.invokes)} INVOKES
+        {fmtInt(stats?.invokes)} CALLS
       </span>
       <span className="sep" />
       {view !== 'callers' && (

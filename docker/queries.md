@@ -5,15 +5,16 @@ Run before the first import.
 ```cypher
 CREATE CONSTRAINT const_crate_name IF NOT EXISTS FOR (n:Crate) REQUIRE n.name IS UNIQUE;
 CREATE CONSTRAINT const_version IF NOT EXISTS FOR (n:Version) REQUIRE (n.name, n.version) IS UNIQUE;
-CREATE INDEX idx_invoke IF NOT EXISTS FOR ()-[r:INVOKES]-() ON (r.callsite, r.target);
-CREATE INDEX idx_invoke_target IF NOT EXISTS FOR ()-[r:INVOKES]-() ON (r.target);
-CREATE TEXT INDEX idx_invoke_target_text IF NOT EXISTS FOR ()-[r:INVOKES]-() ON (r.target);
+CREATE CONSTRAINT const_symbol_name IF NOT EXISTS FOR (n:Symbol) REQUIRE n.name IS UNIQUE;
+CREATE TEXT INDEX idx_symbol_name_text IF NOT EXISTS FOR (n:Symbol) ON (n.name);
 CREATE INDEX idx_is_latest IF NOT EXISTS FOR (n:Version) ON (n.latest);
 CREATE INDEX idx_unsafe_total IF NOT EXISTS FOR (n:Version) ON (n.unsafe_total);
 CREATE TEXT INDEX idx_crate_name_text IF NOT EXISTS FOR (n:Crate) ON (n.name);
 ```
 
-- `idx_invoke_target`: function lookups below and the UI Callers view.
+- `const_symbol_name`: required by painter's export (`MERGE` on `Symbol.name` under
+  concurrency) and serves every function lookup below and the UI Callers view.
+- `idx_symbol_name_text`: `CONTAINS` / `ENDS WITH` searches on function names.
 - `idx_crate_name_text`: UI partial-name search.
 - Map build adds `crate_lod_x`, `crate_lod_community`, `Crate.lod_*`, `LOD_DEP` (see `render/README.md`).
 
@@ -26,8 +27,15 @@ CREATE CONSTRAINT FOR (n:Version) REQUIRE (n.name, n.version) IS NODE KEY;
 # Schema notes
 
 - `(Crate)-[:VERSION_OF]->(Version)`: crate to version.
-- `(Version)-[:INVOKES {callsite, target}]->(Crate)`: one edge per call site. Callee crate is the first path segment of `target`; callee version unknown.
-- Callee crate uses the symbol spelling: calls into `actix-web` point at `actix_web`.
+- Calls: `(Version)-[:HAS_FN]->(:Fn)-[:IS]->(:Symbol)` is a function of a version (the caller),
+  `(:Fn)-[:CALLS {copies}]->(:Symbol)-[:IN]->(Crate)` a function it calls. One `Fn` per
+  (version, calling function), one `CALLS` per distinct call, one `Symbol` per demangled
+  function name, shared by every version. `copies` = compiled (caller, callee) pairs behind the
+  call: monomorphised instances of generic functions demangle to the same name.
+- A symbol's crate is the first path segment of its name, matched to an existing `Crate`
+  (`num_traits` is `num-traits`); the callee version is unknown. Only called symbols have `IN`.
+- Before 2026-10-25 calls were `(Version)-[:INVOKES {callsite, target}]->(Crate)`, one edge per
+  compiled pair; `painter export-for-import` converts a database of that shape.
 - Reach versions through `(:Crate {name})`. `(:Version {name})` without `version` scans every version.
 
 # Crates and versions
@@ -116,104 +124,104 @@ ORDER BY crates DESC LIMIT 10
 
 # Function calls
 
-`target` is the full demangled name. Find it first.
+Function names are full demangled paths. Find the exact name first.
 
 ### Functions of a crate that are called
 
 ```cypher
-MATCH (:Crate {name: 'bytes'})<-[i:INVOKES]-(:Version)
-WHERE i.target CONTAINS 'copy_from_slice'
-RETURN i.target, count(*) AS calls
-ORDER BY calls DESC
+MATCH (:Crate {name: 'bytes'})<-[:IN]-(s:Symbol)
+WHERE s.name CONTAINS 'copy_from_slice'
+RETURN s.name, COUNT { (s)<-[:CALLS]-() } AS callers
+ORDER BY callers DESC
 ```
+
+`callers` = calling functions, one per (version, function).
 
 ### What a version calls
 
 ```cypher
-MATCH (:Version {name: 'rocket', version: '0.5.1'})-[i:INVOKES]->(c:Crate)
+MATCH (:Version {name: 'rocket', version: '0.5.1'})-[:HAS_FN]->(:Fn)-[:CALLS]->(:Symbol)-[:IN]->(c:Crate)
 RETURN c.name, count(*) AS calls
 ORDER BY calls DESC
 ```
 
 ```cypher
-MATCH (:Version {name: 'rocket', version: '0.5.1'})-[i:INVOKES]->(:Crate {name: 'tokio'})
-RETURN i.callsite, i.target
+MATCH (:Version {name: 'rocket', version: '0.5.1'})-[:HAS_FN]->(f:Fn)-[:CALLS]->(t:Symbol)-[:IN]->(:Crate {name: 'tokio'})
+MATCH (f)-[:IS]->(c:Symbol)
+RETURN c.name AS caller, t.name AS callee
 ```
 
 ### All direct callers of a function
 
 ```cypher
-MATCH (v:Version)-[i:INVOKES]->(:Crate)
-WHERE i.target = 'bytes::bytes::Bytes::copy_from_slice'
-RETURN v.name, v.version, i.callsite
+MATCH (:Symbol {name: 'bytes::bytes::Bytes::copy_from_slice'})<-[:CALLS]-(f:Fn)<-[:HAS_FN]-(v:Version)
+MATCH (f)-[:IS]->(c:Symbol)
+RETURN v.name, v.version, c.name AS caller
 ```
 
 Per caller version:
 
 ```cypher
-MATCH (v:Version)-[i:INVOKES]->(:Crate)
-WHERE i.target = 'bytes::bytes::Bytes::copy_from_slice'
-RETURN v.name, v.version, count(*) AS callsites
-ORDER BY callsites DESC
+MATCH (:Symbol {name: 'bytes::bytes::Bytes::copy_from_slice'})<-[:CALLS]-(:Fn)<-[:HAS_FN]-(v:Version)
+RETURN v.name, v.version, count(*) AS callers
+ORDER BY callers DESC
 ```
 
 With the caller's requirement on the callee crate (empty = no direct dependency):
 
 ```cypher
-MATCH (v:Version)-[i:INVOKES]->(c:Crate)
-WHERE i.target = 'bytes::bytes::Bytes::copy_from_slice'
-OPTIONAL MATCH (v)-[d:DEPENDS_ON]->(c)
-RETURN v.name, v.version, i.callsite, collect(DISTINCT d.requirement) AS requirement
+MATCH (s:Symbol {name: 'bytes::bytes::Bytes::copy_from_slice'})-[:IN]->(t:Crate)
+MATCH (s)<-[:CALLS]-(f:Fn)<-[:HAS_FN]-(v:Version)
+MATCH (f)-[:IS]->(c:Symbol)
+OPTIONAL MATCH (v)-[d:DEPENDS_ON]->(t)
+RETURN v.name, v.version, c.name AS caller, collect(DISTINCT d.requirement) AS requirement
 ```
 
 ### Direct callers in one crate version
 
 ```cypher
-MATCH (v:Version {name: 'rust-s3', version: '0.37.2'})-[i:INVOKES]->(:Crate)
-WHERE i.target = 'bytes::bytes::Bytes::copy_from_slice'
-RETURN i.callsite
+MATCH (:Symbol {name: 'bytes::bytes::Bytes::copy_from_slice'})<-[:CALLS]-(f:Fn)<-[:HAS_FN]-(:Version {name: 'rust-s3', version: '0.37.2'})
+MATCH (f)-[:IS]->(c:Symbol)
+RETURN c.name
 ```
 
 ### Transitive callers, all sources
 
-Each hop: callers of the previous hop's `callsite`. Add a `MATCH` per extra level. 2 levels: ~20 s.
+A caller's `Symbol` is the same node as that function's callee `Symbol`, so each level is one
+more `<-[:CALLS]-(:Fn)-[:IS]->` hop. Change `{1,2}` for more levels.
 
 ```cypher
-MATCH (v1:Version)-[i1:INVOKES]->(:Crate)
-WHERE i1.target = 'bytes::bytes::Bytes::copy_from_slice'
-MATCH (v2:Version)-[i2:INVOKES]->(:Crate)
-WHERE i2.target = i1.callsite
-RETURN DISTINCT v2.name, v2.version, i2.callsite, i1.callsite AS via
+MATCH (:Symbol {name: 'bytes::bytes::Bytes::copy_from_slice'})
+      ((:Symbol)<-[:CALLS]-(:Fn)-[:IS]->(:Symbol)){1,2}
+      (c:Symbol)
+RETURN DISTINCT c.name
 LIMIT 500
 ```
 
-3 levels (slow: ~7 min for this function; prefer the UI Callers view):
+With the version that holds the outermost caller:
 
 ```cypher
-MATCH (v1:Version)-[i1:INVOKES]->(:Crate)
-WHERE i1.target = 'bytes::bytes::Bytes::copy_from_slice'
-MATCH (v2:Version)-[i2:INVOKES]->(:Crate)
-WHERE i2.target = i1.callsite
-MATCH (v3:Version)-[i3:INVOKES]->(:Crate)
-WHERE i3.target = i2.callsite
-RETURN DISTINCT v3.name, v3.version, i3.callsite, [i2.callsite, i1.callsite] AS via
+MATCH (:Symbol {name: 'bytes::bytes::Bytes::copy_from_slice'})<-[:CALLS]-(:Fn)-[:IS]->(c1:Symbol)
+      <-[:CALLS]-(f2:Fn)-[:IS]->(c2:Symbol)
+MATCH (f2)<-[:HAS_FN]-(v2:Version)
+RETURN DISTINCT v2.name, v2.version, c2.name, c1.name AS via
 LIMIT 500
 ```
 
-Not version-checked: a hop matches every version that calls a function of that name. The UI Callers view adds requirement checks and walks up to 10 levels.
+Not version-checked: a hop matches every version that calls a function of that name. The UI
+Callers view adds requirement checks and walks up to 10 levels.
 
 ### Transitive callers in one crate version
 
 Call chains inside a single version.
 
 ```cypher
-MATCH (v:Version {name: 'rust-s3', version: '0.37.2'})-[i1:INVOKES]->(:Crate)
-WHERE i1.target = 'bytes::bytes::Bytes::copy_from_slice'
-OPTIONAL MATCH (v)-[i2:INVOKES]->(:Crate)
-WHERE i2.target = i1.callsite
-OPTIONAL MATCH (v)-[i3:INVOKES]->(:Crate)
-WHERE i3.target = i2.callsite
-RETURN DISTINCT i1.callsite, i2.callsite, i3.callsite
+MATCH (v:Version {name: 'rust-s3', version: '0.37.2'})
+MATCH (:Symbol {name: 'bytes::bytes::Bytes::copy_from_slice'})<-[:CALLS]-(f1:Fn)-[:IS]->(c1:Symbol)
+WHERE (v)-[:HAS_FN]->(f1)
+OPTIONAL MATCH (c1)<-[:CALLS]-(f2:Fn)-[:IS]->(c2:Symbol) WHERE (v)-[:HAS_FN]->(f2)
+OPTIONAL MATCH (c2)<-[:CALLS]-(f3:Fn)-[:IS]->(c3:Symbol) WHERE (v)-[:HAS_FN]->(f3)
+RETURN DISTINCT c1.name, c2.name, c3.name
 ```
 
 Each row is one chain, nearest caller first; `null` = chain ends.
@@ -268,12 +276,22 @@ RETURN name, version, n
 ```cypher
 MATCH (a)-[r]->(b)
 WITH a, type(r) AS type, b, count(*) AS n
-WHERE n > 1 AND type <> 'INVOKES'
+WHERE n > 1
 RETURN a, type, b, n
 LIMIT 100
 ```
 
-`INVOKES` repeats per call site by design.
+Scans every relationship (slow); none should repeat.
+
+### Unreferenced symbols
+
+Re-exporting a version deletes its `Fn` nodes but leaves `Symbol`s, which other versions share.
+Symbols nothing refers to any more:
+
+```cypher
+MATCH (s:Symbol) WHERE NOT EXISTS { (s)<-[:CALLS]-() } AND NOT EXISTS { (s)<-[:IS]-() }
+CALL { WITH s DETACH DELETE s } IN TRANSACTIONS OF 10000 ROWS
+```
 
 ### Drop the Map precompute
 

@@ -3,7 +3,8 @@
 Web UI for the painter graph, built on the
 [Neo4j Visualization Library](https://neo4j.com/docs/nvl/current/). Standalone
 from the Rust side; the only contract is the graph schema painter writes
-(`Crate`, `Version`, `VERSION_OF`, `DEPENDS_ON`, `INVOKES`).
+(`Crate`, `Version`, `VERSION_OF`, `DEPENDS_ON`, and the call graph `HAS_FN` / `Fn` / `IS` /
+`CALLS` / `Symbol` / `IN`).
 
 Two pieces, one container:
 
@@ -76,9 +77,9 @@ Linux add `--add-host=host.docker.internal:host-gateway`.
 
 Database side: create the constraints and indexes in `docker/queries.md`.
 `idx_crate_name_text` is what makes partial-name search fast;
-`idx_invoke_target` is what makes the Callers view fast (without it each step
-expands every `INVOKES` edge into the callee crate, seconds for tokio). The Map
-build creates its own `lod_*` indexes.
+`const_symbol_name` is what makes the Callers view fast: each step is one seek
+per function name on `Symbol.name`, then its callers. The Map build creates its
+own `lod_*` indexes.
 
 To get the Map view working you also need the precompute, see below. The
 Default and Deps views work as soon as the graph has data.
@@ -135,10 +136,11 @@ strings on `DEPENDS_ON` and call counts on `INVOKES`.
 "Latest" is `Version.latest = true` (from `painter set-latest-versions`) when
 present, else the highest semver triple.
 
-`INVOKES` is one relationship per call site in the graph. The server folds
-them into one edge per (`Version`, `Crate`) with a `count` and up to ten
-sample `targets`; ids of those edges start with `agg:`. The Cypher panel
-returns raw relationships.
+`INVOKES` is not stored: the graph holds calls as
+`(Version)-[:HAS_FN]->(Fn)-[:CALLS]->(Symbol)-[:IN]->(Crate)`. The server
+folds them into one synthetic `INVOKES` edge per (`Version`, `Crate`) with a
+`count` of distinct calls and up to ten sample `targets`; ids of those edges
+start with `agg:`. The Cypher panel returns raw relationships.
 
 The Cypher panel at the bottom runs any read query. Nodes, relationships, and
 paths in the result are merged into the canvas; scalar columns show as a
@@ -262,7 +264,7 @@ JSON throughout. Graph payloads are
 | `GET /api/lod/viewport?x0&y0&x1&y1&budget&minCell` | clusters or crates for a viewport; no bbox = whole map; 503 until a build is loaded |
 | `GET /api/lod/locate?name` | a crate's map position |
 | `GET /api/lod/search?q&limit` | crate names on the map, in memory |
-| `GET /api/crates/:name/versions` | a crate's versions, newest first, with `latest` and `exported` (has `INVOKES`) |
+| `GET /api/crates/:name/versions` | a crate's versions, newest first, with `latest` and `exported` (has a call graph) |
 | `GET /api/functions/search?crate&q&limit` | called functions of a crate containing `q`, most-called first |
 | `GET /api/callers?crate&fn&match&version&depth&limit` | Callers view: `rows` of `{depth, crate, version, function, calls, verified, path}`; `match=exact` or `contains` |
 | `GET /api/node/:id` | one node by `elementId` |

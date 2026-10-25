@@ -5,7 +5,7 @@ use libpainter::{
     Error, Roots, analysis, check, compile,
     db::Db,
     ecosystems::EcosystemsClient,
-    index,
+    index, migrate,
     rules::{BuildEverything, BuildRules, EcosystemsRules, NamedCrates},
 };
 use rayon::prelude::*;
@@ -166,7 +166,7 @@ enum Command {
         roots: RootsArgs,
     },
     /// Compare the index against the bytecode root and the database: how many selected crate
-    /// versions have bytecode, a `(Version)` node, and exported `INVOKES` edges.
+    /// versions have bytecode, a `(Version)` node, and an exported call graph.
     CompileCheck {
         /// List every version that is missing bytecode, a database node, or both.
         #[arg(long, short = 'v')]
@@ -190,6 +190,18 @@ enum Command {
         /// Crate names to import.
         #[arg(value_name = "CRATE", required = true)]
         names: Vec<String>,
+    },
+    /// Stream the whole database into `neo4j-admin database import` CSV files, converting the
+    /// old `INVOKES` call edges to the `HAS_FN`/`CALLS`/`Symbol` schema. Only reads the database.
+    ExportForImport {
+        #[command(flatten)]
+        db: DbArgs,
+        /// Directory for the CSV files (created if missing).
+        #[arg(long)]
+        out: PathBuf,
+        /// Where the import process will see `--out`, for the printed `neo4j-admin` command.
+        #[arg(long, default_value = "/import")]
+        import_dir: String,
     },
     /// Export all crates with built bytecode to the neo4j database
     ExportAllNeo4j {
@@ -312,6 +324,20 @@ async fn main() -> Result<(), Error> {
         }
         Command::CountUnsafe { roots, db } => {
             analysis::count_unsafe(&Roots::from(roots), db.connect().await?).await?;
+        }
+        Command::ExportForImport {
+            db,
+            out,
+            import_dir,
+        } => {
+            let summary =
+                migrate::export_for_import(&db.host, &db.username, &db.password, &out).await?;
+            println!("{summary:#?}");
+            println!(
+                "\nneo4j-admin database import full neo4j --overwrite-destination \\\n    --multiline-fields=true --skip-bad-relationships=false \\\n    {}",
+                migrate::import_args(&import_dir).join(" \\\n    ")
+            );
+            println!("\nThen create the schema:\n{}", migrate::SCHEMA_CYPHER);
         }
         Command::ExportAllNeo4j { db, roots } => {
             let roots = Roots::from(roots);

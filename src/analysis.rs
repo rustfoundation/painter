@@ -163,16 +163,16 @@ pub async fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P, db: Arc<Db>) -> Re
     let (crate_name, crate_version) = crate::crate_fs::split_full_name(crate_fullname)
         .ok_or_else(|| Error::CrateNameError(crate_fullname.to_string()))?;
 
-    // A re-import replaces the version's whole invoke graph: `insert_invokes` deletes the
-    // existing `[:INVOKES]` edges and creates the new ones.
-    if db.has_any_invoke(crate_name, crate_version).await? {
-        log::info!("{crate_fullname}: replacing existing invoke graph");
+    // A re-import replaces the version's whole call graph: `insert_calls` deletes the existing
+    // `(:Fn)` nodes and creates the new ones.
+    if db.has_call_graph(crate_name, crate_version).await? {
+        log::info!("{crate_fullname}: replacing existing call graph");
     }
 
     log::trace!("Importing: {crate_name}");
 
     // `extract_calls` only keeps callees with a recordable crate.
-    let mut rows: Vec<(String, String, String)> = calls
+    let rows: Vec<(String, String, String)> = calls
         .into_iter()
         .filter_map(|(caller, callee)| {
             let dst = callee_crate(&callee)?.to_string();
@@ -181,8 +181,7 @@ pub async fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P, db: Arc<Db>) -> Re
         .collect();
 
     // Map each callee crate as written in Rust paths (`num_traits`) to its `(Crate)` node's
-    // name (`num-traits`). Names that match no crate are left as they are and dropped by
-    // `insert_invokes`.
+    // name (`num-traits`). Calls into names that match no crate are dropped below.
     let idents: std::collections::BTreeSet<&str> = rows.iter().map(|r| r.2.as_str()).collect();
     let candidates: Vec<String> = idents
         .iter()
@@ -193,15 +192,16 @@ pub async fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P, db: Arc<Db>) -> Re
         .iter()
         .filter_map(|i| Some((i.to_string(), resolve_crate_name(i, &existing)?)))
         .collect();
-    for row in &mut rows {
-        if let Some(name) = resolved.get(&row.2) {
-            row.2.clone_from(name);
-        }
-    }
+    let raw = rows.len();
+    let calls =
+        crate::db::collapse_calls(rows.into_iter().filter_map(|(caller, callee, ident)| {
+            Some((caller, callee, resolved.get(&ident)?.clone()))
+        }));
 
-    db.insert_invokes((crate_name, crate_version), &rows)
-        .await?;
-    log::info!("{crate_fullname}: imported {} invocations", rows.len());
+    db.insert_calls((crate_name, crate_version), &calls).await?;
+    log::debug!("{crate_fullname}: {} distinct calls", calls.len());
+    // The batch import driver (`docker/entry.sh`) matches this exact line.
+    log::info!("{crate_fullname}: imported {raw} invocations");
 
     Ok(())
 }

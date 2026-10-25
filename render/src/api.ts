@@ -110,7 +110,7 @@ export interface CallersQuery {
 export interface CrateVersion {
   version: string;
   latest: boolean;
-  /** Has outgoing INVOKES, i.e. painter exported its call graph. */
+  /** Has a call graph (HAS_FN functions), i.e. painter exported it. */
   exported: boolean;
 }
 

@@ -114,7 +114,7 @@ api.get(
       `CALL { MATCH (c:Crate) RETURN count(c) AS crates }
        CALL { MATCH (v:Version) RETURN count(v) AS versions }
        CALL { MATCH ()-[r:DEPENDS_ON]->() RETURN count(r) AS dependsOn }
-       CALL { MATCH ()-[r:INVOKES]->() RETURN count(r) AS invokes }
+       CALL { MATCH ()-[r:CALLS]->() RETURN count(r) AS invokes }
        RETURN crates, versions, dependsOn, invokes`,
     );
     res.json(g.rows[0] ?? {});
@@ -161,9 +161,10 @@ api.get(
 );
 
 /**
- * Build a synthetic aggregated INVOKES relationship. The raw graph has one
- * INVOKES edge per callsite, which is far too dense to draw; we collapse them
- * into one edge per (Version, Crate) pair carrying a count and sample targets.
+ * Build a synthetic aggregated INVOKES relationship. The graph stores calls as
+ * (Version)-[:HAS_FN]->(:Fn)-[:CALLS]->(:Symbol)-[:IN]->(Crate), far too dense
+ * to draw; we collapse them into one edge per (Version, Crate) pair carrying
+ * the number of distinct calls and sample target symbols.
  */
 const aggregatedInvokes = (fromId, toId, count, targets) => ({
   id: `agg:${fromId}->${toId}:INVOKES`,
@@ -181,7 +182,7 @@ const aggregatedInvokes = (fromId, toId, count, targets) => ({
  * Query params:
  *   versions   = latest | all            (default latest)
  *   deps       = true | false            (default true)   Version-[:DEPENDS_ON]->Crate
- *   invokes    = true | false            (default true)   Version-[:INVOKES]->Crate (aggregated per crate)
+ *   invokes    = true | false            (default true)   calls from a Version into each Crate (aggregated per crate)
  *   dependents = true | false            (default false)  Version-[:DEPENDS_ON]->(this Crate), with their Crate
  *   limit      = per-relationship-type cap (default 200)
  *
@@ -222,8 +223,8 @@ api.get(
        }
        CALL {
          WITH v
-         OPTIONAL MATCH (v)-[i:INVOKES]->(ic:Crate) WHERE $invokes
-         WITH ic, count(i) AS n, collect(DISTINCT i.target)[0..10] AS targets
+         OPTIONAL MATCH (v)-[:HAS_FN]->(:Fn)-[k:CALLS]->(s:Symbol)-[:IN]->(ic:Crate) WHERE $invokes
+         WITH ic, count(k) AS n, collect(DISTINCT s.name)[0..10] AS targets
          WHERE ic IS NOT NULL
          WITH ic, n, targets ORDER BY n DESC
          RETURN collect({ic: ic, n: n, targets: targets})[0..$limit] AS invList
@@ -262,7 +263,8 @@ api.get(
 /**
  * Expand a node: return its neighbours over the given relationship types.
  * Body: { id: elementId, direction?: 'in'|'out'|'both', types?: string[], limit?: number }
- * INVOKES neighbours are aggregated per crate like in /graph/crate.
+ * INVOKES neighbours (calls from a Version into a Crate, see aggregatedInvokes)
+ * are aggregated per crate like in /graph/crate.
  */
 api.post(
   '/graph/expand',
@@ -285,13 +287,21 @@ api.post(
       : { nodes: [], rels: [], rows: [], meta: { records: 0, elapsedMs: 0 } };
 
     if (requested.includes('INVOKES')) {
+      // Calls run Version -> Crate: outgoing from a Version, incoming to a Crate.
       const inv = await readGraph(
         `MATCH (n) WHERE elementId(n) = $id
-         MATCH (n)${arrow('r:INVOKES')}(m)
-         WITH n, m, startNode(r) = n AS outgoing, count(r) AS cnt, collect(DISTINCT r.target)[0..10] AS targets
+         CALL {
+           WITH n
+           MATCH (n:Version)-[:HAS_FN]->(:Fn)-[k:CALLS]->(s:Symbol)-[:IN]->(m:Crate) WHERE $out
+           RETURN m, true AS outgoing, count(k) AS cnt, collect(DISTINCT s.name)[0..10] AS targets
+           UNION
+           WITH n
+           MATCH (n:Crate)<-[:IN]-(s:Symbol)<-[k:CALLS]-(:Fn)<-[:HAS_FN]-(m:Version) WHERE $in
+           RETURN m, false AS outgoing, count(k) AS cnt, collect(DISTINCT s.name)[0..10] AS targets
+         }
          WITH n, m, outgoing, cnt, targets ORDER BY cnt DESC
          RETURN n, m, outgoing, cnt, targets LIMIT $limit`,
-        { id, limit: cap },
+        { id, limit: cap, out: direction !== 'in', in: direction !== 'out' },
       );
       for (const row of inv.rows) {
         const [from, to] = row.outgoing ? [row.n.id, row.m.id] : [row.m.id, row.n.id];
@@ -570,26 +580,27 @@ api.get(
 );
 
 // ---------------------------------------------------------------------------
-// Callers view: reverse call graph over INVOKES (see callers.mjs)
+// Callers view: reverse call graph over CALLS (see callers.mjs)
 // ---------------------------------------------------------------------------
 
 /**
- * INVOKES edges point at the crate named by the symbol path, which spells
- * `my-crate` as `my_crate`; accept either spelling for the callee crate.
+ * A called Symbol is IN the crate named by its path, which spells `my-crate`
+ * as `my_crate`; accept either spelling for the callee crate.
  */
 const crateSpellings = (name) => [...new Set([name, normCrate(name), name.replace(/_/g, '-')])];
 
 /**
- * Functions of a crate that something calls: distinct INVOKES targets into
- * it whose name contains `q` (case-insensitive), most-called first. Names
- * ending in `q` rank first so `spawn` finds `tokio::task::spawn::spawn`.
+ * Functions of a crate that something calls: Symbols IN it whose name
+ * contains `q` (case-insensitive), most-called first (`calls` = distinct
+ * calling functions). Names ending in `q` rank first so `spawn` finds
+ * `tokio::task::spawn::spawn`.
  */
 const searchFunctions = async (crate, q, limit) =>
   readGraph(
     `MATCH (t:Crate) WHERE t.name IN $names
-     MATCH (t)<-[i:INVOKES]-(:Version)
-     WHERE $q = '' OR toLower(i.target) CONTAINS $q
-     WITH i.target AS name, count(*) AS calls
+     MATCH (t)<-[:IN]-(s:Symbol)
+     WHERE $q = '' OR toLower(s.name) CONTAINS $q
+     WITH s.name AS name, COUNT { (s)<-[:CALLS]-() } AS calls
      ORDER BY toLower(name) ENDS WITH $q DESC, calls DESC, size(name)
      RETURN name, calls LIMIT $limit`,
     { names: crateSpellings(crate), q: q.toLowerCase(), limit: neo4j.int(limit) },
@@ -611,7 +622,7 @@ api.get(
   wrap(async (req, res) => {
     const g = await readGraph(
       `MATCH (c:Crate {name: $name})-[:VERSION_OF]-(v:Version)
-       RETURN v.version AS version, coalesce(v.latest, false) AS latest, EXISTS { (v)-[:INVOKES]->() } AS exported
+       RETURN v.version AS version, coalesce(v.latest, false) AS latest, EXISTS { (v)-[:HAS_FN]->() } AS exported
        ORDER BY v.semver_major DESC, v.semver_minor DESC, v.semver_patch DESC, coalesce(v.semver_pre, '') = '' DESC, v.version DESC`,
       { name: String(req.params.name) },
     );
@@ -655,7 +666,7 @@ api.get(
     const targets = exact ? [fn] : (await searchFunctions(crate, fn, 500)).map((f) => f.name);
     if (!targets.length) {
       return res.status(404).json({
-        error: `nothing calls a function of '${crate}' containing '${fn}' (INVOKES only records calls into crates painter has exported callers for)`,
+        error: `nothing calls a function of '${crate}' containing '${fn}' (calls are only recorded from crate versions painter has exported)`,
       });
     }
 

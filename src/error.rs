@@ -1,4 +1,4 @@
-use crate::{check, compile, crate_fs, db, index, rules};
+use crate::{check, compile, crate_fs, db, index, migrate, rules};
 
 /// Top error type returned during any stage of analysis from compile to data import.
 #[derive(thiserror::Error, Debug)]
@@ -32,6 +32,9 @@ pub enum Error {
     /// `compile-check` failure.
     #[error("Compile check error: {0}")]
     CheckError(#[from] check::Error),
+    /// `export-for-import` failure.
+    #[error("Migration export error: {0}")]
+    MigrateError(#[from] migrate::Error),
     /// `-b` was required but not given.
     #[error("MissingBytecodesPath")]
     MissingBytecodesPath,

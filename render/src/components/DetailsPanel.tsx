@@ -86,7 +86,7 @@ export function DetailsPanel({ view, onExpandDeps, selected, nodeById, onExpand,
             <span className="line" style={{ background: '#4C8DFF' }} /> DEPENDS_ON
           </li>
           <li>
-            <span className="line" style={{ background: '#E5484D' }} /> INVOKES (width = call count)
+            <span className="line" style={{ background: '#E5484D' }} /> INVOKES: calls into a crate (width = distinct calls)
           </li>
         </ul>
         )}
@@ -108,8 +108,8 @@ export function DetailsPanel({ view, onExpandDeps, selected, nodeById, onExpand,
         </p>
         {selected.properties.aggregated === true && selected.type === 'INVOKES' && (
           <p className="muted">
-            Aggregated: {fmt(selected.properties.count)} INVOKES edges collapsed into one. Showing up to 10 distinct
-            targets.
+            Aggregated: {fmt(selected.properties.count)} distinct calls (CALLS edges) collapsed into one. Showing up
+            to 10 distinct targets.
           </p>
         )}
         {selected.properties.aggregated === true && selected.type === 'DEPENDS_ON' && (
