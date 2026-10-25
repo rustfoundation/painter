@@ -166,7 +166,12 @@ impl CrateCache {
         let tar_gz = std::fs::File::open(&src_crate_file)?;
         let tar = flate2::read::GzDecoder::new(tar_gz);
         let mut archive = tar::Archive::new(tar);
-        archive.unpack(sources_dir.as_ref())?;
+        if let Err(e) = archive.unpack(sources_dir.as_ref()) {
+            // Do not leave a half-unpacked tree behind: a later open would adopt it as a
+            // pre-existing extraction.
+            let _ = std::fs::remove_dir_all(&extracted_path);
+            return Err(e.into());
+        }
 
         if !extracted_path.exists() {
             return Err(Error::ExtractionFailed);
@@ -254,6 +259,24 @@ impl CrateFs {
         self.cache
             .remove(self.find_cache_index(&entry).ok_or(Error::CrateNotFound)?);
 
+        Ok(())
+    }
+
+    /// Evict `entry` from the cache if present and delete its extraction from the sources
+    /// directory, even one that existed before this `CrateFs` opened it (e.g. left behind by an
+    /// interrupted run).
+    ///
+    /// # Errors
+    /// Returns `Error::IoError` if the extraction exists but cannot be removed.
+    pub fn purge(&mut self, entry: &CrateEntry) -> Result<(), Error> {
+        if let Some(index) = self.find_cache_index(entry) {
+            // Dropping the cache entry deletes extractions it created itself.
+            self.cache.remove(index);
+        }
+        let path = self.config.extract_path.join(entry.full_name());
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
         Ok(())
     }
 
@@ -442,6 +465,60 @@ mod tests {
             assert_eq!(cache.path(), pre);
         }
         assert!(pre.exists(), "pre-existing extraction must survive drop");
+    }
+
+    #[test]
+    fn purge_deletes_cached_and_preexisting_extractions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crates = tmp.path().join("crates");
+        let sources = tmp.path().join("sources");
+        std::fs::create_dir_all(&crates).unwrap();
+        std::fs::create_dir_all(&sources).unwrap();
+
+        let fresh = CrateEntry::from_parts("demo", "0.1.0");
+        write_crate_tarball(
+            &fresh.candidate_paths(&crates)[2],
+            &fresh,
+            &[("Cargo.toml", "")],
+        );
+        let stale = CrateEntry::from_parts("stale", "1.0.0");
+        std::fs::create_dir_all(sources.join(stale.full_name()).join("src")).unwrap();
+
+        let mut fs = CrateFs::new(CrateFsConfig::with_paths(&crates, &sources)).unwrap();
+        let extracted = fs.open_entry(fresh.clone()).unwrap().path().to_path_buf();
+        let adopted = fs.open_entry(stale.clone()).unwrap().path().to_path_buf();
+
+        fs.purge(&fresh).unwrap();
+        fs.purge(&stale).unwrap();
+        assert!(!extracted.exists());
+        assert!(
+            !adopted.exists(),
+            "pre-existing extraction must be purged too"
+        );
+        assert!(matches!(fs.close("demo-0.1.0"), Err(Error::CrateNotFound)));
+
+        // Purging something that was never opened or extracted is a no-op.
+        fs.purge(&CrateEntry::from_parts("absent", "1.0.0"))
+            .unwrap();
+    }
+
+    #[test]
+    fn crate_cache_removes_partial_extractions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crates = tmp.path().join("crates");
+        let sources = tmp.path().join("sources");
+        std::fs::create_dir_all(&sources).unwrap();
+
+        // A truncated archive: the first file unpacks, then the gzip stream ends.
+        let entry = CrateEntry::from_parts("demo", "0.1.0");
+        let path = entry.candidate_paths(&crates)[2].clone();
+        let big = "x".repeat(1 << 20);
+        write_crate_tarball(&path, &entry, &[("a.txt", "a"), ("b.txt", &big)]);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+
+        assert!(CrateCache::new(&entry, &crates, &sources).is_err());
+        assert!(!sources.join("demo-0.1.0").exists());
     }
 
     #[test]

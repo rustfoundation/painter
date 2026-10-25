@@ -63,6 +63,10 @@ pub fn clean(path: &Path, toolchain: &str) -> Result<(), Error> {
     }
 }
 
+/// Directory under the bytecode root where [`compile_crate`] assembles a version's bitcode before
+/// renaming it into place. Dot-prefixed so bytecode scans and exports skip it.
+pub const STAGING_DIR: &str = ".painter-staging";
+
 /// Executes a cargo rustc  within the crates sources directory. This is executed within the
 /// `Roots::sources_root` directory inside a given crates version folder.
 ///
@@ -112,21 +116,30 @@ pub fn compile_crate<PS: AsRef<Path>, PC: AsRef<Path>>(
     log::trace!("Compiled: {fullname} with result: {output:?}");
 
     if output.status.success() {
-        std::fs::create_dir_all(&output_dir)?;
+        // Copy the emitted .bc files into a staging dir and rename it into place, so a
+        // `<name>-<version>` dir in the bytecode root is always complete: an interrupted copy
+        // never looks like a finished build to update-only or to a concurrent exporter.
+        let staging = bc_root.as_ref().join(STAGING_DIR).join(&fullname);
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
+        std::fs::create_dir_all(&staging)?;
 
-        // If the compile succeeded, search for emitted .bc files of bytecode and copy them over
-        // to the Roots::bytecode_root directory.
-        WalkDir::new(src_path.as_ref())
+        let mut copied = 0usize;
+        for e in WalkDir::new(src_path.as_ref())
             .into_iter()
             .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some() && e.path().extension().unwrap() == "bc")
-            .for_each(|e| {
-                let dst = output_dir.join(Path::new(e.path().file_name().unwrap()));
-                if dst.exists() {
-                    std::fs::remove_file(&dst).unwrap();
-                }
-                std::fs::copy(e.path(), &dst).unwrap();
-            });
+            .filter(|e| e.path().extension().is_some_and(|x| x == "bc"))
+        {
+            std::fs::copy(e.path(), staging.join(e.file_name()))?;
+            copied += 1;
+        }
+
+        if output_dir.exists() {
+            std::fs::remove_dir_all(&output_dir)?;
+        }
+        std::fs::rename(&staging, &output_dir)?;
+        log::info!("Compiled: {fullname}, {copied} bitcode file(s)");
 
         clean(src_path.as_ref(), toolchain)?;
     } else {
@@ -175,7 +188,9 @@ impl Default for CompileOptions {
 pub const DEFAULT_TOOLCHAIN: &str = "1.67";
 
 /// Compile one version of a crate: extract it through `fs`, build, and copy bitcode into
-/// `bc_root`. Failures are logged, not returned, so a bad crate never stops the sweep.
+/// `bc_root`. Failures are logged, not returned, so a bad crate never stops the sweep. The
+/// extraction is deleted afterwards, including one left behind by an interrupted earlier run,
+/// so the sources root only holds the crates currently being built.
 fn compile_version(
     name: &str,
     version: &str,
@@ -184,15 +199,23 @@ fn compile_version(
     opts: &CompileOptions,
 ) {
     let fullname = format!("{name}-{version}");
+    let entry = CrateEntry::from_parts(name, version);
+    let purge = |entry: &CrateEntry| {
+        if let Err(e) = fs.lock().unwrap().purge(entry) {
+            log::warn!("{fullname}: removing extracted sources failed: {e}");
+        }
+    };
 
     if opts.update_only && bc_root.join(&fullname).exists() {
         log::info!("{fullname} bytecode exists, skipping..");
+        // Sources left behind by an interrupted earlier run.
+        purge(&entry);
         return;
     }
 
     let src_path = {
         let mut lock = fs.lock().unwrap();
-        match lock.open_entry(CrateEntry::from_parts(name, version)) {
+        match lock.open_entry(entry.clone()) {
             Ok(entry) => entry.path().to_path_buf(),
             Err(e) => {
                 log::error!("Opening failed on {fullname}: {e}");
@@ -204,6 +227,7 @@ fn compile_version(
     if let Err(e) = compile_crate(name, version, &src_path, bc_root, &opts.toolchain) {
         log::error!("{fullname} failed: {e}");
     }
+    purge(&entry);
 }
 
 /// Ask `rules` which versions of each crate to build, with bounded concurrency. Rule failures
@@ -309,6 +333,12 @@ pub async fn compile_all<P: AsRef<Path> + Send + Sync>(
 
     let work = plan(rules, opts.rules_concurrency).await?;
 
+    // Half-copied bitcode from an interrupted earlier run.
+    let staging = bc_root.as_ref().join(STAGING_DIR);
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+
     // A dedicated pool so `jobs` bounds the number of concurrent `cargo` processes regardless
     // of how many threads the global rayon pool has.
     let pool = rayon::ThreadPoolBuilder::new()
@@ -371,6 +401,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{test_toolchain, write_fixture_crate};
     use super::*;
+    use crate::crate_fs::CrateFsConfig;
 
     #[test]
     fn default_options() {
@@ -379,6 +410,47 @@ mod tests {
         assert_eq!(o.toolchain, DEFAULT_TOOLCHAIN);
         assert_eq!(o.rules_concurrency, 16);
         assert_eq!(o.jobs, None);
+    }
+
+    /// `compile_all`'s per-version step deletes the extraction after building, and deletes a
+    /// stale one when it skips an already-built version.
+    #[test]
+    fn compile_version_removes_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crates = tmp.path().join("crates");
+        let sources = tmp.path().join("sources");
+        let bc_root = tmp.path().join("bc");
+        std::fs::create_dir_all(&crates).unwrap();
+        std::fs::create_dir_all(&sources).unwrap();
+
+        // Pack the fixture as crates/painter_fixture-0.1.0.crate.
+        let staging = tmp.path().join("staging");
+        let dir = write_fixture_crate(&staging, "painter_fixture", "0.1.0");
+        let gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(crates.join("painter_fixture-0.1.0.crate")).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut tar = tar::Builder::new(gz);
+        tar.append_dir_all("painter_fixture-0.1.0", &dir).unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+
+        let fs = Mutex::new(CrateFs::new(CrateFsConfig::with_paths(&crates, &sources)).unwrap());
+        let opts = CompileOptions {
+            toolchain: test_toolchain(),
+            ..CompileOptions::default()
+        };
+        compile_version("painter_fixture", "0.1.0", &fs, &bc_root, &opts);
+        assert!(bc_root.join("painter_fixture-0.1.0").is_dir());
+        let extracted = sources.join("painter_fixture-0.1.0");
+        assert!(!extracted.exists(), "sources survived the build");
+
+        // A stale extraction of the now-built version, as an interrupted run leaves behind.
+        std::fs::create_dir_all(extracted.join("src")).unwrap();
+        compile_version("painter_fixture", "0.1.0", &fs, &bc_root, &opts);
+        assert!(
+            !extracted.exists(),
+            "stale sources of a built version survived"
+        );
     }
 
     #[test]
@@ -404,6 +476,12 @@ mod tests {
             .collect();
         assert!(!bcs.is_empty(), "no .bc copied into {}", out.display());
         assert!(!src.join("target").exists(), "cargo clean did not run");
+        let staging = bc_root.join(STAGING_DIR);
+        assert_eq!(
+            std::fs::read_dir(&staging).unwrap().count(),
+            0,
+            "staging dir not renamed into place"
+        );
 
         // The bitcode is readable by the linked LLVM and contains the intra-crate call.
         let calls = crate::analysis::extract_calls(&out).unwrap();

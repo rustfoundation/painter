@@ -141,7 +141,8 @@ pub async fn export_all_db<P: AsRef<Path>>(bc_root: P, db: Arc<Db>) -> Result<()
     let dirs: Vec<_> = std::fs::read_dir(&bc_root)
         .unwrap()
         .filter_map(Result::ok)
-        .filter(|e| e.path().is_dir())
+        // Dot-dirs are not crate versions (e.g. compile's staging dir).
+        .filter(|e| e.path().is_dir() && !e.file_name().to_string_lossy().starts_with('.'))
         .collect();
 
     let mut failures = 0usize;

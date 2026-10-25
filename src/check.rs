@@ -204,6 +204,10 @@ pub fn scan_bytecodes(bc_root: &Path) -> Result<HashSet<(String, String)>, Error
             }
             let dir_name = entry.file_name();
             let dir_name = dir_name.to_str()?;
+            if dir_name.starts_with('.') {
+                // e.g. compile's staging dir.
+                return None;
+            }
             let Some((name, version)) = split_full_name(dir_name) else {
                 log::warn!("bytecode dir does not look like <name>-<version>: {dir_name}");
                 return None;
@@ -318,6 +322,7 @@ mod tests {
         mk("empty-1.0.0", &[]);
         mk("junk-1.0.0", &["notes.txt"]);
         mk("not_a_crate_dir", &["x.bc"]);
+        mk(".painter-staging/half-1.0.0", &["x.bc"]);
         std::fs::write(tmp.path().join("stray-1.0.0"), b"file, not dir").unwrap();
 
         let found = scan_bytecodes(tmp.path()).unwrap();
