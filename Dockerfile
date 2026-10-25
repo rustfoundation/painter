@@ -76,6 +76,22 @@ RUN set -eux; \
     rm -rf "$RUSTUP_HOME/downloads" "$RUSTUP_HOME/tmp"; \
     for tc in ${PAINTER_TOOLCHAINS}; do cargo "+$tc" --version; done
 
+# sccache is installed but off: compile-all only uses it when the container sets
+# RUSTC_WRAPPER=sccache (docker ctl.sh does with SCCACHE=1). It then caches dependency rlibs
+# across crates; the analyzed crate (--emit=llvm-bc), proc macros, and build scripts are never
+# cached.
+ARG SCCACHE_VERSION=0.18.0
+ARG SCCACHE_SHA256=45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
+RUN set -eux; \
+    f="sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl"; \
+    curl -sSfL -o /tmp/sccache.tar.gz \
+        "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/$f.tar.gz"; \
+    echo "${SCCACHE_SHA256}  /tmp/sccache.tar.gz" | sha256sum -c -; \
+    tar xzf /tmp/sccache.tar.gz -C /tmp; \
+    install -m 755 "/tmp/$f/sccache" /usr/local/bin/sccache; \
+    rm -rf /tmp/sccache.tar.gz "/tmp/$f"; \
+    sccache --version
+
 COPY --from=builder /out/bin/painter /out/bin/count-unsafe /usr/local/bin/
 
 # The index is a bind-mounted git clone owned by the host user; let libgit2 open it as root.

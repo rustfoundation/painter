@@ -67,6 +67,12 @@ pub fn clean(path: &Path, toolchain: &str) -> Result<(), Error> {
 /// renaming it into place. Dot-prefixed so bytecode scans and exports skip it.
 pub const STAGING_DIR: &str = ".painter-staging";
 
+/// Cargo `--config` override that builds every dependency at `opt-level=0`. Only the crate under
+/// analysis emits bitcode, so optimizing its dependencies is wasted work. `"*"` does not match
+/// workspace members, so the analyzed crate keeps the release profile; generic and `#[inline]`
+/// code from dependencies is codegened inside it and is optimized as before.
+pub const DEPS_OPT_LEVEL: &str = r#"profile.release.package."*".opt-level=0"#;
+
 /// Executes a cargo rustc  within the crates sources directory. This is executed within the
 /// `Roots::sources_root` directory inside a given crates version folder.
 ///
@@ -97,6 +103,8 @@ pub fn compile_crate<PS: AsRef<Path>, PC: AsRef<Path>>(
     let output = std::process::Command::new("cargo")
         .arg(format!("+{toolchain}"))
         .args([
+            "--config",
+            DEPS_OPT_LEVEL,
             "rustc",
             "--release",
             "--lib",
