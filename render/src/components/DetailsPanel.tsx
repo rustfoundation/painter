@@ -1,5 +1,7 @@
-import type { ExpandType, GraphNode, GraphRel, View } from '../api';
-import { isCrate, isVersion, nodeTitle, relTitle } from '../graph';
+import { useEffect, useState } from 'react';
+import { api, type CrateRegistry, type ExpandType, type GraphNode, type GraphRel, type VersionPublisher, type View } from '../api';
+import { isCrate, isTeam, isUser, isVersion, nodeTitle, relTitle } from '../graph';
+import { fmtBytes, fmtCompact, fmtDate, fmtDateTime, UserLink } from './meta';
 
 interface Props {
   view: View;
@@ -10,6 +12,8 @@ interface Props {
   onExpand: (id: string, direction: 'in' | 'out' | 'both', types: ExpandType[]) => void;
   onRemove: (id: string) => void;
   onLoadCrate: (name: string) => void;
+  /** Open a crates.io login in the Publishers view. */
+  onOpenUser: (login: string) => void;
   busy: boolean;
 }
 
@@ -114,6 +118,453 @@ function UnsafeSummary({ p }: { p: Record<string, unknown> }) {
   );
 }
 
+const numOf = (p: Record<string, unknown>, k: string) => (typeof p[k] === 'number' ? (p[k] as number) : null);
+const n = (v: number | null) => (v === null ? '—' : v.toLocaleString());
+
+/** `generate-metadata` build job: has_build_script, build_script, build_script_lines, links. */
+function BuildSummary({ p }: { p: Record<string, unknown> }) {
+  if (!p.meta_build) {
+    return (
+      <>
+        <h3>Build script</h3>
+        <p className="muted">{p.has_build_script === true ? 'Has a build script (details pending generate-metadata).' : 'Not scanned yet (run painter generate-metadata --job build).'}</p>
+      </>
+    );
+  }
+  if (p.has_build_script !== true) {
+    return (
+      <>
+        <h3>Build script</h3>
+        <p className="muted">None.</p>
+      </>
+    );
+  }
+  return (
+    <>
+      <h3>Build script</h3>
+      <table className="props unsafe-cats">
+        <tbody>
+          <tr>
+            <th>script</th>
+            <td>
+              <code>{String(p.build_script ?? 'build.rs')}</code>
+              {p.build_script_lines === null || p.build_script_lines === undefined ? <span className="muted"> (not in the tarball)</span> : ` · ${n(numOf(p, 'build_script_lines'))} lines`}
+            </td>
+          </tr>
+          {typeof p.links === 'string' && (
+            <tr>
+              <th>links</th>
+              <td>
+                <span className="flag links">{p.links}</span>
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </>
+  );
+}
+
+/** `generate-metadata` native job: has_native_code, vendored_native, native_* counts. */
+function NativeSummary({ p }: { p: Record<string, unknown> }) {
+  if (!p.meta_native) {
+    return (
+      <>
+        <h3>Native code</h3>
+        <p className="muted">Not scanned yet (run painter generate-metadata --job native).</p>
+      </>
+    );
+  }
+  if (p.has_native_code !== true) {
+    return (
+      <>
+        <h3>Native code</h3>
+        <p className="muted">None{numOf(p, 'native_prebuilt_files') ? ` (${n(numOf(p, 'native_prebuilt_files'))} prebuilt binaries)` : ''}.</p>
+      </>
+    );
+  }
+  const langs = Array.isArray(p.native_langs) ? (p.native_langs as string[]) : [];
+  const dirs = Array.isArray(p.native_dirs) ? (p.native_dirs as string[]) : [];
+  return (
+    <>
+      <h3>
+        Native code{' '}
+        {p.vendored_native === true ? (
+          <span className="flag vendored" title="Enough native code to be a vendored library">
+            vendored
+          </span>
+        ) : (
+          <span className="flag native">shim</span>
+        )}
+      </h3>
+      <table className="props unsafe-cats">
+        <tbody>
+          <tr>
+            <th>languages</th>
+            <td>{langs.join(', ') || '—'}</td>
+          </tr>
+          <tr>
+            <th>files</th>
+            <td>
+              {n(numOf(p, 'native_source_files'))} sources · {n(numOf(p, 'native_header_files'))} headers
+            </td>
+          </tr>
+          <tr>
+            <th>lines</th>
+            <td>
+              {n(numOf(p, 'native_lines'))} ({n(numOf(p, 'native_source_lines'))} in sources)
+              {numOf(p, 'native_vendor_dir_lines') ? ` · ${n(numOf(p, 'native_vendor_dir_lines'))} under vendor dirs` : ''}
+            </td>
+          </tr>
+          <tr>
+            <th>size</th>
+            <td>
+              {n(numOf(p, 'native_bytes'))} bytes · largest {n(numOf(p, 'native_largest_bytes'))}
+            </td>
+          </tr>
+          {numOf(p, 'native_prebuilt_files') ? (
+            <tr>
+              <th>prebuilt</th>
+              <td>{n(numOf(p, 'native_prebuilt_files'))} binaries (.a .so .dll .o …)</td>
+            </tr>
+          ) : null}
+          <tr>
+            <th>in</th>
+            <td>{dirs.map((d) => `${d}/`).join(' ') || '—'}</td>
+          </tr>
+        </tbody>
+      </table>
+    </>
+  );
+}
+
+/** `generate-metadata` diff job: files and lines changed since the previous version. */
+function DiffSummary({ p }: { p: Record<string, unknown> }) {
+  if (!p.meta_diff) {
+    return (
+      <>
+        <h3>Changes since previous version</h3>
+        <p className="muted">Not diffed yet (run painter generate-metadata --job diff).</p>
+      </>
+    );
+  }
+  const base = typeof p.diff_base === 'string' ? p.diff_base : null;
+  const added = numOf(p, 'diff_lines_added') ?? 0;
+  const removed = numOf(p, 'diff_lines_removed') ?? 0;
+  const fa = numOf(p, 'diff_files_added') ?? 0;
+  const fr = numOf(p, 'diff_files_removed') ?? 0;
+  const fm = numOf(p, 'diff_files_modified') ?? 0;
+  const paths = Array.isArray(p.diff_paths) ? (p.diff_paths as string[]) : [];
+  const pAdded = Array.isArray(p.diff_added) ? (p.diff_added as number[]) : [];
+  const pRemoved = Array.isArray(p.diff_removed) ? (p.diff_removed as number[]) : [];
+  const pStatus = Array.isArray(p.diff_status) ? (p.diff_status as string[]) : [];
+  const top = paths
+    .map((path, i) => ({ path, status: pStatus[i], added: pAdded[i] ?? 0, removed: pRemoved[i] ?? 0 }))
+    .sort((a, b) => b.added + b.removed - (a.added + a.removed))
+    .slice(0, 8);
+  return (
+    <>
+      <h3>
+        Changes since {base ? `v${base}` : 'nothing (first version)'}{' '}
+        {p.diff_approximate === true && (
+          <span className="flag approx" title="A file hit the diff timeout; counts are an upper bound">
+            approx
+          </span>
+        )}
+      </h3>
+      <table className="props unsafe-cats">
+        <tbody>
+          <tr>
+            <th>lines</th>
+            <td>
+              <span className="added">+{added.toLocaleString()}</span> / <span className="removed">−{removed.toLocaleString()}</span>
+            </td>
+          </tr>
+          <tr>
+            <th>files</th>
+            <td>
+              {base === null ? `${n(numOf(p, 'diff_files_total'))} added` : `+${fa} · −${fr} · ~${fm} of ${n(numOf(p, 'diff_files_total'))}`}
+              {base !== null && fa + fr + fm === 0 ? <span className="muted"> (identical)</span> : null}
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      {base !== null && top.length > 0 && (
+        <ul className="targets diff-top">
+          {top.map((f) => (
+            <li key={f.path} title={`${f.status}: +${f.added} / −${f.removed}`}>
+              <span className={`status ${f.status}`}>{f.status === 'added' ? '+' : f.status === 'removed' ? '−' : '~'}</span> <code>{f.path}</code>{' '}
+              <span className="muted small">
+                +{f.added}/−{f.removed}
+              </span>
+            </li>
+          ))}
+          {paths.length > top.length && <li className="muted small">… {paths.length - top.length} more in the Diffs view</li>}
+        </ul>
+      )}
+    </>
+  );
+}
+
+const str = (p: Record<string, unknown>, k: string) => (typeof p[k] === 'string' && p[k] ? (p[k] as string) : null);
+
+const ExtLink = ({ href, label }: { href: string; label?: string }) => (
+  <a href={href} target="_blank" rel="noreferrer" className="ext">
+    {label ?? href.replace(/^https?:\/\//, '')}
+  </a>
+);
+
+/**
+ * Registry facts of a Crate: description, links, downloads, dates (node properties)
+ * plus owners, publishers, categories, and keywords fetched from /api/registry/crate.
+ */
+function CrateRegistrySummary({ p, onOpenUser }: { p: Record<string, unknown>; onOpenUser: (login: string) => void }) {
+  const name = String(p.name ?? '');
+  const [reg, setReg] = useState<CrateRegistry | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setReg(null);
+    setError(null);
+    api
+      .crateRegistry(name)
+      .then((r) => !cancelled && setReg(r))
+      .catch((err) => !cancelled && setError(err instanceof Error ? err.message : String(err)));
+    return () => {
+      cancelled = true;
+    };
+  }, [name]);
+  if (!p.registry_id) {
+    return (
+      <>
+        <h3>crates.io</h3>
+        <p className="muted">Not in the registry dump yet (run painter generate-metadata --job registry).</p>
+      </>
+    );
+  }
+  const description = str(p, 'description');
+  return (
+    <>
+      <h3>crates.io</h3>
+      {description && <p className="crate-description">{description}</p>}
+      <table className="props unsafe-cats">
+        <tbody>
+          <tr>
+            <th>downloads</th>
+            <td>
+              <b>{fmtCompact(numOf(p, 'downloads'))}</b> <span className="muted">{n(numOf(p, 'downloads'))}</span>
+            </td>
+          </tr>
+          <tr>
+            <th>versions</th>
+            <td>
+              {n(numOf(p, 'num_versions'))}
+              {str(p, 'default_version') ? ` · default ${str(p, 'default_version')}` : ''}
+            </td>
+          </tr>
+          <tr>
+            <th>created</th>
+            <td title={fmtDateTime(str(p, 'created_at'))}>{fmtDate(str(p, 'created_at'))}</td>
+          </tr>
+          <tr>
+            <th>updated</th>
+            <td title={fmtDateTime(str(p, 'updated_at'))}>{fmtDate(str(p, 'updated_at'))}</td>
+          </tr>
+          <tr>
+            <th>links</th>
+            <td>
+              {str(p, 'repository') && (
+                <div>
+                  <ExtLink href={str(p, 'repository')!} />
+                </div>
+              )}
+              {str(p, 'homepage') && str(p, 'homepage') !== str(p, 'repository') && (
+                <div>
+                  <ExtLink href={str(p, 'homepage')!} />
+                </div>
+              )}
+              {str(p, 'documentation') && (
+                <div>
+                  <ExtLink href={str(p, 'documentation')!} label="documentation" />
+                </div>
+              )}
+              <div>
+                <ExtLink href={`https://crates.io/crates/${name}`} label="crates.io" />
+              </div>
+            </td>
+          </tr>
+          {p.trustpub_only === true && (
+            <tr>
+              <th>publishing</th>
+              <td>
+                <span className="flag forbid" title="Only trusted publishing (CI identity) may upload">
+                  trusted publishing only
+                </span>
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+      {error && <p className="muted small">{error}</p>}
+      {reg && (
+        <>
+          <h3>Owners {reg.owners.length ? <span className="muted">{reg.owners.length}</span> : null}</h3>
+          {reg.owners.length ? (
+            <table className="props unsafe-cats owners">
+              <tbody>
+                {reg.owners.map((o) => (
+                  <tr key={o.login}>
+                    <th>
+                      <span className="swatch" style={{ background: o.kind === 'Team' ? '#20B2AA' : '#E36BAE' }} /> <UserLink login={o.login} name={o.name} onOpen={onOpenUser} />
+                    </th>
+                    <td className="muted small" title={fmtDateTime(o.since)}>
+                      since {fmtDate(o.since)}
+                      {o.addedBy && o.addedBy !== o.login ? (
+                        <>
+                          {' '}
+                          by <UserLink login={o.addedBy} onOpen={onOpenUser} />
+                        </>
+                      ) : (
+                        ''
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <p className="muted">No owners recorded.</p>
+          )}
+          <h3>Publishers {reg.publishers.length ? <span className="muted">{reg.publishers.length}</span> : null}</h3>
+          {reg.publishers.length ? (
+            <table className="props unsafe-cats owners">
+              <tbody>
+                {reg.publishers.slice(0, 8).map((u) => (
+                  <tr key={u.login}>
+                    <th>
+                      <UserLink login={u.login} name={u.name} onOpen={onOpenUser} />
+                    </th>
+                    <td className="muted small" title={`first ${fmtDateTime(u.first)}, last ${fmtDateTime(u.last)}`}>
+                      {u.versions} upload{u.versions === 1 ? '' : 's'} · {fmtDate(u.first)} → {fmtDate(u.last)}
+                    </td>
+                  </tr>
+                ))}
+                {reg.publishers.length > 8 && (
+                  <tr>
+                    <td colSpan={2} className="muted small">
+                      … {reg.publishers.length - 8} more
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          ) : (
+            <p className="muted">No uploader recorded (crates.io records uploaders since 2017).</p>
+          )}
+          {(reg.categories.length > 0 || reg.keywords.length > 0) && (
+            <>
+              <h3>Categories and keywords</h3>
+              <div className="chips">
+                {reg.categories.map((c) => (
+                  <span key={c.slug} className="flag category" title={`${c.slug}${c.crates ? ` · ${c.crates.toLocaleString()} crates` : ''}`}>
+                    {c.name}
+                  </span>
+                ))}
+                {reg.keywords.map((k) => (
+                  <span key={k} className="flag keyword">
+                    #{k}
+                  </span>
+                ))}
+              </div>
+            </>
+          )}
+        </>
+      )}
+    </>
+  );
+}
+
+/** Registry facts of a Version: published_at, uploader (fetched), yanked, license, size, downloads, edition, MSRV, binaries. */
+function VersionRegistrySummary({ p, onOpenUser }: { p: Record<string, unknown>; onOpenUser: (login: string) => void }) {
+  const name = String(p.name ?? '');
+  const version = String(p.version ?? '');
+  const [pub, setPub] = useState<VersionPublisher | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setPub(null);
+    api
+      .versionPublisher(name, version)
+      .then((r) => !cancelled && setPub(r))
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [name, version]);
+  if (!p.meta_registry) {
+    return (
+      <>
+        <h3>crates.io</h3>
+        <p className="muted">{p.registry_missing ? 'Not in the crates.io dump (deleted or renamed).' : 'Not in the registry dump yet (run painter generate-metadata --job registry).'}</p>
+      </>
+    );
+  }
+  const bins = Array.isArray(p.bin_names) ? (p.bin_names as string[]) : [];
+  return (
+    <>
+      <h3>
+        crates.io{' '}
+        {p.yanked === true && (
+          <span className="flag yanked" title="Yanked on crates.io">
+            yanked
+          </span>
+        )}
+      </h3>
+      <table className="props unsafe-cats">
+        <tbody>
+          <tr>
+            <th>published</th>
+            <td title={fmtDateTime(str(p, 'published_at'))}>{fmtDate(str(p, 'published_at'))}</td>
+          </tr>
+          <tr>
+            <th>uploader</th>
+            <td>{pub ? pub.login ? <UserLink login={pub.login} name={pub.publisherName} onOpen={onOpenUser} /> : <span className="muted">not recorded</span> : <span className="muted">…</span>}</td>
+          </tr>
+          <tr>
+            <th>downloads</th>
+            <td>
+              <b>{fmtCompact(numOf(p, 'downloads'))}</b> <span className="muted">{n(numOf(p, 'downloads'))}</span>
+            </td>
+          </tr>
+          <tr>
+            <th>license</th>
+            <td>{str(p, 'license') ?? <span className="muted">—</span>}</td>
+          </tr>
+          <tr>
+            <th>crate size</th>
+            <td>{fmtBytes(numOf(p, 'crate_size'))}</td>
+          </tr>
+          <tr>
+            <th>edition · msrv</th>
+            <td>
+              {str(p, 'edition') ?? '—'} · {str(p, 'rust_version') ?? '—'}
+            </td>
+          </tr>
+          <tr>
+            <th>targets</th>
+            <td>
+              {p.has_lib === true ? 'lib' : p.has_lib === false ? <span className="muted">no lib</span> : '—'}
+              {bins.length ? ` · bin ${bins.join(', ')}` : ''}
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </>
+  );
+}
+
+/** Keys the summaries above already present; the raw table below skips them. */
+const SUMMARISED = /^(diff_(paths|status|added|removed|binary)|description)$/;
+
 function Properties({ props }: { props: Record<string, unknown> }) {
   const entries = Object.entries(props).sort(([a], [b]) => a.localeCompare(b));
   if (!entries.length) return <p className="muted">no properties</p>;
@@ -131,7 +582,7 @@ function Properties({ props }: { props: Record<string, unknown> }) {
   );
 }
 
-export function DetailsPanel({ view, onExpandDeps, selected, nodeById, onExpand, onRemove, onLoadCrate, busy }: Props) {
+export function DetailsPanel({ view, onExpandDeps, selected, nodeById, onExpand, onRemove, onLoadCrate, onOpenUser, busy }: Props) {
   if (!selected) {
     return (
       <div className="details">
@@ -179,6 +630,12 @@ export function DetailsPanel({ view, onExpandDeps, selected, nodeById, onExpand,
           </li>
           <li>
             <span className="line" style={{ background: '#E5484D' }} /> INVOKES: calls into a crate (width = distinct calls)
+          </li>
+          <li>
+            <span className="swatch" style={{ background: '#E36BAE' }} /> User · <span className="swatch" style={{ background: '#20B2AA' }} /> Team (crates.io)
+          </li>
+          <li>
+            <span className="line" style={{ background: '#E36BAE' }} /> OWNS · <span className="line" style={{ background: '#C9A227' }} /> PUBLISHED (width = uploads)
           </li>
         </ul>
         )}
@@ -233,7 +690,7 @@ export function DetailsPanel({ view, onExpandDeps, selected, nodeById, onExpand,
   return (
     <div className="details">
       <h2>
-        <span className={`badge ${isCrate(node) ? 'crate' : isVersion(node) ? 'version' : ''}`}>{node.labels.join(':')}</span>{' '}
+        <span className={`badge ${isCrate(node) ? 'crate' : isVersion(node) ? 'version' : isUser(node) ? 'user' : isTeam(node) ? 'team' : ''}`}>{node.labels.join(':')}</span>{' '}
         {nodeTitle(node)}
       </h2>
 
@@ -265,6 +722,12 @@ export function DetailsPanel({ view, onExpandDeps, selected, nodeById, onExpand,
             <button disabled={busy} onClick={() => onExpand(node.id, 'in', ['INVOKES'])}>
               Invoked by
             </button>
+            <button disabled={busy} onClick={() => onExpand(node.id, 'in', ['OWNS'])} title="Add the crates.io owners (users and teams)">
+              Owners
+            </button>
+            <button disabled={busy} onClick={() => onExpand(node.id, 'in', ['PUBLISHED'])} title="Add every user who uploaded a version">
+              Publishers
+            </button>
           </>
         )}
         {isVersion(node) && (
@@ -278,6 +741,26 @@ export function DetailsPanel({ view, onExpandDeps, selected, nodeById, onExpand,
             <button disabled={busy} onClick={() => onExpand(node.id, 'both', ['VERSION_OF'])}>
               Crate
             </button>
+            {view === 'default' && (
+              <button disabled={busy} onClick={() => onExpand(node.id, 'in', ['PUBLISHED'])} title="Add the user who uploaded this version">
+                Uploader
+              </button>
+            )}
+          </>
+        )}
+        {(isUser(node) || isTeam(node)) && (
+          <>
+            <button disabled={busy} className="primary" onClick={() => onOpenUser(String(node.properties.login ?? ''))} title="Open in the Publishers view">
+              Open publisher
+            </button>
+            <button disabled={busy} onClick={() => onExpand(node.id, 'out', ['OWNS'])} title="Add the crates this account owns">
+              Owns
+            </button>
+            {isUser(node) && (
+              <button disabled={busy} onClick={() => onExpand(node.id, 'out', ['PUBLISHED'])} title="Add crates and versions this user uploaded (capped at 100)">
+                Published
+              </button>
+            )}
           </>
         )}
         {view === 'default' && (
@@ -290,9 +773,32 @@ export function DetailsPanel({ view, onExpandDeps, selected, nodeById, onExpand,
         </button>
       </div>
 
-      {isVersion(node) && <UnsafeSummary p={node.properties} />}
+      {isCrate(node) && <CrateRegistrySummary p={node.properties} onOpenUser={onOpenUser} />}
+      {isVersion(node) && (
+        <>
+          <VersionRegistrySummary p={node.properties} onOpenUser={onOpenUser} />
+          <UnsafeSummary p={node.properties} />
+          <BuildSummary p={node.properties} />
+          <NativeSummary p={node.properties} />
+          <DiffSummary p={node.properties} />
+        </>
+      )}
+      {(isUser(node) || isTeam(node)) && (
+        <>
+          <h3>crates.io {isTeam(node) ? 'team' : 'user'}</h3>
+          <p className="muted">
+            {String(node.properties.name ?? '')}
+            {isUser(node) && (
+              <>
+                {' '}
+                · <ExtLink href={`https://github.com/${String(node.properties.login ?? '')}`} />
+              </>
+            )}
+          </p>
+        </>
+      )}
       <h3>Properties</h3>
-      <Properties props={node.properties} />
+      <Properties props={Object.fromEntries(Object.entries(node.properties).filter(([k]) => !SUMMARISED.test(k)))} />
       <p className="muted small">elementId {node.id}</p>
     </div>
   );

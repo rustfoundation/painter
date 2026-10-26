@@ -960,3 +960,279 @@ table.unsafe-deps-table td {
 .details .meter.inline {
   width: 50px;
 }
+
+/* ---------- build scripts / native code / diffs views ---------- */
+.flag.links {
+  border-color: #b88bff;
+  color: #b88bff;
+}
+
+.flag.native {
+  border-color: #4c8dff;
+  color: #4c8dff;
+}
+
+.flag.vendored {
+  border-color: #f5a623;
+  color: #f5a623;
+}
+
+.flag.approx {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.flag.first {
+  border-color: var(--muted);
+  color: var(--muted);
+}
+
+.tile.links-tile {
+  min-width: 180px;
+  max-height: 120px;
+  overflow: auto;
+}
+
+.links-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  font-size: 12px;
+  columns: 2;
+  column-gap: 14px;
+}
+
+.links-list li {
+  break-inside: avoid;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.links-list a,
+.unsafe-table a.link-name {
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.links-list a.active {
+  font-weight: 600;
+  text-decoration: underline;
+}
+
+.lang-chips {
+  display: inline-flex;
+  gap: 3px;
+}
+
+.lang-chip {
+  display: inline-block;
+  font-size: 10px;
+  line-height: 14px;
+  padding: 0 4px;
+  border-radius: 3px;
+  color: #fff;
+}
+
+.unsafe-table td.dirs {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.unsafe-table td code,
+.diff-files code {
+  font-size: 11px;
+}
+
+.added {
+  color: #2bb673;
+}
+
+.removed {
+  color: #e5484d;
+}
+
+.diff-files {
+  flex: 1;
+  min-width: 320px;
+}
+
+table.diff-files-table {
+  border-collapse: collapse;
+  font-size: 12px;
+  margin-top: 6px;
+}
+
+table.diff-files-table td {
+  padding: 1px 10px 1px 0;
+  border: 0;
+  white-space: nowrap;
+}
+
+table.diff-files-table td.path {
+  max-width: 520px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.status {
+  display: inline-block;
+  width: 12px;
+  text-align: center;
+  font-weight: 600;
+}
+
+.status.added {
+  color: #2bb673;
+}
+
+.status.removed {
+  color: #e5484d;
+}
+
+.status.modified {
+  color: #f5a623;
+}
+
+.details ul.diff-top li {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------- publishers / releases / supply chain views (registry job) ---------- */
+.badge.user {
+  background: #e36bae33;
+  color: #f4a7d0;
+}
+
+.badge.team {
+  background: #20b2aa33;
+  color: #7fe0da;
+}
+
+.user-link,
+.details a.ext {
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.user-link:hover,
+.details a.ext:hover {
+  text-decoration: underline;
+}
+
+.flag.yanked {
+  border-color: var(--danger);
+  color: var(--danger);
+  margin-left: 6px;
+}
+
+.flag.unsafe {
+  border-color: #e5484d;
+  color: #e5484d;
+}
+
+.flag.joined {
+  border-color: #c9a227;
+  color: #c9a227;
+  margin-left: 6px;
+}
+
+.flag.role-publisher {
+  border-color: #c9a227;
+  color: #c9a227;
+}
+
+.flag.role-owner {
+  border-color: #e36bae;
+  color: #e36bae;
+}
+
+.flag.role-both {
+  border-color: #b88bff;
+  color: #b88bff;
+}
+
+.flag.category {
+  border-color: var(--accent);
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+
+.flag.keyword {
+  margin-bottom: 4px;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.unsafe-table td.warn,
+.unsafe-table td.warn a {
+  color: #f5a623;
+  font-weight: 600;
+}
+
+.unsafe-table td.desc {
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.unsafe-controls .search {
+  min-width: 320px;
+}
+
+.unsafe-controls .views button.active,
+.unsafe-controls button.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.unsafe-controls .presets {
+  display: inline-flex;
+  gap: 2px;
+}
+
+.unsafe-controls .presets button {
+  padding: 3px 7px;
+  font-size: 11px;
+}
+
+.unsafe-controls input[type='date'] {
+  color-scheme: dark;
+}
+
+.pad-x {
+  padding-left: 12px;
+  padding-right: 12px;
+}
+
+.explain {
+  margin: 6px 0 0;
+}
+
+.crate-description {
+  margin: 0 0 6px;
+  white-space: pre-line;
+}
+
+.details table.owners th {
+  width: 50%;
+  color: inherit;
+  font-weight: 500;
+}
+
+.tile a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.tile a:hover {
+  text-decoration: underline;
+}

@@ -22,6 +22,12 @@ import { StatusBar } from './components/StatusBar';
 import { MapView } from './components/MapView';
 import { CallersView } from './components/CallersView';
 import { UnsafeView } from './components/UnsafeView';
+import { BuildView } from './components/BuildView';
+import { NativeView } from './components/NativeView';
+import { DiffsView } from './components/DiffsView';
+import { PublishersView } from './components/PublishersView';
+import { ReleasesView } from './components/ReleasesView';
+import { SupplyView } from './components/SupplyView';
 
 const DEFAULT_OPTIONS: CrateLoadOptions = { versions: 'latest', deps: true, invokes: true, dependents: false, limit: 200 };
 const DEFAULT_DEPS_LIMIT = 5000;
@@ -55,6 +61,8 @@ export function App() {
   const [mapTarget, setMapTarget] = useState<{ name: string; nonce: number } | null>(null);
   const [mapBudget, setMapBudget] = useState(600);
   const [mapMeta, setMapMeta] = useState<{ mode: string; level: number; inView: number; total: number; nodes: number; rels: number; elapsedMs: number } | null>(null);
+  /** Publishers view: login to open, set from the details panel and the other registry views. */
+  const [publisherTarget, setPublisherTarget] = useState<{ login: string; nonce: number } | null>(null);
 
   const fitAll = useCallback(() => {
     const nvl = nvlRef.current;
@@ -211,7 +219,7 @@ export function App() {
     [loadChain],
   );
 
-  /** From the Unsafe view: switch to Default and load one crate. */
+  /** From the Unsafe / Build scripts / Native code / Diffs views: switch to Default and load one crate. */
   const openInGraph = useCallback(
     (name: string) => {
       setView('default');
@@ -222,6 +230,13 @@ export function App() {
     },
     [loadCrate],
   );
+
+  /** From anywhere: switch to Publishers and open one crates.io login. */
+  const openUser = useCallback((login: string) => {
+    setView('publishers');
+    setError(null);
+    setPublisherTarget({ login, nonce: Date.now() });
+  }, []);
 
   const expand = useCallback(async (id: string, direction: 'in' | 'out' | 'both', types: ExpandType[]) => {
     setBusy(true);
@@ -344,6 +359,18 @@ export function App() {
           <CallersView busy={busy} onBusy={setBusy} onError={setError} />
         ) : view === 'unsafe' ? (
           <UnsafeView busy={busy} onBusy={setBusy} onError={setError} onOpenCrate={openInGraph} />
+        ) : view === 'build' ? (
+          <BuildView busy={busy} onBusy={setBusy} onError={setError} onOpenCrate={openInGraph} />
+        ) : view === 'native' ? (
+          <NativeView busy={busy} onBusy={setBusy} onError={setError} onOpenCrate={openInGraph} />
+        ) : view === 'diffs' ? (
+          <DiffsView busy={busy} onBusy={setBusy} onError={setError} onOpenCrate={openInGraph} />
+        ) : view === 'publishers' ? (
+          <PublishersView busy={busy} onBusy={setBusy} onError={setError} onOpenCrate={openInGraph} onOpenUser={openUser} target={publisherTarget} />
+        ) : view === 'releases' ? (
+          <ReleasesView busy={busy} onBusy={setBusy} onError={setError} onOpenCrate={openInGraph} onOpenUser={openUser} />
+        ) : view === 'supply' ? (
+          <SupplyView busy={busy} onBusy={setBusy} onError={setError} onOpenCrate={openInGraph} onOpenUser={openUser} />
         ) : view === 'map' ? (
           <MapView
             target={mapTarget}
@@ -402,6 +429,7 @@ export function App() {
             onExpand={(id, dir, types) => void expand(id, dir, types)}
             onRemove={remove}
             onLoadCrate={(n) => void (view === 'deps' ? loadChain(n, true) : loadCrate(n))}
+            onOpenUser={openUser}
             busy={busy}
           />
         </aside>

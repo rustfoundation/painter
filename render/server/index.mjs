@@ -15,6 +15,39 @@ import { config, describeConfig } from './config.mjs';
 import { collectGraph } from './graph.mjs';
 import { findCallers, normCrate } from './callers.mjs';
 import { SORTS as UNSAFE_SORTS, unsafeCrate, unsafeDeps, unsafeStats, unsafeTop } from './unsafe.mjs';
+import {
+  BUILD_SORTS,
+  DIFF_SORTS,
+  NATIVE_SORTS,
+  buildCrate,
+  buildLinks,
+  buildStats,
+  buildTop,
+  diffCrate,
+  diffStats,
+  diffTop,
+  diffVersion,
+  nativeCrate,
+  nativeStats,
+  nativeTop,
+} from './metadata.mjs';
+import {
+  RELEASE_SORTS,
+  RELEASE_SOURCES,
+  busFactor,
+  crateRegistry,
+  dateRange,
+  newUploaders,
+  ownerAdditions,
+  parseInstant,
+  publisherLeaderboards,
+  registryStats,
+  releases,
+  releasesHistogram,
+  searchUsers,
+  userProfile,
+  versionPublisher,
+} from './registry.mjs';
 import { createLodJobs } from './lod/jobs.mjs';
 import { LodIndex } from './lod/index.mjs';
 
@@ -272,7 +305,8 @@ api.post(
   wrap(async (req, res) => {
     const { id, direction = 'both', types = [], limit } = req.body ?? {};
     if (typeof id !== 'string' || !id) return res.status(400).json({ error: 'id (elementId) is required' });
-    const allowed = ['VERSION_OF', 'DEPENDS_ON', 'INVOKES'];
+    // OWNS / PUBLISHED bring User and Team nodes onto the canvas (registry job).
+    const allowed = ['VERSION_OF', 'DEPENDS_ON', 'INVOKES', 'OWNS', 'PUBLISHED'];
     const requested = Array.isArray(types) && types.length ? types.filter((t) => allowed.includes(t)) : allowed;
     const plain = requested.filter((t) => t !== 'INVOKES');
     const cap = neo4j.int(clampLimit(limit, 100));
@@ -741,6 +775,8 @@ const lodJobs = createLodJobs({
 // ---------------------------------------------------------------------------
 
 const readRows = (cypher, params) => readGraph(cypher, params).then((g) => g.rows);
+/** For the whole-scope stats aggregations: a label scan of every version, which under import load can exceed the default timeout. */
+const readRowsSlow = (cypher, params) => readGraph(cypher, params, { timeoutMs: config.depsTimeoutMs }).then((g) => g.rows);
 const unsafeScope = (v) => (v === 'all' ? 'all' : 'latest');
 const unsafeTri = (v) => (v === 'yes' || v === 'no' ? v : 'any');
 const nonNegInt = (v, fallback = 0) => {
@@ -760,7 +796,7 @@ api.get(
     const hit = unsafeStatsCache.get(scope);
     if (hit && Date.now() - hit.at < UNSAFE_STATS_TTL_MS) return res.json({ ...hit.value, cached: true });
     const started = Date.now();
-    const value = { ...(await unsafeStats(readRows, scope)), elapsedMs: Date.now() - started };
+    const value = { ...(await unsafeStats(readRowsSlow, scope)), elapsedMs: Date.now() - started };
     unsafeStatsCache.set(scope, { at: Date.now(), value });
     res.json({ ...value, cached: false });
   }),
@@ -816,6 +852,319 @@ api.get(
     });
     if (!result) return res.status(404).json({ error: `no ${req.query.version ? `version ${req.query.version}` : 'latest version'} of crate '${crate}'` });
     res.json({ ...result, meta: { elapsedMs: Date.now() - started } });
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// Build scripts / Native code / Diffs views: generate-metadata properties on
+// Version nodes (see metadata.mjs). Same shape as the Unsafe routes: cached
+// stats per scope, a server-sorted leaderboard with `hasMore`, a per-crate history.
+// ---------------------------------------------------------------------------
+
+const metaStatsCache = new Map();
+const META_STATS_TTL_MS = 60_000;
+
+/** Serve `fn(readRowsSlow, scope)` from a 60 s cache keyed by view and scope. */
+const cachedStats = (key, fn) =>
+  wrap(async (req, res) => {
+    const scope = unsafeScope(req.query.scope);
+    const cacheKey = `${key}:${scope}`;
+    const hit = metaStatsCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < META_STATS_TTL_MS) return res.json({ ...hit.value, cached: true });
+    const started = Date.now();
+    const value = { ...(await fn(readRowsSlow, scope)), elapsedMs: Date.now() - started };
+    metaStatsCache.set(cacheKey, { at: Date.now(), value });
+    res.json({ ...value, cached: false });
+  });
+
+const sortKey = (sorts, requested, fallback) => (Object.hasOwn(sorts, String(requested)) ? String(requested) : fallback);
+
+/** `?scope`: build-script coverage, sizes, and the top `links` libraries. */
+api.get('/build/stats', cachedStats('build', buildStats));
+
+/** `?scope&sort&dir&q&links&link&custom&minLines&limit&offset`: versions with a build script (`link` = exact `links` name). */
+api.get(
+  '/build/top',
+  wrap(async (req, res) => {
+    const started = Date.now();
+    const sort = sortKey(BUILD_SORTS, req.query.sort, 'lines');
+    const scope = unsafeScope(req.query.scope);
+    const result = await buildTop(readRows, {
+      scope,
+      sort,
+      desc: req.query.dir !== 'asc',
+      q: String(req.query.q ?? '').trim(),
+      links: unsafeTri(req.query.links),
+      link: String(req.query.link ?? '').trim(),
+      custom: unsafeTri(req.query.custom),
+      minLines: nonNegInt(req.query.minLines),
+      limit: clampLimit(req.query.limit, 100),
+      offset: nonNegInt(req.query.offset),
+    });
+    res.json({ ...result, meta: { elapsedMs: Date.now() - started, sort, scope } });
+  }),
+);
+
+/** `?scope&limit`: `links` libraries ranked by distinct crates. */
+api.get(
+  '/build/links',
+  wrap(async (req, res) => {
+    const started = Date.now();
+    const rows = await buildLinks(readRows, unsafeScope(req.query.scope), clampLimit(req.query.limit, 50));
+    res.json({ rows, meta: { elapsedMs: Date.now() - started } });
+  }),
+);
+
+/** Every version of a crate with its build-script facts, oldest first. */
+api.get(
+  '/build/crate/:name',
+  wrap(async (req, res) => {
+    const name = String(req.params.name);
+    res.json({ name, versions: await buildCrate(readRows, name) });
+  }),
+);
+
+/** `?scope`: native-code coverage, totals, language / directory breakdowns. */
+api.get('/native/stats', cachedStats('native', nativeStats));
+
+const NATIVE_LANGS = new Set(['c', 'c++', 'objc', 'asm']);
+
+/** `?scope&sort&dir&q&vendored&prebuilt&lang&minLines&limit&offset`: versions with native code. */
+api.get(
+  '/native/top',
+  wrap(async (req, res) => {
+    const started = Date.now();
+    const sort = sortKey(NATIVE_SORTS, req.query.sort, 'lines');
+    const scope = unsafeScope(req.query.scope);
+    const lang = String(req.query.lang ?? '').trim().toLowerCase();
+    const result = await nativeTop(readRows, {
+      scope,
+      sort,
+      desc: req.query.dir !== 'asc',
+      q: String(req.query.q ?? '').trim(),
+      vendored: unsafeTri(req.query.vendored),
+      prebuilt: unsafeTri(req.query.prebuilt),
+      lang: NATIVE_LANGS.has(lang) ? lang : '',
+      minLines: nonNegInt(req.query.minLines),
+      limit: clampLimit(req.query.limit, 100),
+      offset: nonNegInt(req.query.offset),
+    });
+    res.json({ ...result, meta: { elapsedMs: Date.now() - started, sort, scope } });
+  }),
+);
+
+/** Every version of a crate with its native-code facts, oldest first. */
+api.get(
+  '/native/crate/:name',
+  wrap(async (req, res) => {
+    const name = String(req.params.name);
+    res.json({ name, versions: await nativeCrate(readRows, name) });
+  }),
+);
+
+/** `?scope`: diff coverage, totals, and a churn histogram. */
+api.get('/diffs/stats', cachedStats('diffs', diffStats));
+
+/** `?scope&sort&dir&q&firsts&approximate&minChurn&limit&offset`: the biggest version-to-version changes. */
+api.get(
+  '/diffs/top',
+  wrap(async (req, res) => {
+    const started = Date.now();
+    const sort = sortKey(DIFF_SORTS, req.query.sort, 'churn');
+    const scope = unsafeScope(req.query.scope);
+    const firsts = ['exclude', 'include', 'only'].includes(String(req.query.firsts)) ? String(req.query.firsts) : 'exclude';
+    const result = await diffTop(readRows, {
+      scope,
+      sort,
+      desc: req.query.dir !== 'asc',
+      q: String(req.query.q ?? '').trim(),
+      firsts,
+      approximate: unsafeTri(req.query.approximate),
+      minChurn: nonNegInt(req.query.minChurn),
+      limit: clampLimit(req.query.limit, 100),
+      offset: nonNegInt(req.query.offset),
+    });
+    res.json({ ...result, meta: { elapsedMs: Date.now() - started, sort, scope, firsts } });
+  }),
+);
+
+/** Every version of a crate with its diff totals, oldest first: the change history. */
+api.get(
+  '/diffs/crate/:name',
+  wrap(async (req, res) => {
+    const name = String(req.params.name);
+    res.json({ name, versions: await diffCrate(readRows, name) });
+  }),
+);
+
+/** `?crate&version`: the changed files of one version against its predecessor. */
+api.get(
+  '/diffs/version',
+  wrap(async (req, res) => {
+    const crate = String(req.query.crate ?? '').trim();
+    const version = String(req.query.version ?? '').trim();
+    if (!crate || !version) return res.status(400).json({ error: 'crate and version are required' });
+    const result = await diffVersion(readRows, { crate, version });
+    if (!result) return res.status(404).json({ error: `no version ${version} of crate '${crate}'` });
+    res.json(result);
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// Publishers / Releases / Supply chain views: crates.io registry data (users, teams,
+// OWNS, PUBLISHED, dates; see registry.mjs). Everything is index-backed and LIMITed;
+// the leaderboards and coverage stats aggregate whole relationship types and are cached.
+// ---------------------------------------------------------------------------
+
+const REGISTRY_CACHE_TTL_MS = 10 * 60_000;
+const registryCache = new Map();
+
+/** Serve `fn()` from a 10 min cache under `key`, with the long timeout (same pattern as the stats endpoints). */
+const cachedRegistry = async (key, fn) => {
+  const hit = registryCache.get(key);
+  if (hit && Date.now() - hit.at < REGISTRY_CACHE_TTL_MS) return { ...hit.value, cached: true };
+  const started = Date.now();
+  const value = { ...(await fn(readRowsSlow)), elapsedMs: Date.now() - started };
+  registryCache.set(key, { at: Date.now(), value });
+  return { ...value, cached: false };
+};
+
+/** Registry coverage: users, teams, owners, uploads, how many crates / versions the dump reached. */
+api.get(
+  '/registry/stats',
+  wrap(async (_req, res) => {
+    res.json(await cachedRegistry('stats', registryStats));
+  }),
+);
+
+/** `?q&limit`: users whose login starts with `q` (index seek), plus teams containing it. */
+api.get(
+  '/publishers/search',
+  wrap(async (req, res) => {
+    const q = String(req.query.q ?? '').trim();
+    if (!q) return res.json({ users: [], teams: [] });
+    res.json(await searchUsers(readRows, q, clampLimit(req.query.limit, 20)));
+  }),
+);
+
+/** One user or team: crates published / owned, upload timeline, totals. */
+api.get(
+  '/publishers/user/:login',
+  wrap(async (req, res) => {
+    const started = Date.now();
+    const login = String(req.params.login).trim();
+    const profile = await userProfile(readRows, login);
+    if (!profile) return res.status(404).json({ error: `no user or team with login '${login}'` });
+    res.json({ ...profile, meta: { elapsedMs: Date.now() - started } });
+  }),
+);
+
+/** Most prolific publishers (crates, uploads) and the owners / publishers of the most-downloaded crates. */
+api.get(
+  '/publishers/leaderboards',
+  wrap(async (_req, res) => {
+    res.json(await cachedRegistry('leaderboards', (read) => publisherLeaderboards(read, 100)));
+  }),
+);
+
+const releaseArgs = (query) => {
+  const kind = query.kind === 'crates' ? 'crates' : 'versions';
+  const sources = RELEASE_SOURCES[kind];
+  const source = sources.includes(String(query.source)) ? String(query.source) : sources[0];
+  return { kind, source, ...dateRange(query.from, query.to, kind === 'crates' ? 30 : 7) };
+};
+
+/**
+ * `?kind=crates|versions&source&from&to&q&minDownloads&sort=date|downloads|name&dir&limit&offset`:
+ * crates or versions published in `[from, to]` (`to` inclusive as a date). Sorting by
+ * anything but the date materialises the whole range, so it gets the long timeout.
+ */
+api.get(
+  '/releases',
+  wrap(async (req, res) => {
+    const started = Date.now();
+    const args = releaseArgs(req.query);
+    const sort = RELEASE_SORTS.includes(String(req.query.sort)) ? String(req.query.sort) : 'date';
+    const result = await releases(sort === 'date' ? readRows : readRowsSlow, {
+      ...args,
+      sort,
+      desc: req.query.dir !== 'asc',
+      q: String(req.query.q ?? '').trim(),
+      minDownloads: nonNegInt(req.query.minDownloads),
+      limit: clampLimit(req.query.limit, 100),
+      offset: nonNegInt(req.query.offset),
+    });
+    res.json({ ...result, meta: { ...args, sort, elapsedMs: Date.now() - started } });
+  }),
+);
+
+/** `?kind&source&from&to`: releases per day (<= 92 days) or month in the range; cached per range. */
+api.get(
+  '/releases/histogram',
+  wrap(async (req, res) => {
+    const args = releaseArgs(req.query);
+    res.json(await cachedRegistry(`hist:${args.kind}:${args.source}:${args.from}:${args.to}`, (read) => releasesHistogram(read, args)));
+  }),
+);
+
+const topN = (v) => Math.min(50_000, Math.max(100, nonNegInt(v, 2000) || 2000));
+
+/** `?top&limit&offset`: among the top N crates by downloads, those with exactly one User owner and no Team. */
+api.get(
+  '/supply/bus-factor',
+  wrap(async (req, res) => {
+    const started = Date.now();
+    const top = topN(req.query.top);
+    const result = await busFactor(readRowsSlow, { top, limit: clampLimit(req.query.limit, 100), offset: nonNegInt(req.query.offset) });
+    res.json({ ...result, meta: { top, elapsedMs: Date.now() - started } });
+  }),
+);
+
+/** `?since&minDownloads&self=exclude|include&limit&offset`: owners added since a date to popular crates. */
+api.get(
+  '/supply/owner-additions',
+  wrap(async (req, res) => {
+    const started = Date.now();
+    const since = parseInstant(req.query.since, new Date(Date.now() - 180 * 86_400_000).toISOString());
+    const self = req.query.self === 'include' ? 'include' : 'exclude';
+    const minDownloads = nonNegInt(req.query.minDownloads, 100_000);
+    const result = await ownerAdditions(readRowsSlow, { since, minDownloads, self, limit: clampLimit(req.query.limit, 100), offset: nonNegInt(req.query.offset) });
+    res.json({ ...result, meta: { since, minDownloads, self, elapsedMs: Date.now() - started } });
+  }),
+);
+
+/** `?top&limit&offset`: among the top N crates, latest versions uploaded by a first-time uploader of the crate. */
+api.get(
+  '/supply/new-uploaders',
+  wrap(async (req, res) => {
+    const started = Date.now();
+    const top = topN(req.query.top);
+    const result = await newUploaders(readRowsSlow, { top, limit: clampLimit(req.query.limit, 100), offset: nonNegInt(req.query.offset) });
+    res.json({ ...result, meta: { top, elapsedMs: Date.now() - started } });
+  }),
+);
+
+/** Owners, publishers, categories, keywords of one crate (side panel). */
+api.get(
+  '/registry/crate/:name',
+  wrap(async (req, res) => {
+    const name = String(req.params.name);
+    const result = await crateRegistry(readRows, name);
+    if (!result) return res.status(404).json({ error: `crate '${name}' not found` });
+    res.json(result);
+  }),
+);
+
+/** `?crate&version`: who uploaded one version and when (side panel). */
+api.get(
+  '/registry/version',
+  wrap(async (req, res) => {
+    const crate = String(req.query.crate ?? '').trim();
+    const version = String(req.query.version ?? '').trim();
+    if (!crate || !version) return res.status(400).json({ error: 'crate and version are required' });
+    const result = await versionPublisher(readRows, { crate, version });
+    if (!result) return res.status(404).json({ error: `no version ${version} of crate '${crate}'` });
+    res.json(result);
   }),
 );
 
@@ -1017,10 +1366,18 @@ const server = app.listen(config.port, config.host, () => {
 
 // Do not block serving on Neo4j being up; the compose stack may start the
 // database slower than this container. /api/health reports the real state.
-waitForNeo4j().catch((err) => {
-  log(`giving up on neo4j: ${err.message}`);
-  process.exit(1);
-});
+waitForNeo4j()
+  .then(() => {
+    // Registry coverage is a label scan of every version (seconds, tens of seconds under
+    // import load); warm its 10 min cache once so the first Publishers visit has numbers.
+    cachedRegistry('stats', registryStats)
+      .then((s) => log(`registry stats warmed in ${s.elapsedMs} ms`))
+      .catch((err) => log(`registry stats warm-up failed: ${err.message}`));
+  })
+  .catch((err) => {
+    log(`giving up on neo4j: ${err.message}`);
+    process.exit(1);
+  });
 
 const shutdown = async (signal) => {
   log(`received ${signal}, shutting down`);

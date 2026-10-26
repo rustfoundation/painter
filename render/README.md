@@ -19,6 +19,9 @@ render/
     config.mjs        every setting, read from env at startup
     graph.mjs         neo4j records -> {nodes, rels, rows}
     callers.mjs       reverse call-graph walk for the Callers view, Cargo requirement matching
+    unsafe.mjs        Unsafe view queries over the generate-metadata unsafe properties
+    metadata.mjs      Build scripts / Native code / Diffs view queries over the build / native / diff properties
+    registry.mjs      Publishers / Releases / Supply chain view queries over the registry job's User, Team, OWNS, PUBLISHED, dates
     index.mjs         routes
     lod/              Map view precompute (layout + communities) and viewport index
       build.mjs       full build / incremental update pipeline
@@ -29,7 +32,9 @@ render/
       neo4j-io.mjs    streaming reads, batched writes
   src/
     App.tsx           view switching, Default and Deps canvases
-    components/       Toolbar, DetailsPanel, CypherPanel, StatusBar, MapView, CallersView
+    components/       Toolbar, DetailsPanel, CypherPanel, StatusBar, MapView, CallersView, UnsafeView,
+                      BuildView, NativeView, DiffsView, PublishersView, ReleasesView, SupplyView
+                      (+ meta.tsx: tiles, histogram, leaderboard hook, history strip, date helpers, UserLink they share)
     api.ts            API client + types
     graph.ts          store -> NVL elements, colours
   Dockerfile          two-stage; final image runs `node server/index.mjs`
@@ -79,7 +84,14 @@ Database side: create the constraints and indexes in `docker/queries.md`.
 `idx_crate_name_text` is what makes partial-name search fast;
 `const_symbol_name` is what makes the Callers view fast: each step is one seek
 per function name on `Symbol.name`, then its callers. The Map build creates its
-own `lod_*` indexes.
+own `lod_*` indexes. The Build scripts / Native code / Diffs leaderboards use
+`idx_has_build_script`, `idx_version_links`, `idx_has_native_code`,
+`idx_vendored_native`, and `idx_diff_lines_added` (each builds in seconds).
+The Publishers / Releases / Supply chain views need the registry job's indexes
+(`painter generate-metadata --job registry` creates them): `idx_user_login`,
+`idx_published_at` (a relationship range index on `PUBLISHED.at`),
+`idx_owns_since`, `idx_version_published_at`, `idx_crate_created_at`, and
+`idx_crate_downloads`.
 
 To get the Map view working you also need the precompute, see below. The
 Default and Deps views work as soon as the graph has data.
@@ -244,7 +256,7 @@ calibration for headless checks.
 
 ### Unsafe
 
-A leaderboard of crate versions by the unsafe-code metrics `painter count-unsafe`
+A leaderboard of crate versions by the unsafe-code metrics `painter generate-metadata`
 stores on `Version` nodes (geiger's counters per category, source size,
 `#![forbid(unsafe_code)]` on the crate root, build scripts). Tiles at the top give
 scan coverage, the share of versions with any unsafe, the totals per category
@@ -264,6 +276,124 @@ skipped, each dependency at its latest version), most unsafe first.
 In the graph views a scanned version's caption shows `☢N` when it has unsafe
 code, and the side panel has an Unsafe section with the same breakdown.
 
+### Build scripts, Native code, Diffs
+
+Three more leaderboards over what `painter generate-metadata` stores on
+`Version` nodes (jobs `build`, `native`, `diff`; see `docker/queries.md` for the
+property list). They share the Unsafe view's shape: coverage and total tiles at
+the top (click a tile to sort or filter by it), scope latest / all versions,
+server-side sort on every column, filters, paging, Copy TSV, and clicking a row
+opens the crate's per-version history (one bar per version, oldest left, latest
+outlined; click a bar to filter to that crate) plus "Open in graph". A run of
+`generate-metadata` may still be in progress: coverage says how many versions
+each job has reached, and versions it has not reached are simply absent.
+
+**Build scripts**: versions Cargo would run a build script for, with the
+script's path (`package.build`, normally `build.rs`), its line count, and the
+`package.links` library it claims. Tiles: coverage (the unsafe scanner also
+stored `has_build_script`, so "with a build script" is over every version where
+it is known), share declaring `links`, custom script paths, total script lines,
+a size histogram, and the most-linked libraries by distinct crate (click one, or
+a `links` cell, to filter to it). Filters: name, links yes/no, exact links name,
+custom path, min lines. Flags show native / vendored code.
+
+**Native code**: versions shipping C / C++ / Objective-C / assembly sources or
+headers, or prebuilt binaries. Columns: native lines (sources + headers,
+non-blank), source-only lines, files, bytes, largest file, lines under
+`vendor/`-style directories, prebuilt binary count, top-level directories, and
+language chips. Tiles: coverage, share with native code, share that is a
+vendored library (the thresholds are in `docker/queries.md`), prebuilt binaries,
+native + build script, one tile per language (click to filter), a lines
+histogram, and where the code lives. Filters: name, vendored, prebuilt,
+language, min lines. The history bar is native lines, orange when vendored.
+
+**Diffs**: what changed between consecutive versions (semver order,
+pre-releases before their release). Columns: churn (lines added + removed),
+lines added / removed, files added / removed / modified, files in the version,
+the base version. Tiles: coverage, lines added / removed (net), files changed,
+unchanged republishes (identical to the previous version), approximate diffs
+(a file hit the 2 s per-file bound), and a churn histogram. First versions are
+excluded by default (everything counts as added); `first versions` can include
+or isolate them. The expanded row shows the crate's history (bar height =
+churn, green added / red removed, first version grey; click a bar to switch)
+and the changed files of the shown version, biggest first, with `+ − ~` status
+and `binary` where there are no line counts.
+
+Captions in the graph views carry the same facts: `⚙` build script
+(`⚙→lib` when it declares `links`), `C` native code (`C!` vendored, `C+bin`
+with prebuilt binaries), `Δ+a/−r` lines changed since the previous version.
+The side panel of a `Version` has Build script, Native code, and Changes
+sections (the latter lists the eight biggest file changes; the per-file
+`diff_*` lists are left out of the raw property table).
+
+### Publishers, Releases, Supply chain
+
+Three views over the crates.io registry data `painter generate-metadata --job
+registry` loads from a crates.io database dump: `User` / `Team` nodes,
+`OWNS {since, added_by}` and `PUBLISHED {at, last, versions}` edges, categories
+and keywords, and the registry properties on `Crate` (downloads, dates,
+description, links, `trustpub_only`) and `Version` (`published_at`, `yanked`,
+license, size, downloads, edition, MSRV, targets). Dates come from the API as
+ISO strings. Every query is index-backed and LIMITed; the only whole-type
+aggregations (coverage, the prolific-publisher boards) are cached for 10
+minutes and run with the long timeout, like the other views' stats. Note that
+the crates.io index clone painter imports `Version` nodes from can lag the
+dump by days, so the newest versions in a dump may have no node yet; the
+crate-level `PUBLISHED.last` still reflects them.
+
+**Publishers**: type a login (prefix match on `User.login`, teams by substring)
+and Open, or click any login anywhere in the UI. Without a login the view shows
+registry coverage tiles (users, teams, ownerships, publisher pairs, yanked,
+trusted-publishing-only crates) and four leaderboards: most crates published,
+most uploads, owners of the top 5,000 crates by downloads (with how many they
+own alone), and publishers of those crates. A publisher page has totals
+(crates published and their downloads, uploads with first / last date, crates
+owned and sole ownerships, downloads of owned crates, and among the latest
+versions of their crates how many have unsafe code, build scripts, native code,
+or are yanked), an upload timeline (per month or year, from the version-level
+`PUBLISHED` edges, so nothing before 2017), and one table of every crate they
+published or own: role, downloads, versions, their uploads with first / last
+date, owner since and who added them, owner count (1 = sole owner, highlighted),
+latest version with its metadata badges. Client-side sort and role filter,
+Copy TSV; a crate row opens the crate in the Default graph. Teams have no
+uploads, only ownerships.
+
+**Releases**: crates or versions published in a date range (inclusive dates,
+presets for the last 24 h to 1 y). Crates by `Crate.created_at` (first-ever
+release) or by `PUBLISHED.at` on crate edges (a user's first upload of the
+crate; `joined` marks crates that existed before, i.e. a new publisher joining).
+Versions by `PUBLISHED.at` on version edges (uploader known) or by
+`Version.published_at` (every version, uploader when recorded). A strip above
+the table counts releases per day (ranges up to 92 days) or per month; click a
+bar to zoom the range to it. Filters: name contains, minimum downloads. Sorting
+by date walks the index in order and is fast for any range; sorting by
+downloads or name materialises the range (long timeout). Rows show publisher /
+owners (clickable), downloads, description or license / size / edition / MSRV
+and the metadata badges, `yanked`, `trustpub`.
+
+**Supply chain**: three boards of ownership signals, nothing precomputed, each
+bounded by a top-N of crates by downloads (`idx_crate_downloads`, 500 to
+20,000) or by an `OWNS.since` range. *Single-owner crates*: owned by exactly one
+user and no team, with when and by whom they became owner, how many other
+crates that account owns, how many distinct uploaders the crate has, the latest
+version and date, and the crate's dependency degree from the Map precompute.
+*Recent owner additions*: owners added since a date to crates above a download
+floor, by default only when added by someone else, with the new owner's
+account age, how many crates they publish, and whether they ever uploaded the
+crate. *New uploader shipped latest*: crates with more than one version whose
+latest version was uploaded by a user whose only upload of the crate it is,
+with whether they are an owner and their account age.
+
+In the graph views a `Crate`'s side panel has crates.io facts (description,
+downloads, versions, created / updated, repository / homepage / documentation
+links, trusted publishing), its owners (since, added by), publishers (uploads,
+first / last), categories and keywords; a `Version`'s panel shows published
+date, uploader, downloads, license, crate size, edition / MSRV, yanked, and
+lib / bin targets. Logins open the Publishers view. "Owners" / "Publishers"
+(crate) and "Uploader" (version) buttons add `User` (pink) and `Team` (teal)
+nodes with `OWNS` / `PUBLISHED` edges; from a user, "Owns" / "Published" expand
+the other way. Yanked versions carry a `⊘` caption badge.
+
 ## API
 
 JSON throughout. Graph payloads are
@@ -277,7 +407,7 @@ JSON throughout. Graph payloads are
 | `GET /api/stats` | node and relationship counts |
 | `GET /api/crates/search?q&limit` | crate names containing `q`, prefix first |
 | `GET /api/graph/crate/:name?versions&deps&invokes&dependents&limit` | Default view load; `name` may be partial, `meta.resolvedName` says what was picked |
-| `POST /api/graph/expand` | `{id, direction, types, limit}`: neighbours of a node |
+| `POST /api/graph/expand` | `{id, direction, types, limit}`: neighbours of a node (`VERSION_OF`, `DEPENDS_ON`, `INVOKES`, `OWNS`, `PUBLISHED`) |
 | `GET /api/graph/deps?crate&direction&limit` | crate-level direct neighbours; no `crate` = whole graph, capped and cached |
 | `GET /api/graph/deps/chain?q&limit&depth&exact` | Deps view: transitive chain, `meta.roots/depth/truncated` |
 | `GET /api/lod/status` | job state, `LodMeta`, index state, unpositioned count |
@@ -293,6 +423,28 @@ JSON throughout. Graph payloads are
 | `GET /api/unsafe/top?scope&sort&dir&q&forbids&build&minLines&minUnsafe&limit&offset` | Unsafe leaderboard rows, sorted and filtered server-side; `hasMore` for paging |
 | `GET /api/unsafe/crate/:name` | every version of a crate with its unsafe metrics, oldest first |
 | `GET /api/unsafe/deps?crate&version&depth&limit` | unsafe in a version's dependency closure (`depth` hops, dev-deps skipped, latest version of each dependency) |
+| `GET /api/build/stats?scope` | Build scripts tiles: coverage, links / custom-path counts, script-size histogram, top `links` (cached 60 s) |
+| `GET /api/build/top?scope&sort&dir&q&links&link&custom&minLines&limit&offset` | Build scripts leaderboard; `links` yes/no/any, `link` exact name, `custom` = not `build.rs`; `hasMore` for paging |
+| `GET /api/build/links?scope&limit` | `package.links` values by distinct crates, with sample crate names |
+| `GET /api/build/crate/:name` | every version of a crate with its build-script facts, oldest first |
+| `GET /api/native/stats?scope` | Native code tiles: coverage, vendored / prebuilt counts, totals, per-language and per-directory breakdowns, lines histogram (cached 60 s) |
+| `GET /api/native/top?scope&sort&dir&q&vendored&prebuilt&lang&minLines&limit&offset` | Native code leaderboard; `lang` is `c`, `c++`, `objc`, or `asm` |
+| `GET /api/native/crate/:name` | every version of a crate with its native-code facts, oldest first |
+| `GET /api/diffs/stats?scope` | Diffs tiles: coverage, lines / files totals over non-first versions, unchanged and approximate counts, churn histogram (cached 60 s) |
+| `GET /api/diffs/top?scope&sort&dir&q&firsts&approximate&minChurn&limit&offset` | Diffs leaderboard; `firsts` = `exclude` (default), `include`, `only` |
+| `GET /api/diffs/crate/:name` | every version of a crate with its diff totals, oldest first |
+| `GET /api/diffs/version?crate&version` | one version's changed files (`{path, status, added, removed, binary}`), biggest first; `files` null until diffed |
+| `GET /api/registry/stats` | registry coverage: users, teams, ownerships, publisher pairs, uploads, crates / versions reached by the dump, yanked, trustpub-only (cached 10 min) |
+| `GET /api/publishers/search?q&limit` | `{users, teams}`: logins starting with `q` (index seek; the typed, lowercase, and capitalised spellings), teams containing it |
+| `GET /api/publishers/user/:login` | a User or Team: properties, `crates` (published / owned merged by name with downloads and latest-version metadata), `timeline` (uploads per month), `totals` |
+| `GET /api/publishers/leaderboards` | `byCrates`, `byUploads` (all users), `owners`, `publishers` (over the top 5,000 crates by downloads), top 100 each (cached 10 min) |
+| `GET /api/releases?kind&source&from&to&q&minDownloads&sort&dir&limit&offset` | crates (`source=created\|publisher`) or versions (`source=publisher\|published_at`) published in `[from, to]`; `sort=date\|downloads\|name`; `hasMore` for paging |
+| `GET /api/releases/histogram?kind&source&from&to` | releases per day (≤ 92 days) or month in the range, with the total (cached 10 min per range) |
+| `GET /api/supply/bus-factor?top&limit&offset` | among the top N crates by downloads, those with one User owner and no Team |
+| `GET /api/supply/owner-additions?since&minDownloads&self&limit&offset` | owners added since a date to crates above a download floor; `self=exclude` (default) drops self-added |
+| `GET /api/supply/new-uploaders?top&limit&offset` | among the top N crates with > 1 version, latest versions uploaded by a first-time uploader of the crate |
+| `GET /api/registry/crate/:name` | owners, publishers, categories, keywords of one crate |
+| `GET /api/registry/version?crate&version` | uploader and dates of one version |
 | `GET /api/node/:id` | one node by `elementId` |
 | `POST /api/cypher` | `{query, params}`, read-only, row-capped; 403 when disabled |
 

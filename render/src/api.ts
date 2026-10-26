@@ -52,7 +52,7 @@ export interface Health {
 }
 
 /** Which graph the UI shows. */
-export type View = 'default' | 'deps' | 'map' | 'callers' | 'unsafe';
+export type View = 'default' | 'deps' | 'map' | 'callers' | 'unsafe' | 'build' | 'native' | 'diffs' | 'publishers' | 'releases' | 'supply';
 
 export const VIEWS: { id: View; label: string; title: string }[] = [
   { id: 'default', label: 'Default', title: 'Crates, versions, and their DEPENDS_ON / INVOKES edges' },
@@ -60,7 +60,17 @@ export const VIEWS: { id: View; label: string; title: string }[] = [
   { id: 'map', label: 'Map', title: 'Whole ecosystem on a precomputed layout; zoom in to resolve clusters into crates' },
   { id: 'callers', label: 'Callers', title: 'Table of every crate version and function that calls a function, directly or through other functions' },
   { id: 'unsafe', label: 'Unsafe', title: 'Leaderboard of crate versions by unsafe code: per-category counts, density, forbid(unsafe_code), build scripts, and the unsafe in their dependencies' },
+  { id: 'build', label: 'Build scripts', title: 'Crate versions with a build script: where it is, how big, what native library it links, and the most-linked libraries' },
+  { id: 'native', label: 'Native code', title: 'Crate versions shipping C / C++ / Objective-C / assembly sources, headers, or prebuilt binaries; vendored libraries' },
+  { id: 'diffs', label: 'Diffs', title: 'What changed between consecutive versions: files and lines added / removed, per crate history, per file' },
+  { id: 'publishers', label: 'Publishers', title: 'crates.io users and teams: who publishes and owns what, upload timelines, the most prolific publishers and the owners of the most-downloaded crates' },
+  { id: 'releases', label: 'Releases', title: 'Crates and versions published in a timeframe, with a per-day / per-month timeline' },
+  { id: 'supply', label: 'Supply chain', title: 'Ownership signals on popular crates: single-owner crates, recent owner additions, first-time uploaders of the latest version' },
 ];
+
+/** Views that are tables, not a graph canvas: no search box, layout, or edge toggles. */
+export const TABLE_VIEWS: ReadonlySet<View> = new Set<View>(['callers', 'unsafe', 'build', 'native', 'diffs', 'publishers', 'releases', 'supply']);
+export const isTableView = (v: View) => TABLE_VIEWS.has(v);
 
 /** Callers view: one function that reaches the searched function. */
 export interface CallerRow {
@@ -270,6 +280,497 @@ export interface UnsafeDepsResult {
   meta: { elapsedMs: number };
 }
 
+// ---------------------------------------------------------------------------
+// Build scripts / Native code / Diffs views (painter generate-metadata properties)
+// ---------------------------------------------------------------------------
+
+/** One crate version's build-script facts. Nulls where the build job has not run. */
+export interface BuildRow {
+  name: string;
+  version: string;
+  latest: boolean;
+  hasBuildScript: boolean | null;
+  /** Script path, normally `build.rs`. */
+  path: string | null;
+  lines: number | null;
+  /** `package.links`: the native library the script claims. */
+  links: string | null;
+  /** `meta_build` marker (job revision); null = not scanned. */
+  revision: string | null;
+  error: string | null;
+  rsLines: number | null;
+  unsafeTotal: number | null;
+  hasNativeCode: boolean;
+  vendoredNative: boolean;
+}
+
+export type BuildSort = 'lines' | 'name' | 'path' | 'links' | 'rsLines' | 'unsafe';
+
+export interface LinksRow {
+  links: string;
+  versions: number;
+  crates: number;
+  sample: string[];
+}
+
+export interface BuildStats {
+  scope: UnsafeScope;
+  versions: number;
+  /** Versions with the build job's marker. */
+  scanned: number;
+  /** Versions where has_build_script is set at all (the unsafe scanner stored it too). */
+  known: number;
+  unreadable: number;
+  withBuild: number;
+  withBuildScanned: number;
+  withLinks: number;
+  /** Scripts not at the default `build.rs`. */
+  custom: number;
+  /** Build script declared but not in the tarball. */
+  missingScript: number;
+  scriptLines: number;
+  /** Scanned build scripts by line count: 0–10, 11–50, 51–200, 201–1000, >1000. */
+  histogram: number[];
+  topLinks: LinksRow[];
+  elapsedMs: number;
+  cached: boolean;
+}
+
+export interface BuildTopQuery {
+  scope: UnsafeScope;
+  sort: BuildSort;
+  desc: boolean;
+  q: string;
+  links: UnsafeTri;
+  /** Exact `links` library name, '' for any. */
+  link: string;
+  custom: UnsafeTri;
+  minLines: number;
+  limit: number;
+  offset: number;
+}
+
+export type NativeLang = 'c' | 'c++' | 'objc' | 'asm';
+
+/** One crate version's native-code facts. Nulls where the native job has not run. */
+export interface NativeRow {
+  name: string;
+  version: string;
+  latest: boolean;
+  hasNativeCode: boolean | null;
+  vendored: boolean | null;
+  sourceFiles: number | null;
+  headerFiles: number | null;
+  sourceLines: number | null;
+  /** Non-blank lines in sources and headers. */
+  lines: number | null;
+  bytes: number | null;
+  largestBytes: number | null;
+  vendorDirLines: number | null;
+  langs: string[];
+  dirs: string[];
+  prebuilt: number | null;
+  revision: string | null;
+  error: string | null;
+  hasBuildScript: boolean;
+  links: string | null;
+}
+
+export type NativeSort = 'lines' | 'sourceLines' | 'files' | 'bytes' | 'largest' | 'vendorDirLines' | 'prebuilt' | 'name';
+
+export interface NativeStats {
+  scope: UnsafeScope;
+  versions: number;
+  scanned: number;
+  unreadable: number;
+  withNative: number;
+  vendored: number;
+  withPrebuilt: number;
+  nativeWithBuild: number;
+  nativeWithLinks: number;
+  sourceFiles: number;
+  headerFiles: number;
+  sourceLines: number;
+  lines: number;
+  bytes: number;
+  prebuiltFiles: number;
+  /** Versions with native code by native_lines: 1–100, 101–1k, 1k–10k, 10k–100k, >100k. */
+  histogram: number[];
+  langs: { lang: string; versions: number; crates: number; lines: number }[];
+  dirs: { dir: string; versions: number; crates: number }[];
+  elapsedMs: number;
+  cached: boolean;
+}
+
+export interface NativeTopQuery {
+  scope: UnsafeScope;
+  sort: NativeSort;
+  desc: boolean;
+  q: string;
+  vendored: UnsafeTri;
+  prebuilt: UnsafeTri;
+  lang: NativeLang | '';
+  minLines: number;
+  limit: number;
+  offset: number;
+}
+
+/** One crate version's changes against its predecessor. Nulls where the diff job has not run. */
+export interface DiffRow {
+  name: string;
+  version: string;
+  latest: boolean;
+  /** The version compared against; null for a crate's first version. */
+  base: string | null;
+  filesAdded: number | null;
+  filesRemoved: number | null;
+  filesModified: number | null;
+  filesTotal: number | null;
+  linesAdded: number | null;
+  linesRemoved: number | null;
+  /** Some file hit the per-file diff timeout; counts are an upper bound. */
+  approximate: boolean | null;
+  revision: string | null;
+  error: string | null;
+  /** Lines added + removed. */
+  churn: number;
+  filesChanged: number;
+  rsLines: number | null;
+}
+
+export type DiffSort = 'churn' | 'added' | 'removed' | 'filesChanged' | 'filesAdded' | 'filesRemoved' | 'filesModified' | 'filesTotal' | 'name';
+export type DiffFirsts = 'exclude' | 'include' | 'only';
+
+export interface DiffFile {
+  path: string;
+  status: 'added' | 'removed' | 'modified' | null;
+  added: number;
+  removed: number;
+  binary: boolean;
+}
+
+export interface DiffVersion extends DiffRow {
+  /** Changed files, biggest first; null when the diff job has not run on this version. */
+  files: DiffFile[] | null;
+}
+
+export interface DiffStats {
+  scope: UnsafeScope;
+  versions: number;
+  scanned: number;
+  unreadable: number;
+  /** Scanned versions with no predecessor. */
+  firsts: number;
+  approximate: number;
+  /** Versions identical to their predecessor. */
+  unchanged: number;
+  linesAdded: number;
+  linesRemoved: number;
+  filesAdded: number;
+  filesRemoved: number;
+  filesModified: number;
+  filesTotal: number;
+  /** Non-first versions by churn: 0, 1–10, 11–100, 101–1k, 1k–10k, >10k. */
+  histogram: number[];
+  elapsedMs: number;
+  cached: boolean;
+}
+
+export interface DiffTopQuery {
+  scope: UnsafeScope;
+  sort: DiffSort;
+  desc: boolean;
+  q: string;
+  firsts: DiffFirsts;
+  approximate: UnsafeTri;
+  minChurn: number;
+  limit: number;
+  offset: number;
+}
+
+// ---------------------------------------------------------------------------
+// Publishers / Releases / Supply chain views (crates.io registry data: User, Team,
+// OWNS, PUBLISHED, Category, Keyword, and the registry properties on Crate / Version)
+// ---------------------------------------------------------------------------
+
+export interface RegistryStats {
+  users: number;
+  teams: number;
+  owns: number;
+  /** PUBLISHED->Crate edges: (user, crate) publisher pairs. */
+  cratePublishers: number;
+  /** PUBLISHED->Version edges: uploads with a recorded uploader. */
+  versionUploads: number;
+  categories: number;
+  keywords: number;
+  crates: number;
+  cratesInRegistry: number;
+  trustpubOnly: number;
+  cratesWithoutOwner: number;
+  latestVersions: number;
+  latestInRegistry: number;
+  latestYanked: number;
+  /** `registry-1@<dump timestamp>` marker of the newest dump. */
+  dump: string | null;
+  versions: number;
+  versionsInRegistry: number;
+  versionsWithDate: number;
+  versionsMissing: number;
+  yanked: number;
+  elapsedMs: number;
+  cached: boolean;
+}
+
+export interface UserHit {
+  login: string;
+  name: string | null;
+  /** Crates published (0 for teams). */
+  crates: number;
+  owns: number;
+}
+
+/** One crate in a publisher's profile: registry facts, the latest version's metadata, and the user's relation to it. */
+export interface PublisherCrate {
+  name: string;
+  downloads: number | null;
+  numVersions: number | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  description: string | null;
+  trustpubOnly: boolean | null;
+  owners: number;
+  publishers: number;
+  latestVersion: string | null;
+  yanked: boolean;
+  unsafeTotal: number | null;
+  hasBuildScript: boolean;
+  hasNativeCode: boolean;
+  vendoredNative: boolean;
+  published: { first: string; last: string; versions: number } | null;
+  owns: { since: string | null; addedBy: string | null } | null;
+}
+
+export interface PublisherProfile {
+  kind: 'User' | 'Team';
+  id: number;
+  login: string;
+  name: string | null;
+  ghId: number | null;
+  createdAt: string | null;
+  avatar: string | null;
+  crates: PublisherCrate[];
+  /** Uploads per month (users only). */
+  timeline: { year: number; month: number; uploads: number }[];
+  totals: {
+    crates: number;
+    published: number;
+    uploads: number;
+    owned: number;
+    ownedDownloads: number;
+    publishedDownloads: number;
+    soleOwner: number;
+    unsafe: number;
+    buildScripts: number;
+    native: number;
+    yanked: number;
+    withLatest: number;
+    firstUpload: string | null;
+    lastUpload: string | null;
+    truncated: boolean;
+  };
+  meta: { elapsedMs: number };
+}
+
+export interface ProlificRow {
+  login: string;
+  name: string | null;
+  crates: number;
+  uploads: number;
+  first: string | null;
+  last: string | null;
+}
+
+export interface TopOwnerRow {
+  kind: 'User' | 'Team';
+  login: string;
+  name: string | null;
+  crates: number;
+  /** Crates where this is the only owner. */
+  sole: number;
+  downloads: number;
+  sample: string[];
+}
+
+export interface TopPublisherRow {
+  login: string;
+  name: string | null;
+  crates: number;
+  uploads: number;
+  downloads: number;
+  sample: string[];
+}
+
+export interface PublisherLeaderboards {
+  byCrates: ProlificRow[];
+  byUploads: ProlificRow[];
+  owners: TopOwnerRow[];
+  publishers: TopPublisherRow[];
+  /** The download boards rank owners / publishers of this many top crates. */
+  topCrates: number;
+  elapsedMs: number;
+  cached: boolean;
+}
+
+export type ReleaseKind = 'crates' | 'versions';
+export type ReleaseSource = 'created' | 'publisher' | 'published_at';
+export type ReleaseSort = 'date' | 'downloads' | 'name';
+
+export interface ReleaseRow {
+  name: string;
+  /** Null for crate rows. */
+  version: string | null;
+  /** Uploader; null when crates.io did not record one (or for Crate.created_at rows). */
+  login: string | null;
+  at: string;
+  downloads: number | null;
+  // crate rows
+  numVersions?: number | null;
+  defaultVersion?: string | null;
+  createdAt?: string | null;
+  description?: string | null;
+  trustpubOnly?: boolean | null;
+  owners?: string[];
+  ownerCount?: number;
+  publisherCount?: number;
+  // version rows
+  latest?: boolean;
+  yanked?: boolean;
+  license?: string | null;
+  crateSize?: number | null;
+  edition?: string | null;
+  rustVersion?: string | null;
+  unsafeTotal?: number | null;
+  hasBuildScript?: boolean;
+  hasNativeCode?: boolean;
+  vendoredNative?: boolean;
+  /** source=publisher crate rows: uploads by this user, their last upload, and whether the crate existed before them. */
+  extra: { uploads?: number; last?: string; joined?: boolean };
+}
+
+export interface ReleasesQuery {
+  kind: ReleaseKind;
+  source: ReleaseSource;
+  from: string;
+  to: string;
+  q: string;
+  minDownloads: number;
+  sort: ReleaseSort;
+  desc: boolean;
+  limit: number;
+  offset: number;
+}
+
+export interface ReleasesResult {
+  rows: ReleaseRow[];
+  hasMore: boolean;
+  meta: { kind: ReleaseKind; source: ReleaseSource; from: string; to: string; sort: ReleaseSort; elapsedMs: number };
+}
+
+export interface ReleasesHistogram {
+  kind: ReleaseKind;
+  source: ReleaseSource;
+  from: string;
+  to: string;
+  unit: 'day' | 'month';
+  buckets: { bucket: string; n: number }[];
+  total: number;
+  elapsedMs: number;
+  cached: boolean;
+}
+
+export interface BusFactorRow {
+  name: string;
+  downloads: number;
+  numVersions: number | null;
+  updatedAt: string | null;
+  /** Crate-level dependency degree from the Map precompute, when built. */
+  degree: number | null;
+  trustpubOnly: boolean | null;
+  repository: string | null;
+  login: string;
+  ownerName: string | null;
+  since: string | null;
+  addedBy: string | null;
+  ownerCrates: number;
+  publishers: number;
+  latestVersion: string | null;
+  yanked: boolean;
+  latestAt: string | null;
+}
+
+export interface OwnerAdditionRow {
+  name: string;
+  downloads: number | null;
+  numVersions: number | null;
+  createdAt: string | null;
+  kind: 'User' | 'Team';
+  login: string;
+  ownerName: string | null;
+  addedBy: string | null;
+  since: string;
+  owners: number;
+  hasPublished: boolean;
+  ownerPublished: number | null;
+  ownerCreatedAt: string | null;
+}
+
+export interface NewUploaderRow {
+  name: string;
+  downloads: number;
+  numVersions: number | null;
+  version: string;
+  yanked: boolean;
+  at: string;
+  login: string;
+  uploaderName: string | null;
+  uploaderCreatedAt: string | null;
+  owner: boolean;
+  publishers: number;
+  uploaderCrates: number;
+  owners: string[];
+}
+
+export interface SupplyResult<Row> {
+  rows: Row[];
+  hasMore: boolean;
+  meta: { elapsedMs: number; top?: number; since?: string; minDownloads?: number; self?: string };
+}
+
+export interface CrateRegistry {
+  name: string;
+  inRegistry: boolean;
+  owners: { kind: 'User' | 'Team'; login: string; name: string | null; since: string | null; addedBy: string | null }[];
+  publishers: { login: string; name: string | null; first: string | null; last: string | null; versions: number }[];
+  categories: { slug: string; name: string; crates: number | null }[];
+  keywords: string[];
+}
+
+export interface VersionPublisher {
+  name: string;
+  version: string;
+  login: string | null;
+  publisherName: string | null;
+  at: string | null;
+  publishedAt: string | null;
+  inRegistry: boolean;
+}
+
+export interface TopResult<Row, Sort> {
+  rows: Row[];
+  hasMore: boolean;
+  meta: { elapsedMs: number; sort: Sort; scope: UnsafeScope };
+}
+
 export interface Stats {
   crates: number;
   versions: number;
@@ -285,7 +786,7 @@ export interface CrateLoadOptions {
   limit: number;
 }
 
-export type ExpandType = 'VERSION_OF' | 'DEPENDS_ON' | 'INVOKES';
+export type ExpandType = 'VERSION_OF' | 'DEPENDS_ON' | 'INVOKES' | 'OWNS' | 'PUBLISHED';
 
 export class ApiError extends Error {
   constructor(
@@ -394,6 +895,90 @@ export const api = {
     if (version) params.set('version', version);
     return request<UnsafeDepsResult>(`/api/unsafe/deps?${params}`);
   },
+  buildStats: (scope: UnsafeScope) => request<BuildStats>(`/api/build/stats?scope=${scope}`),
+  buildTop: (q: BuildTopQuery) =>
+    request<TopResult<BuildRow, BuildSort>>(
+      `/api/build/top?${new URLSearchParams({
+        scope: q.scope,
+        sort: q.sort,
+        dir: q.desc ? 'desc' : 'asc',
+        q: q.q,
+        links: q.links,
+        link: q.link,
+        custom: q.custom,
+        minLines: String(q.minLines),
+        limit: String(q.limit),
+        offset: String(q.offset),
+      })}`,
+    ),
+  buildLinks: (scope: UnsafeScope, limit = 50) =>
+    request<{ rows: LinksRow[]; meta: { elapsedMs: number } }>(`/api/build/links?scope=${scope}&limit=${limit}`).then((r) => r.rows),
+  buildCrate: (name: string) => request<{ name: string; versions: BuildRow[] }>(`/api/build/crate/${encodeURIComponent(name)}`).then((r) => r.versions),
+  nativeStats: (scope: UnsafeScope) => request<NativeStats>(`/api/native/stats?scope=${scope}`),
+  nativeTop: (q: NativeTopQuery) =>
+    request<TopResult<NativeRow, NativeSort>>(
+      `/api/native/top?${new URLSearchParams({
+        scope: q.scope,
+        sort: q.sort,
+        dir: q.desc ? 'desc' : 'asc',
+        q: q.q,
+        vendored: q.vendored,
+        prebuilt: q.prebuilt,
+        lang: q.lang,
+        minLines: String(q.minLines),
+        limit: String(q.limit),
+        offset: String(q.offset),
+      })}`,
+    ),
+  nativeCrate: (name: string) => request<{ name: string; versions: NativeRow[] }>(`/api/native/crate/${encodeURIComponent(name)}`).then((r) => r.versions),
+  diffStats: (scope: UnsafeScope) => request<DiffStats>(`/api/diffs/stats?scope=${scope}`),
+  diffTop: (q: DiffTopQuery) =>
+    request<TopResult<DiffRow, DiffSort> & { meta: { firsts: DiffFirsts } }>(
+      `/api/diffs/top?${new URLSearchParams({
+        scope: q.scope,
+        sort: q.sort,
+        dir: q.desc ? 'desc' : 'asc',
+        q: q.q,
+        firsts: q.firsts,
+        approximate: q.approximate,
+        minChurn: String(q.minChurn),
+        limit: String(q.limit),
+        offset: String(q.offset),
+      })}`,
+    ),
+  diffCrate: (name: string) => request<{ name: string; versions: DiffRow[] }>(`/api/diffs/crate/${encodeURIComponent(name)}`).then((r) => r.versions),
+  diffVersion: (crate: string, version: string) => request<DiffVersion>(`/api/diffs/version?${new URLSearchParams({ crate, version })}`),
+  registryStats: () => request<RegistryStats>('/api/registry/stats'),
+  searchUsers: (q: string, limit = 15) => request<{ users: UserHit[]; teams: UserHit[] }>(`/api/publishers/search?${new URLSearchParams({ q, limit: String(limit) })}`),
+  publisher: (login: string) => request<PublisherProfile>(`/api/publishers/user/${encodeURIComponent(login)}`),
+  publisherLeaderboards: () => request<PublisherLeaderboards>('/api/publishers/leaderboards'),
+  releases: (q: ReleasesQuery) =>
+    request<ReleasesResult>(
+      `/api/releases?${new URLSearchParams({
+        kind: q.kind,
+        source: q.source,
+        from: q.from,
+        to: q.to,
+        q: q.q,
+        minDownloads: String(q.minDownloads),
+        sort: q.sort,
+        dir: q.desc ? 'desc' : 'asc',
+        limit: String(q.limit),
+        offset: String(q.offset),
+      })}`,
+    ),
+  releasesHistogram: (kind: ReleaseKind, source: ReleaseSource, from: string, to: string) =>
+    request<ReleasesHistogram>(`/api/releases/histogram?${new URLSearchParams({ kind, source, from, to })}`),
+  busFactor: (q: { top: number; limit: number; offset: number }) =>
+    request<SupplyResult<BusFactorRow>>(`/api/supply/bus-factor?${new URLSearchParams({ top: String(q.top), limit: String(q.limit), offset: String(q.offset) })}`),
+  ownerAdditions: (q: { since: string; minDownloads: number; self: 'exclude' | 'include'; limit: number; offset: number }) =>
+    request<SupplyResult<OwnerAdditionRow>>(
+      `/api/supply/owner-additions?${new URLSearchParams({ since: q.since, minDownloads: String(q.minDownloads), self: q.self, limit: String(q.limit), offset: String(q.offset) })}`,
+    ),
+  newUploaders: (q: { top: number; limit: number; offset: number }) =>
+    request<SupplyResult<NewUploaderRow>>(`/api/supply/new-uploaders?${new URLSearchParams({ top: String(q.top), limit: String(q.limit), offset: String(q.offset) })}`),
+  crateRegistry: (name: string) => request<CrateRegistry>(`/api/registry/crate/${encodeURIComponent(name)}`),
+  versionPublisher: (crate: string, version: string) => request<VersionPublisher>(`/api/registry/version?${new URLSearchParams({ crate, version })}`),
   expand: (id: string, direction: 'in' | 'out' | 'both', types: ExpandType[], limit = 100) =>
     request<GraphPayload>('/api/graph/expand', json({ id, direction, types, limit })),
   cypher: (query: string, params: Record<string, unknown> = {}) =>

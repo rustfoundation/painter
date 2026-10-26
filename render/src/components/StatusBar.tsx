@@ -1,4 +1,4 @@
-import type { GraphPayload, Health, Stats, View } from '../api';
+import { isTableView, type GraphPayload, type Health, type Stats, type View } from '../api';
 
 interface Props {
   view: View;
@@ -39,7 +39,7 @@ export function StatusBar(props: Props) {
         {fmtInt(stats?.invokes)} CALLS
       </span>
       <span className="sep" />
-      {view !== 'callers' && view !== 'unsafe' && (
+      {!isTableView(view) && (
         <span>
           view: {nodeCount} nodes · {relCount} rels
         </span>
@@ -64,10 +64,10 @@ export function StatusBar(props: Props) {
           </span>
         </>
       )}
-      {view !== 'callers' && view !== 'unsafe' && (
+      {!isTableView(view) && (
       <>
       <span className="sep" />
-      {(view === 'map' ? [] : view === 'deps' ? ['DEPENDS_ON'] : ['VERSION_OF', 'DEPENDS_ON', 'INVOKES']).map((t) => (
+      {(view === 'map' ? [] : view === 'deps' ? ['DEPENDS_ON'] : ['VERSION_OF', 'DEPENDS_ON', 'INVOKES', 'OWNS', 'PUBLISHED']).map((t) => (
         <label key={t} className="opt">
           <input type="checkbox" checked={!hiddenRelTypes.has(t)} onChange={() => onToggleRelType(t)} /> {t}
         </label>

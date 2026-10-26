@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { api, VIEWS, type CrateLoadOptions, type View } from '../api';
+import { api, isTableView, VIEWS, type CrateLoadOptions, type View } from '../api';
 
 interface Props {
   view: View;
@@ -87,7 +87,7 @@ export function Toolbar(props: Props) {
           </button>
         ))}
       </div>
-      {view !== 'callers' && view !== 'unsafe' && (
+      {!isTableView(view) && (
       <>
       <div className="search">
         <input
@@ -220,7 +220,7 @@ export function Toolbar(props: Props) {
 
       <span className="spacer" />
 
-      {view !== 'callers' && view !== 'unsafe' && (
+      {!isTableView(view) && (
       <>
       <label className="opt">
         layout
