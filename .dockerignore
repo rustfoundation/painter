@@ -1,0 +1,15 @@
+target
+**/target
+.git
+llvm-ir/.git
+llvm-ir-analysis/.git
+docker
+render
+poc
+scratch
+test_data
+graph-imports
+docs
+*.log
+nohup.out
+*.png

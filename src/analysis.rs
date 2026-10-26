@@ -1,22 +1,94 @@
-use crate::{db::Db, Error, Roots};
-use llvm_ir_analysis::{llvm_ir::Module, ModuleAnalysis};
+use crate::{Error, db::Db};
+use llvm_ir_analysis::{ModuleAnalysis, llvm_ir::Module};
 use rayon::prelude::*;
 use rustc_demangle::demangle;
 
-use crates_index::Crate;
 use std::{io::Write, path::Path, sync::Arc};
 
-const BLOCKED_STRINGS: &[&str] = &["llvm.", "__rust", "rt::", "std::", "core::", "alloc::"];
+const BLOCKED_CRATES: &[&str] = &["core", "std", "alloc"];
 
-/// Extract all function calls/invocations within a bytecode file. Returns a `Vec<(String,String)>`
-/// of (caller, callee) demangled function names.
+/// The first identifier followed by `::`, so `<serde::X as core::fmt::Display>::fmt` is `serde`.
+#[must_use]
+pub fn crate_of(demangled: &str) -> Option<&str> {
+    let bytes = demangled.as_bytes();
+    let mut start = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        let is_ident = b.is_ascii_alphanumeric() || b == b'_';
+        match (start, is_ident) {
+            (None, true) => start = Some(i),
+            (Some(st), false) => {
+                if bytes[i..].starts_with(b"::") {
+                    return Some(&demangled[st..i]);
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[must_use]
+pub fn callee_crate(demangled: &str) -> Option<&str> {
+    if demangled.starts_with("llvm.") || demangled.starts_with("__rust") {
+        return None;
+    }
+    let c = crate_of(demangled)?;
+    if BLOCKED_CRATES.contains(&c) {
+        None
+    } else {
+        Some(c)
+    }
+}
+
+/// Parsing takes gigabytes for a large crate. Run inline it stalled the whole `join_all` chunk and
+/// Neo4j dropped connections that did not authenticate within 30 s.
+static PARSE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// Bounds the 2^n spelling enumeration in [`crate_name_candidates`].
+const MAX_SEPARATOR_VARIANTS: usize = 6;
+
+/// Rust paths write `foo-bar` as `foo_bar` and crates.io treats `-`/`_` alike, so every `_` may
+/// be either. `ident` itself comes first.
+#[must_use]
+pub fn crate_name_candidates(ident: &str) -> Vec<String> {
+    let seps: Vec<usize> = ident.match_indices('_').map(|(i, _)| i).collect();
+    if seps.is_empty() {
+        return vec![ident.to_string()];
+    }
+    if seps.len() > MAX_SEPARATOR_VARIANTS {
+        return vec![ident.to_string(), ident.replace('_', "-")];
+    }
+    (0..1u32 << seps.len())
+        .map(|mask| {
+            ident
+                .char_indices()
+                .map(|(at, c)| match seps.iter().position(|&s| s == at) {
+                    Some(bit) if mask & (1 << bit) != 0 => '-',
+                    _ => c,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn resolve_crate_name<S: std::hash::BuildHasher>(
+    ident: &str,
+    existing: &std::collections::HashSet<String, S>,
+) -> Option<String> {
+    crate_name_candidates(ident)
+        .into_iter()
+        .find(|c| existing.contains(c))
+}
+
+/// Returns (caller, callee) demangled names.
 ///
 /// # Panics
-/// This function will panic if iterating the `Roots::bytecode_root` fails.
+/// If the directory cannot be read or the bitcode fails to parse.
 ///
-/// This function will panic if an LLVM parsing error occurs while parsing the bytecode.
 /// # Errors
-/// TODO: Failure cases currently panic and should be moved to errors.
+/// Never; failures panic.
 #[allow(clippy::unnecessary_wraps)]
 pub fn extract_calls<P: AsRef<Path>>(crate_bc_dir: P) -> Result<Vec<(String, String)>, Error> {
     let mut calls = Vec::<(String, String)>::new();
@@ -34,207 +106,114 @@ pub fn extract_calls<P: AsRef<Path>>(crate_bc_dir: P) -> Result<Vec<(String, Str
         let analysis = ModuleAnalysis::new(&module);
 
         let graph = analysis.call_graph();
-        graph.inner().all_edges().for_each(|(src_raw, dst_raw, _)| {
-            let src = format!("{:#}", demangle(src_raw));
-            let dst = format!("{:#}", demangle(dst_raw));
+        graph
+            .inner()
+            .all_edges()
+            .for_each(|(src_raw, dst_raw, ())| {
+                let src = format!("{:#}", demangle(src_raw));
+                let dst = format!("{:#}", demangle(dst_raw));
 
-            if !BLOCKED_STRINGS
-                .iter()
-                .any(|s| src.contains(*s) || dst.contains(*s))
-            {
-                calls.push((src, dst));
-            }
-        });
+                if callee_crate(&dst).is_some() {
+                    calls.push((src, dst));
+                }
+            });
     }
 
     Ok(calls)
 }
 
-/// Extracts all calls within a  single crates bytecode. Then, perform database insertions of each
-/// call into the database.
-///
 /// # Panics
-/// This function panics if extracting the filename of a crates full name from its path fails.
+/// If the directory name is not UTF-8 or the bitcode fails to parse.
 ///
 /// # Errors
-/// Returns `painter::analysis::Error` on failure of database insertion.
+/// If the name does not split or a database call fails.
 #[allow(clippy::needless_pass_by_value)]
 pub async fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P, db: Arc<Db>) -> Result<(), Error> {
-    let calls = extract_calls(&crate_bc_dir)?;
+    let calls = {
+        let _slot = PARSE_SLOTS
+            .acquire()
+            .await
+            .expect("semaphore is never closed");
+        let dir = crate_bc_dir.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || extract_calls(dir))
+            .await
+            .expect("bitcode parsing panicked")?
+    };
     let crate_fullname = crate_bc_dir.as_ref().file_name().unwrap().to_str().unwrap();
 
-    let (crate_name, crate_version) = crate_fullname.rsplit_once('-').unwrap();
+    let (crate_name, crate_version) = crate::crate_fs::split_full_name(crate_fullname)
+        .ok_or_else(|| Error::CrateNameError(crate_fullname.to_string()))?;
 
-    // If this crate/version has an invoke, assume its completed and bail
-    if db.has_any_invoke(crate_name, crate_version).await? {
-        log::trace!("{}-{} Exists, skipping..", crate_name, crate_version);
-        return Ok(());
+    // `insert_calls` replaces the version's whole call graph.
+    if db.has_call_graph(crate_name, crate_version).await? {
+        log::info!("{crate_fullname}: replacing existing call graph");
     }
 
-    log::trace!("Importing: {}", crate_name);
+    log::trace!("Importing: {crate_name}");
 
-    for (caller, callee) in &calls {
-        let dst_crate = callee.split_once("::").unwrap_or(("NONE", "")).0;
-        db.insert_invoke(caller, callee, (crate_name, crate_version), dst_crate)
-            .await?;
-    }
+    let rows: Vec<(String, String, String)> = calls
+        .into_iter()
+        .filter_map(|(caller, callee)| {
+            let dst = callee_crate(&callee)?.to_string();
+            Some((caller, callee, dst))
+        })
+        .collect();
+
+    // Rust paths say `num_traits`, the node is `num-traits`; unmatched names are dropped below.
+    let idents: std::collections::BTreeSet<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+    let candidates: Vec<String> = idents
+        .iter()
+        .flat_map(|i| crate_name_candidates(i))
+        .collect();
+    let existing = db.existing_crate_names(&candidates).await?;
+    let resolved: std::collections::HashMap<String, String> = idents
+        .iter()
+        .filter_map(|i| Some((i.to_string(), resolve_crate_name(i, &existing)?)))
+        .collect();
+    let raw = rows.len();
+    let calls =
+        crate::db::collapse_calls(rows.into_iter().filter_map(|(caller, callee, ident)| {
+            Some((caller, callee, resolved.get(&ident)?.clone()))
+        }));
+
+    db.insert_calls((crate_name, crate_version), &calls).await?;
+    log::debug!("{crate_fullname}: {} distinct calls", calls.len());
+    // The batch import driver (`docker/entry.sh`) matches this exact line.
+    log::info!("{crate_fullname}: imported {raw} invocations");
 
     Ok(())
 }
 
-/// Iterate across all crates in the bytecode root, and call `export_crate_db`
-///
 /// # Panics
-/// This function panics if there are permissions issues reading the bytecode root directory.
+/// If the bytecode root cannot be read.
+///
 /// # Errors
-/// Returns `painter::analysis::Error` on failure.
+/// Never; per-crate failures are logged and counted.
 pub async fn export_all_db<P: AsRef<Path>>(bc_root: P, db: Arc<Db>) -> Result<(), Error> {
     let dirs: Vec<_> = std::fs::read_dir(&bc_root)
         .unwrap()
         .filter_map(Result::ok)
-        .filter(|e| e.path().is_dir())
+        // Skips compile's staging dir.
+        .filter(|e| e.path().is_dir() && !e.file_name().to_string_lossy().starts_with('.'))
         .collect();
 
-    let iter = dirs.iter().array_chunks::<16>();
-    for chunk in iter {
+    let mut failures = 0usize;
+    for chunk in crate::chunked(dirs.iter(), 16) {
         let tasks: Vec<_> = chunk
-            .into_iter()
+            .iter()
             .map(|c| export_crate_db(c.path(), db.clone()))
             .collect();
 
-        futures::future::join_all(tasks).await;
-    }
-
-    //for crate_bc_dir in dirs {
-    //    ;
-    //}
-
-    Ok(())
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct CountUnsafeEntry {
-    pub safe: u32,
-    pub unsafe_: u32,
-}
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct CountUnsafeResult {
-    pub functions: CountUnsafeEntry,
-    pub exprs: CountUnsafeEntry,
-    pub item_impls: CountUnsafeEntry,
-    pub item_traits: CountUnsafeEntry,
-    pub methods: CountUnsafeEntry,
-}
-impl CountUnsafeResult {
-    #[must_use]
-    pub fn has_unsafe(&self) -> bool {
-        self.functions.unsafe_ > 0
-            || self.exprs.unsafe_ > 0
-            || self.item_impls.unsafe_ > 0
-            || self.item_traits.unsafe_ > 0
-            || self.methods.unsafe_ > 0
-    }
-
-    #[must_use]
-    pub fn total_unsafe(&self) -> u32 {
-        self.functions.unsafe_
-            + self.exprs.unsafe_
-            + self.item_impls.unsafe_
-            + self.item_traits.unsafe_
-            + self.methods.unsafe_
-    }
-}
-
-pub(crate) async fn count_unsafe_crate_extract(
-    c: Crate,
-    roots: Roots,
-    db: Arc<Db>,
-) -> Result<(), Error> {
-    let compressed_root = &roots.compressed_root;
-    let sources_root = &roots.sources_root;
-
-    for v in c.versions() {
-        let crate_fullname = format!("{}-{}", v.name(), v.version());
-        let crate_path = compressed_root.join(format!("{}.crate", &crate_fullname));
-
-        // Lets work off the tgz for now, since we cant extract
-        // TODO: this needs to be unified to a file driver
-        if std::fs::metadata(&crate_path).is_ok() {
-            let extracted_path = sources_root.join(&crate_fullname);
-            let tar_gz = std::fs::File::open(&crate_path).unwrap();
-            let tar = flate2::read::GzDecoder::new(tar_gz);
-            let mut archive = tar::Archive::new(tar);
-            if archive.unpack(sources_root).is_ok() {
-                log::trace!("Extracted {}", &crate_fullname);
-
-                // Run our count
-                let output = std::process::Command::new("count-unsafe")
-                    .args([&extracted_path])
-                    .output()
-                    .unwrap();
-                if output.status.success() {
-                    let raw_json = std::str::from_utf8(&output.stdout).unwrap();
-                    log::trace!("{}", &raw_json);
-
-                    let unsafe_result: CountUnsafeResult = serde_json::from_str(raw_json).unwrap();
-                    if unsafe_result.has_unsafe() {
-                        log::debug!("{} unsafe", &crate_fullname);
-                        db.set_unsafe(v.name(), v.version(), &unsafe_result).await;
-                        //.unwrap();
-                    }
-
-                    // Finally delete
-                    //std::fs::remove_dir_all(extracted_path).unwrap();
-                    log::trace!("Deleted {}", &crate_fullname);
-                }
+        for (dir, result) in chunk.iter().zip(futures::future::join_all(tasks).await) {
+            if let Err(e) = result {
+                failures += 1;
+                log::error!("{}: export failed: {}", dir.path().display(), e);
             }
         }
     }
-    Ok(())
-}
-pub(crate) async fn count_unsafe_crate(c: Crate, roots: Roots, db: Arc<Db>) -> Result<(), Error> {
-    let compressed_root = &roots.compressed_root;
-    let sources_root = &roots.sources_root;
 
-    for v in c.versions() {
-        let crate_fullname = format!("{}-{}", v.name(), v.version());
-        let crate_path = sources_root.join(format!("{}", &crate_fullname));
-
-        // Lets work off the tgz for now, since we cant extract
-        // TODO: this needs to be unified to a file driver
-        if std::fs::metadata(&crate_path).is_ok() {
-            // Run our count
-            let output = std::process::Command::new("count-unsafe")
-                .args([&crate_path])
-                .output()
-                .unwrap();
-            if output.status.success() {
-                let raw_json = std::str::from_utf8(&output.stdout).unwrap();
-                log::trace!("{}", &raw_json);
-
-                let unsafe_result: CountUnsafeResult = serde_json::from_str(raw_json).unwrap();
-                if unsafe_result.has_unsafe() {
-                    log::debug!("{} unsafe", &crate_fullname);
-                    db.set_unsafe(v.name(), v.version(), &unsafe_result).await;
-                    //.unwrap();
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(crate) async fn count_unsafe(roots: &Roots, db: Arc<Db>) -> Result<(), Error> {
-    let index = crates_index::Index::new_cargo_default().map_err(crate::index::Error::from)?;
-
-    let iter = index.crates().array_chunks::<128>();
-    for chunk in iter {
-        let tasks: Vec<_> = chunk
-            .into_iter()
-            .map(|c| count_unsafe_crate(c, roots.clone(), db.clone()))
-            .collect();
-
-        futures::future::join_all(tasks).await;
+    if failures > 0 {
+        log::error!("{failures} crate version(s) failed to export");
     }
 
     Ok(())
@@ -249,12 +228,13 @@ fn export_crate_csv<P: AsRef<Path>>(crate_bc_dir: P) -> Result<(), Error> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true)
             .open(crate_bc_dir.as_ref().join("calls.csv"))
             .unwrap();
 
-        calls.iter().enumerate().for_each(|(_, (src, dst))| {
+        for (src, dst) in &calls {
             writeln!(file, "{crate_fullname},{src},{dst}").unwrap();
-        });
+        }
     }
 
     Ok(())
@@ -272,4 +252,142 @@ fn export_all_csv<P: AsRef<Path>>(bc_root: P) -> Result<(), Error> {
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_data() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data")
+    }
+
+    #[test]
+    fn crate_name_candidates_swap_every_separator() {
+        assert_eq!(crate_name_candidates("serde"), ["serde"]);
+        assert_eq!(
+            crate_name_candidates("num_traits"),
+            ["num_traits", "num-traits"]
+        );
+        let mut many = crate_name_candidates("a_b_c");
+        assert_eq!(many[0], "a_b_c");
+        many.sort();
+        assert_eq!(many, ["a-b-c", "a-b_c", "a_b-c", "a_b_c"]);
+        assert_eq!(
+            crate_name_candidates("a_b_c_d_e_f_g_h"),
+            ["a_b_c_d_e_f_g_h", "a-b-c-d-e-f-g-h"]
+        );
+    }
+
+    #[test]
+    fn resolve_crate_name_prefers_an_exact_match() {
+        let existing: std::collections::HashSet<String> =
+            ["num-traits", "candle-core", "foo_bar", "foo-bar", "serde"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+        assert_eq!(
+            resolve_crate_name("num_traits", &existing).as_deref(),
+            Some("num-traits")
+        );
+        assert_eq!(
+            resolve_crate_name("candle_core", &existing).as_deref(),
+            Some("candle-core")
+        );
+        assert_eq!(
+            resolve_crate_name("foo_bar", &existing).as_deref(),
+            Some("foo_bar")
+        );
+        assert_eq!(
+            resolve_crate_name("serde", &existing).as_deref(),
+            Some("serde")
+        );
+        assert_eq!(resolve_crate_name("std_detect", &existing), None);
+    }
+
+    #[test]
+    fn extract_calls_reads_checked_in_bitcode() {
+        let calls = extract_calls(test_data()).unwrap();
+        assert!(!calls.is_empty(), "no call edges in test_data/*.bc");
+        for (caller, callee) in &calls {
+            assert_ne!(caller, "");
+            assert!(
+                callee_crate(callee).is_some(),
+                "std/core/intrinsic callee leaked through the filter: {callee}"
+            );
+        }
+        assert!(calls.iter().any(|(_, callee)| callee.starts_with("serde::")
+            || callee.contains(" as serde::")
+            || callee.contains("<serde::")));
+    }
+
+    #[test]
+    fn extract_calls_on_an_empty_dir_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), "not bitcode").unwrap();
+        assert_eq!(
+            extract_calls(tmp.path()).unwrap(),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn export_crate_csv_writes_one_row_per_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("serde-1.0.0");
+        std::fs::create_dir(&dir).unwrap();
+        for e in std::fs::read_dir(test_data())
+            .unwrap()
+            .filter_map(Result::ok)
+        {
+            if e.path().extension().is_some_and(|x| x == "bc") {
+                std::fs::copy(e.path(), dir.join(e.file_name())).unwrap();
+            }
+        }
+        export_crate_csv(&dir).unwrap();
+        let csv = std::fs::read_to_string(dir.join("calls.csv")).unwrap();
+        let calls = extract_calls(&dir).unwrap();
+        assert_eq!(csv.lines().count(), calls.len());
+        assert!(csv.lines().all(|l| l.starts_with("serde-1.0.0,")));
+    }
+
+    #[test]
+    fn crate_of_handles_plain_and_trait_impl_paths() {
+        assert_eq!(
+            crate_of("serde::de::Deserialize::deserialize"),
+            Some("serde")
+        );
+        assert_eq!(
+            crate_of("<serde::de::WithDecimalPoint as core::fmt::Display>::fmt"),
+            Some("serde")
+        );
+        assert_eq!(
+            crate_of("<&T as serde::Serialize>::serialize"),
+            Some("serde")
+        );
+        assert_eq!(crate_of("<[u8] as core::fmt::Debug>::fmt"), Some("core"));
+        assert_eq!(crate_of("alloc::vec::Vec<T>::push"), Some("alloc"));
+        assert_eq!(crate_of("__rust_alloc"), None);
+        assert_eq!(crate_of("llvm.memcpy.p0.i64"), None);
+    }
+
+    #[test]
+    fn callee_crate_blocks_std_family_and_intrinsics() {
+        assert_eq!(callee_crate("core::fmt::Write::write_char"), None);
+        assert_eq!(callee_crate("std::io::Write::write"), None);
+        assert_eq!(
+            callee_crate("<alloc::string::String as core::fmt::Write>::write_str"),
+            None
+        );
+        assert_eq!(callee_crate("llvm.memset.p0.i64"), None);
+        assert_eq!(callee_crate("__rust_dealloc"), None);
+        assert_eq!(
+            callee_crate("serde_json::ser::to_string"),
+            Some("serde_json")
+        );
+        assert_eq!(
+            callee_crate("<T as serde::Serialize>::serialize"),
+            Some("serde")
+        );
+    }
 }

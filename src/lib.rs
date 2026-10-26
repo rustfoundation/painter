@@ -1,59 +1,113 @@
-use llvm_ir_analysis::llvm_ir::Module;
-use llvm_ir_analysis::ModuleAnalysis;
-use rustc_demangle::demangle;
-use std::path::Path;
+//! Pipeline stages behind the `painter` CLI: index import, compile, bitcode analysis,
+//! per-version metadata. `main.rs` only parses flags and dispatches here.
+#![deny(clippy::all, clippy::pedantic)]
+#![allow(clippy::enum_variant_names)]
 
-/// Top error type returned during any stage of analysis from compile to data import.
-#[derive(thiserror::Error, Debug)]
-pub enum Error {
-    ///
-    #[error("IO Error: {0}")]
-    IoError(#[from] std::io::Error),
-    ///
-    #[error("LLVM IR failure: {0}")]
-    LLVMError(String),
+pub mod analysis;
+pub mod check;
+pub mod compile;
+pub mod crate_fs;
+pub mod db;
+pub mod ecosystems;
+pub mod error;
+pub mod index;
+pub mod metadata;
+pub mod migrate;
+pub mod rules;
+
+use std::path::PathBuf;
+
+pub use error::Error;
+pub use rules::BuildRules;
+
+/// Unlike `Iterator::array_chunks`, the final partial chunk is yielded, not dropped.
+pub fn chunked<I: Iterator>(iter: I, size: usize) -> impl Iterator<Item = Vec<I::Item>> {
+    let mut iter = iter.peekable();
+    std::iter::from_fn(move || {
+        iter.peek()?;
+        Some(iter.by_ref().take(size).collect())
+    })
 }
 
-const BLOCKED_STRINGS: &[&str] = &["llvm.", "__rust", "rt::", "std::", "core::", "alloc::"];
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Roots {
+    pub sources_root: PathBuf,
+    pub bytecodes_root: Option<PathBuf>,
+    pub compressed_root: PathBuf,
+}
 
-/// Extract all function calls/invocations within a bytecode file. Returns a `Vec<(String,String)>`
-/// of (caller, callee) demangled function names.
-///
-/// # Panics
-/// This function will panic if iterating the `Roots::bytecode_root` fails.
-///
-/// This function will panic if an LLVM parsing error occurs while parsing the bytecode.
-/// # Errors
-/// TODO: Failure cases currently panic and should be moved to errors.
-#[allow(clippy::unnecessary_wraps)]
-pub fn extract_calls<P: AsRef<Path>>(crate_bc_dir: P) -> Result<Vec<(String, String)>, Error> {
-    let mut calls = Vec::<(String, String)>::new();
-
-    for bc_entry in std::fs::read_dir(crate_bc_dir.as_ref())
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some() && e.path().extension().unwrap() == "bc")
-    {
-        let bc_path = bc_entry.path();
-
-        let module = Module::from_bc_path(&bc_path)
-            .map_err(Error::LLVMError)
-            .unwrap();
-        let analysis = ModuleAnalysis::new(&module);
-
-        let graph = analysis.call_graph();
-        graph.inner().all_edges().for_each(|(src_raw, dst_raw, _)| {
-            let src = format!("{:#}", demangle(src_raw));
-            let dst = format!("{:#}", demangle(dst_raw));
-
-            if !BLOCKED_STRINGS
-                .iter()
-                .any(|s| src.contains(*s) || dst.contains(*s))
-            {
-                calls.push((src, dst));
-            }
-        });
+impl Roots {
+    /// # Panics
+    /// If either directory does not exist.
+    ///
+    /// # Errors
+    /// If the cache cannot be initialised.
+    pub fn crate_fs(&self) -> Result<crate_fs::CrateFs, Error> {
+        Ok(crate_fs::CrateFs::new(
+            crate_fs::CrateFsConfig::with_paths(
+                self.compressed_root.clone(),
+                self.sources_root.clone(),
+            ),
+        )?)
     }
 
-    Ok(calls)
+    /// # Errors
+    /// If `-b` was not provided.
+    pub fn bytecodes_root(&self) -> Result<&PathBuf, Error> {
+        self.bytecodes_root
+            .as_ref()
+            .ok_or(Error::MissingBytecodesPath)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunked_keeps_the_final_partial_chunk() {
+        let chunks: Vec<Vec<i32>> = chunked(1..=7, 3).collect();
+        assert_eq!(chunks, vec![vec![1, 2, 3], vec![4, 5, 6], vec![7]]);
+    }
+
+    #[test]
+    fn chunked_handles_empty_and_exact_multiples() {
+        assert_eq!(chunked(std::iter::empty::<u8>(), 4).count(), 0);
+        let chunks: Vec<Vec<i32>> = chunked(1..=4, 2).collect();
+        assert_eq!(chunks, vec![vec![1, 2], vec![3, 4]]);
+    }
+
+    #[test]
+    fn roots_bytecodes_root_is_required() {
+        let roots = Roots {
+            sources_root: PathBuf::from("/s"),
+            bytecodes_root: None,
+            compressed_root: PathBuf::from("/c"),
+        };
+        assert!(matches!(
+            roots.bytecodes_root(),
+            Err(Error::MissingBytecodesPath)
+        ));
+
+        let roots = Roots {
+            bytecodes_root: Some(PathBuf::from("/b")),
+            ..roots
+        };
+        assert_eq!(roots.bytecodes_root().unwrap(), &PathBuf::from("/b"));
+    }
+
+    #[test]
+    fn roots_crate_fs_opens_existing_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = Roots {
+            sources_root: tmp.path().join("src"),
+            bytecodes_root: None,
+            compressed_root: tmp.path().join("crates"),
+        };
+        std::fs::create_dir_all(&roots.sources_root).unwrap();
+        std::fs::create_dir_all(&roots.compressed_root).unwrap();
+        let fs = roots.crate_fs().unwrap();
+        assert_eq!(fs.config().crates_path, roots.compressed_root);
+        assert_eq!(fs.config().extract_path, roots.sources_root);
+    }
 }

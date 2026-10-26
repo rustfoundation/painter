@@ -26,3 +26,7 @@ Cargo.lock
 *.pdb
 
 scratch
+
+# Logs and output of local runs (compile-all, generate-metadata, nohup)
+*.log
+nohup.out

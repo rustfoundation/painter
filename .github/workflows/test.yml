@@ -1,0 +1,25 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Its LLVM must not be newer than 22 (what `llvm-ir` links) or the bitcode is unreadable;
+  # stable 1.99 ships LLVM 23.
+  PAINTER_TEST_TOOLCHAIN: "1.96.1"
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup
+        with:
+          extra-toolchains: ${{ env.PAINTER_TEST_TOOLCHAIN }}
+      - run: cargo test --all-targets
