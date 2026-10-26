@@ -1,9 +1,4 @@
-// Supply-chain view: ownership signals on popular crates from the registry job.
-//   bus factor      · among the top N crates by downloads, those with exactly one User owner and no Team
-//   owner additions · OWNS.since in a window on crates above a download floor, added by someone else
-//   new uploaders   · among the top N crates, latest versions uploaded by a first-time uploader of the crate
-// Nothing is precomputed: each board is one index-backed query bounded by N (Crate.downloads
-// index) or the OWNS.since range.
+// Nothing precomputed: each board is one index-backed query bounded by N or the OWNS.since range.
 
 import { useMemo, useState } from 'react';
 import { api, type BusFactorRow, type NewUploaderRow, type OwnerAdditionRow } from '../api';
@@ -47,7 +42,6 @@ export function SupplyView({ busy, onBusy, onError, onOpenCrate, onOpenUser }: P
   const busQuery = useMemo(() => ({ top, limit }), [top, limit]);
   const addQuery = useMemo(() => ({ since, minDownloads, self, limit }), [since, minDownloads, self, limit]);
   const upQuery = useMemo(() => ({ top, limit }), [top, limit]);
-  // Only the active board loads; the others get an inert fetch so their hooks stay mounted.
   const bus = useLeaderboard<BusFactorRow, typeof busQuery>(signal === 'bus' ? api.busFactor : inert, busQuery, onBusy, onError);
   const additions = useLeaderboard<OwnerAdditionRow, typeof addQuery>(signal === 'additions' ? api.ownerAdditions : inert, addQuery, onBusy, onError);
   const uploaders = useLeaderboard<NewUploaderRow, typeof upQuery>(signal === 'uploaders' ? api.newUploaders : inert, upQuery, onBusy, onError);

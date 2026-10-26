@@ -15,12 +15,10 @@ pub enum Error {
     CrateNotFound(String),
 }
 
-/// Parse a version string leniently: `lenient_semver` first, then a `major.minor.patch`
-/// fallback that strips non-digits from the patch, because the index contains non-compliant
-/// versions.
+/// Lenient because the index contains non-compliant versions.
 ///
 /// # Errors
-/// Returns `Error::InvalidSemver` if no interpretation works.
+/// `Error::InvalidSemver` if no interpretation works.
 pub fn parse_semver(version: &str) -> Result<semver::Version, Error> {
     if let Ok(s) = lenient_semver::parse(version) {
         return Ok(s);
@@ -46,7 +44,6 @@ pub fn parse_semver(version: &str) -> Result<semver::Version, Error> {
     })
 }
 
-/// One dependency declaration of a crate version, as stored on `[:DEPENDS_ON]`.
 #[derive(Debug, Clone)]
 pub struct DependencyRow {
     pub name: String,
@@ -56,58 +53,43 @@ pub struct DependencyRow {
     pub optional: bool,
 }
 
-/// One version of a crate with its dependency declarations, for batched inserts.
 #[derive(Debug, Clone)]
 pub struct VersionRow {
     pub version: String,
     pub dependencies: Vec<DependencyRow>,
 }
 
-/// What the database holds for one crate, as returned by [`Db::crate_version_status`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CrateDbStatus {
-    /// Version strings with a `(Version)` node.
     pub versions: std::collections::HashSet<String>,
-    /// Version strings whose node has a call graph: at least one `[:HAS_FN]` function.
     pub exported: std::collections::HashSet<String>,
 }
 
-/// A crate version with the done-markers `generate-metadata` jobs left on it, as returned by
-/// [`Db::metadata_work_list`]. A marker is the revision of the job that last wrote the version.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetaState {
     pub name: String,
     pub version: String,
     pub latest: bool,
-    /// `unsafe_scanner`: the `unsafe` job's marker.
     pub unsafe_scanner: Option<String>,
-    /// The last `unsafe` scan failed (`unsafe_error` is set).
     pub unsafe_error: bool,
-    /// `meta_build`.
     pub meta_build: Option<String>,
-    /// `meta_native`.
     pub meta_native: Option<String>,
-    /// `meta_diff`.
     pub meta_diff: Option<String>,
-    /// `diff_base`: the version the stored diff was computed against.
     pub diff_base: Option<String>,
-    /// `meta_registry`: the `registry` job's marker (revision and dump timestamp).
     pub meta_registry: Option<String>,
 }
 
-/// A crates.io user, as the `registry` job writes it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegistryUser {
     pub id: u32,
     pub login: String,
     pub name: String,
-    /// GitHub user id; -1 if unknown.
+    /// -1 if unknown.
     pub gh_id: i64,
-    /// RFC 3339, or empty.
+    /// RFC 3339; empty if absent.
     pub created_at: String,
 }
 
-/// A crates.io team (`github:org:team`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegistryTeam {
     pub id: u32,
@@ -116,19 +98,16 @@ pub struct RegistryTeam {
     pub avatar: String,
 }
 
-/// A crates.io category.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegistryCategory {
     pub slug: String,
     pub name: String,
     pub description: String,
     pub path: String,
-    /// Crates in the category, per crates.io.
     pub crates: i64,
 }
 
-/// Crate-level facts for [`Db::set_registry_crates`]. Dates are RFC 3339; empty strings are
-/// absent values.
+/// Dates are RFC 3339; empty strings mean absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegistryCrate {
     pub name: String,
@@ -149,13 +128,11 @@ pub struct RegistryCrate {
     pub team_owners: Vec<(u32, String, String)>,
     /// `(user id, first upload, last upload, versions uploaded)`.
     pub publishers: Vec<(u32, String, String, i64)>,
-    /// Category slugs.
     pub categories: Vec<String>,
     pub keywords: Vec<String>,
 }
 
-/// Version-level facts for [`Db::set_registry_versions`]; `record` is `None` when the dump
-/// does not know the version.
+/// `record` is `None` when the dump does not know the version.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegistryVersion {
     pub name: String,
@@ -163,27 +140,18 @@ pub struct RegistryVersion {
     pub record: Option<crate::metadata::registry::VersionRecord>,
 }
 
-/// A count as a Neo4j integer, saturating.
 fn int(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
 }
 
-/// Attempts made for one write before giving up on a transient error.
 const WRITE_RETRIES: u32 = 6;
 
-/// `[:CALLS]` edges [`Db::insert_calls`] creates per transaction (rounded up to whole callers).
 pub const CALLS_PER_TX: usize = 10_000;
 
-/// `(:Fn)` nodes [`Db::delete_calls`] deletes per transaction, with all their relationships.
 pub const FNS_PER_DELETE_TX: usize = 1_000;
 
-/// One distinct call made by a crate version: function `caller` calls `callee`, a function of
-/// the crate whose `(Crate)` node is named `crate_name`.
-///
-/// `copies` is how many compiled (caller, callee) function pairs share these demangled names.
-/// Painter demangles without the symbol hash, and legacy Rust mangling does not encode
-/// generic arguments, so every monomorphised instance of a generic function (`foo::<u8>`,
-/// `foo::<String>`, ...) gets the same name; [`collapse_calls`] folds them into one row.
+/// `copies`: painter demangles without the symbol hash and legacy mangling drops generic args,
+/// so monomorphised instances share a name; [`collapse_calls`] folds them into one row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallRow {
     pub caller: String,
@@ -192,21 +160,14 @@ pub struct CallRow {
     pub copies: i64,
 }
 
-/// Longest function name stored as is in `Symbol.name`. Neo4j's range indexes (the
-/// `Symbol.name` uniqueness constraint) reject values over about 8 KB, and deeply nested
-/// generic types produce names that long; see [`symbol_key`].
+/// Neo4j range indexes (the `Symbol.name` constraint) reject values over about 8 KB; see [`symbol_key`].
 pub const MAX_SYMBOL_NAME_BYTES: usize = 4096;
 
-/// Bytes of a long name kept at the front of its [`symbol_key`].
 const SYMBOL_KEY_PREFIX_BYTES: usize = 4000;
 
-/// The `Symbol.name` a function name is stored under, and the full name when that differs.
-///
-/// Names up to [`MAX_SYMBOL_NAME_BYTES`] are their own key. A longer name is keyed by its first
-/// 4000 bytes, `…#`, and the 64-bit FNV-1a hash of the whole name in hex; the full name goes in
-/// the unindexed `Symbol.full_name`. The key is deterministic, so every version that mentions
-/// the same long function `MERGE`s onto the same node, and the prefix still starts with the
-/// function's path (so its crate can be read from it).
+/// Longer names are keyed by a 4000-byte prefix, `…#`, and the FNV-1a hash of the whole name,
+/// with the full name in unindexed `Symbol.full_name`. Deterministic, so every version `MERGE`s onto
+/// the same node; the prefix keeps the path so the callee crate can still be read from it.
 #[must_use]
 pub fn symbol_key(name: &str) -> (std::borrow::Cow<'_, str>, Option<&str>) {
     if name.len() <= MAX_SYMBOL_NAME_BYTES {
@@ -225,10 +186,8 @@ pub fn symbol_key(name: &str) -> (std::borrow::Cow<'_, str>, Option<&str>) {
     )
 }
 
-/// Fold repeated `(caller, callee, callee crate)` triples into one [`CallRow`] each, counting
-/// the repeats in `copies`. Nothing but the multiplicity is lost: the repeats are identical
-/// once demangled.
-/// The result is sorted by caller, then callee, so each caller's calls are adjacent.
+/// Repeats are identical once demangled, so only multiplicity is lost. Sorted by caller so each
+/// caller's calls are adjacent.
 #[must_use]
 pub fn collapse_calls<I>(calls: I) -> Vec<CallRow>
 where
@@ -249,9 +208,7 @@ where
         .collect()
 }
 
-/// Split `calls` (sorted by caller, as [`collapse_calls`] returns them) into batches of whole
-/// callers holding about `per_batch` calls each. A caller is never split across batches, so a
-/// batch can exceed `per_batch` by one caller's calls.
+/// Callers are never split, so a batch can exceed `per_batch` by one caller's calls.
 #[must_use]
 pub fn caller_batches(calls: &[CallRow], per_batch: usize) -> Vec<Vec<&[CallRow]>> {
     let mut batches = Vec::new();
@@ -271,9 +228,7 @@ pub fn caller_batches(calls: &[CallRow], per_batch: usize) -> Vec<Vec<&[CallRow]
     batches
 }
 
-/// Whether a database error is transient (a deadlock between concurrent writers touching the
-/// same nodes or index entries, or any other `Neo.TransientError`) and the write can simply be
-/// retried. Neo4j rolls the failed transaction back, so a retry never duplicates data.
+/// Neo4j rolls the failed transaction back, so a retry never duplicates data.
 #[must_use]
 pub fn is_transient(e: &Error) -> bool {
     let msg = e.to_string();
@@ -282,8 +237,7 @@ pub fn is_transient(e: &Error) -> bool {
         || msg.contains("ForsetiClient")
 }
 
-/// Exponential backoff for retry `attempt` (1-based): 100ms, 200ms, 400ms, ... plus up to 50ms
-/// of jitter so writers that deadlocked against each other do not retry in lockstep.
+/// Jitter keeps writers that deadlocked against each other from retrying in lockstep.
 fn backoff(attempt: u32) -> Duration {
     let jitter = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -295,14 +249,12 @@ pub struct Db {
     conn: Arc<Graph>,
 }
 impl Db {
-    /// Run a write query that returns nothing, retrying transient failures with backoff. See
-    /// [`is_transient`].
     async fn write(&self, q: Query) -> Result<(), Error> {
         self.write_first_row(q).await.map(|_| ())
     }
 
-    /// Run a write query and return its first row, if any. The whole result is consumed inside
-    /// the retry loop, so a transient failure surfaced while streaming rows is retried too.
+    /// Consumes the whole result inside the retry loop so a transient failure while streaming rows
+    /// is retried too.
     async fn write_first_row(&self, q: Query) -> Result<Option<Row>, Error> {
         let mut attempt = 0;
         loop {
@@ -330,11 +282,10 @@ impl Db {
         self.conn.clone()
     }
 
-    /// Connect to the neo4j database with the specified parameters.
     /// # Panics
-    /// This function will panic if invalid parameters are provided in the configuration.
+    /// On invalid configuration.
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a connection failure.
+    /// On connection failure.
     pub async fn connect<URI, U, P>(uri: URI, username: U, password: P) -> Result<Self, Error>
     where
         URI: AsRef<str>,
@@ -348,8 +299,7 @@ impl Db {
                     .user(username.as_ref())
                     .password(password.as_ref())
                     .db("neo4j")
-                    // Rows per PULL. Small results are unaffected; `metadata_work_list` streams
-                    // millions of rows and would take one round trip per 10 of them otherwise.
+                    // Without this `metadata_work_list` takes one round trip per 10 of its millions of rows.
                     .fetch_size(1_000)
                     .max_connections(64)
                     .build()
@@ -360,27 +310,12 @@ impl Db {
         Ok(Self { conn })
     }
 
-    /// Replace the call graph of one crate version. Every `(:Fn)` the version already has is
-    /// deleted first ([`Db::delete_calls`]), so re-importing a version never duplicates calls.
-    /// `calls` must be sorted by caller, as [`collapse_calls`] returns them, and every
-    /// `crate_name` should name an existing `(Crate)`; a call whose crate is missing is dropped
-    /// by the `MATCH`.
-    ///
-    /// ```text
-    /// (Version)-[:HAS_FN]->(:Fn)-[:IS]->(:Symbol {name: caller})
-    /// (:Fn)-[:CALLS {copies}]->(:Symbol {name: callee})-[:IN]->(Crate)
-    /// ```
-    ///
-    /// `(:Symbol)` nodes are shared by every version that calls or defines the same function
-    /// and are `MERGE`d through the `Symbol.name` uniqueness constraint on their
-    /// [`symbol_key`] (see
-    /// `docker/queries.md`); so is a symbol's `IN` edge. Writes run [`CALLS_PER_TX`] calls per
-    /// transaction (whole callers each), so the replacement is not atomic: if it fails part way
-    /// the version keeps some of its new calls, and re-importing it fixes that. An empty
-    /// `calls` still deletes the old graph.
+    /// Not atomic: [`CALLS_PER_TX`] calls per transaction, so a failure part way keeps some new calls;
+    /// re-importing fixes it. `calls` must be sorted by caller; calls into a missing `(Crate)` are
+    /// dropped by the `MATCH`.
     ///
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     pub async fn insert_calls(
         &self,
         src_crate: (&str, &str),
@@ -389,9 +324,8 @@ impl Db {
         self.delete_calls(src_crate.0, src_crate.1).await?;
 
         for batch in caller_batches(calls, CALLS_PER_TX) {
-            // neo4rs 0.6 does not expose its map type, so send parallel (nested) lists and
-            // index them: callers[i] calls callees[i][j] in crate dsts[i][j]. Names are sent
-            // as their `symbol_key`, with the full name alongside when it was shortened.
+            // neo4rs 0.6 has no map type: send parallel (nested) lists, callers[i] calls callees[i][j] in
+            // crate dsts[i][j].
             let from_keys: Vec<(std::borrow::Cow<'_, str>, Option<&str>)> =
                 batch.iter().map(|g| symbol_key(&g[0].caller)).collect();
             let to_keys: Vec<Vec<(std::borrow::Cow<'_, str>, Option<&str>)>> = batch
@@ -448,20 +382,11 @@ impl Db {
         Ok(())
     }
 
-    /// Insert a crate with every one of its versions and their dependency edges in a single
-    /// write query. This is the fast path used by `create-fresh-db`: one round trip per crate
-    /// instead of one per version plus one per dependency.
-    ///
-    /// Resumable: versions that already exist in the database are skipped (checked through the
-    /// `(name, version)` uniqueness index), so re-running an interrupted import only adds what is
-    /// missing and never duplicates nodes or edges. `(Crate)` nodes are `MERGE`d because other
-    /// crates' dependencies may already have created them. Versions whose number cannot be
-    /// parsed even leniently are skipped with a warning rather than failing the crate.
-    ///
-    /// `(Crate)-[:VERSION_OF]->(Version)-[:DEPENDS_ON {requirement, features, kind, optional}]->(Crate)`
+    /// Skips versions that already exist, so an interrupted import is resumable. `(Crate)` is `MERGE`d
+    /// because dependencies may have created it.
     ///
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     #[allow(clippy::too_many_lines)]
     pub async fn insert_crate_versions(
         &self,
@@ -480,7 +405,6 @@ impl Db {
             .collect();
 
         if parsed.is_empty() {
-            // Still make sure the crate node exists.
             self.write(query("MERGE (:Crate { name: $name })").param("name", name))
                 .await?;
             return Ok(());
@@ -501,7 +425,6 @@ impl Db {
             .collect();
         let builds: Vec<&str> = parsed.iter().map(|(_, sv)| sv.build.as_str()).collect();
         let pres: Vec<&str> = parsed.iter().map(|(_, sv)| sv.pre.as_str()).collect();
-        // Per-version dependency columns: outer index = version, inner = dependency.
         let dep_names: Vec<Vec<&str>> = parsed
             .iter()
             .map(|(r, _)| r.dependencies.iter().map(|d| d.name.as_str()).collect())
@@ -573,15 +496,12 @@ impl Db {
         Ok(())
     }
 
-    /// For each crate name that has a `(Crate)` node, list its `(Version)` nodes and which of
-    /// them have a call graph (`HAS_FN`). Names with no `(Crate)` node are absent from the result.
-    /// Versions are reached through `VERSION_OF` because the `(name, version)` constraint
-    /// index cannot serve a name-only lookup, which would otherwise scan every `Version`.
+    /// Reached through `VERSION_OF`: the `(name, version)` index cannot serve a name-only lookup.
     ///
     /// # Panics
-    /// Panics if the server returns a row without the requested columns.
+    /// If the server returns a row without the requested columns.
     /// # Errors
-    /// Returns `Error::Neo4jError` on a query failure.
+    /// On a database error.
     pub async fn crate_version_status(
         &self,
         names: &[&str],
@@ -620,25 +540,12 @@ impl Db {
         Ok(out)
     }
 
-    /// Insert a new version of a crate into the database. This will create a new `(Version)` node,
-    /// linking it to its associated top-level `(Crate)` node. If that node does not exist, it is created.
-    ///
-    /// Also inserts all dependency relationships for this version of the crate; whatever is specified
-    /// in the Cargo.toml for this version as its dependencies will gain `[:DEPENDS_ON]` relationships
-    /// with other `(Crate)` nodes. We do not specify exact version-version `[:DEPENDS_ON]` relationships,
-    /// because semver may cause these versions to shift and change based on build time and release
-    /// cycles.
-    ///
-    /// If the current relationship already exists, a new one will *not* be created, hence the upsert.
-    ///
-    /// `(Version)-[:DEPENDS_ON {requirement, features, kind, optional}]->(Crate)`
+    /// Dependencies link to `(Crate)`, not a version, because semver resolution shifts with build time.
     ///
     /// # Panics
-    /// This function may panic if there is an error in the initial insertion of the Crate node
-    /// in which it cant be referenced in future queries. Specifically, it will panic in the event
-    /// a new Node is not returned during insertion.
+    /// If the new `Crate` node is not returned on insertion.
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     pub async fn upsert_crate_version<'a, I, S1, S2, S3, S4, S5>(
         &self,
         name: &str,
@@ -720,11 +627,10 @@ impl Db {
         Ok(())
     }
 
-    ///
     /// # Panics
-    ///
+    /// If the result stream fails.
     /// # Errors
-    ///
+    /// On a database error.
     pub async fn crate_exists<S1>(&self, name: S1) -> Result<bool, Error>
     where
         S1: AsRef<str>,
@@ -742,13 +648,10 @@ impl Db {
             .is_some())
     }
 
-    /// Delete the call graph of one crate version: its `(:Fn)` nodes with their `HAS_FN`,
-    /// `IS`, and `CALLS` edges, [`FNS_PER_DELETE_TX`] functions per transaction. The
-    /// `(Version)` node, its other relationships, and the shared `(:Symbol)` nodes stay; a
-    /// symbol nothing refers to any more is left in place.
+    /// Shared `(:Symbol)` nodes stay, even if nothing refers to them any more.
     ///
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     pub async fn delete_calls<S1, S2>(&self, name: S1, version: S2) -> Result<(), Error>
     where
         S1: AsRef<str>,
@@ -776,10 +679,8 @@ impl Db {
         }
     }
 
-    /// Which of `names` exist as `(Crate)` nodes. One indexed lookup per name, sent in chunks.
-    ///
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     pub async fn existing_crate_names(
         &self,
         names: &[String],
@@ -802,12 +703,10 @@ impl Db {
         Ok(found)
     }
 
-    /// Whether a crate version already has a call graph (at least one `[:HAS_FN]` function).
-    ///
     /// # Panics
-    /// Panics if the result stream fails after the query was accepted.
+    /// If the result stream fails after the query was accepted.
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     pub async fn has_call_graph<S1, S2>(&self, name: S1, version: S2) -> Result<bool, Error>
     where
         S1: AsRef<str>,
@@ -827,13 +726,11 @@ impl Db {
             .is_some())
     }
 
-    /// Mark `version` as the latest of crate `name` and clear the flag on its other versions,
-    /// in one statement. Versions are reached through the `Crate` node: a name-only
-    /// `MATCH (v:Version { name })` cannot use the `(name, version)` constraint index and
-    /// label-scans every `Version` in the database.
+    /// Reached through the `Crate` node: a name-only `MATCH (v:Version { name })` cannot use the
+    /// `(name, version)` index and scans every `Version`.
     ///
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     pub async fn set_latest<S1, S2>(&self, name: S1, version: S2) -> Result<(), Error>
     where
         S1: AsRef<str>,
@@ -850,11 +747,10 @@ impl Db {
         .await
     }
 
-    ///
     /// # Panics
-    ///
+    /// If the result stream fails.
     /// # Errors
-    ///
+    /// On a database error.
     pub async fn version_exists<S1, S2>(&self, name: S1, version: S2) -> Result<bool, Error>
     where
         S1: AsRef<str>,
@@ -874,11 +770,10 @@ impl Db {
             .is_some())
     }
 
-    ///
     /// # Panics
-    ///
+    /// If the result stream fails.
     /// # Errors
-    ///
+    /// On a database error.
     pub async fn crate_version_exists<S1, S2>(&self, name: S1, version: S2) -> Result<bool, Error>
     where
         S1: AsRef<str>,
@@ -898,15 +793,12 @@ impl Db {
             .is_some())
     }
 
-    /// Every crate version with the done-markers the `generate-metadata` jobs left on it, for
-    /// [`crate::metadata::generate_metadata`] to decide what is pending. Restricted to the crates
-    /// in `only` when non-empty. Versions are reached through their `(Crate)`: a bare
-    /// `(v:Version)` scan cannot use the name constraint index.
+    /// Reached through `(Crate)`: a bare `(v:Version)` scan cannot use the name constraint index.
     ///
     /// # Panics
-    /// Panics if the server returns a row without the requested columns.
+    /// If the server returns a row without the requested columns.
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     pub async fn metadata_work_list(&self, only: &[String]) -> Result<Vec<MetaState>, Error> {
         let start = if only.is_empty() {
             "MATCH (c:Crate)-[:VERSION_OF]->(v:Version)"
@@ -949,17 +841,11 @@ impl Db {
         Ok(out)
     }
 
-    /// Upsert `unsafe` job results (see [`crate::metadata::unsafety`]), all of `results` in one
-    /// transaction per kind. A scanned version gets `unsafe_total`,
-    /// `unsafe_{functions,exprs,impls,traits,methods}`, `safe_{...}`, `rs_files`,
-    /// `rs_files_failed`, `rs_lines`, `rs_bytes`, `rs_forbid_files`, `forbids_unsafe` (absent
-    /// when no crate root file parsed), and its done-marker `unsafe_scanner` plus
-    /// `unsafe_scanned_at`, and loses any `unsafe_error`. A version that could not be read gets
-    /// `unsafe_error` instead and loses its counts. Every property is `SET`, so rewriting a
-    /// version replaces it.
+    /// Every property is `SET`, so rewriting a version replaces it; `forbids_unsafe` is absent when no
+    /// crate root file parsed.
     ///
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     #[allow(clippy::too_many_lines)]
     pub async fn set_unsafe_batch(
         &self,
@@ -1064,12 +950,10 @@ impl Db {
         Ok(())
     }
 
-    /// Upsert `build` job results ([`crate::metadata::build`]): `has_build_script`,
-    /// `build_script` (path), `build_script_lines`, `links`, and the done-marker `meta_build`.
     /// Absent values are `SET` to null, which removes a stale property.
     ///
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     pub async fn set_build_batch(
         &self,
         results: &[(&str, &str, &crate::metadata::build::BuildInfo)],
@@ -1122,14 +1006,8 @@ impl Db {
         .await
     }
 
-    /// Upsert `native` job results ([`crate::metadata::native`]): `has_native_code`,
-    /// `vendored_native`, `native_source_files`, `native_header_files`, `native_source_lines`,
-    /// `native_lines`, `native_bytes`, `native_largest_bytes`, `native_vendor_dir_lines`,
-    /// `native_langs`, `native_dirs`, `native_prebuilt_files`, and the done-marker
-    /// `meta_native`.
-    ///
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     pub async fn set_native_batch(
         &self,
         results: &[(&str, &str, &crate::metadata::native::NativeInfo)],
@@ -1196,15 +1074,10 @@ impl Db {
         .await
     }
 
-    /// Upsert `diff` job results ([`crate::metadata::diff`]): `diff_base` (null for the first
-    /// version), totals `diff_files_added` / `_removed` / `_modified`, `diff_lines_added` /
-    /// `_removed`, `diff_files_total`, `diff_approximate`, the per-file parallel lists
-    /// `diff_paths`, `diff_status`, `diff_added`, `diff_removed`, `diff_binary` (index `i` of
-    /// each describes one changed file), and the done-marker `meta_diff`. The lists are
-    /// replaced wholesale, so rewriting never duplicates entries.
+    /// The per-file lists are replaced wholesale, so rewriting never duplicates entries.
     ///
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     #[allow(clippy::too_many_lines)]
     pub async fn set_diff_batch(
         &self,
@@ -1326,12 +1199,10 @@ impl Db {
         .await
     }
 
-    /// Record whether a version's tarball could be read by `generate-metadata`: a non-empty
-    /// entry sets `meta_error` (the version's pending jobs stay pending and are retried by the
-    /// next run), an empty one removes it.
+    /// A non-empty entry leaves the version's jobs pending so the next run retries them.
     ///
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     pub async fn set_meta_error_batch(&self, results: &[(&str, &str, &str)]) -> Result<(), Error> {
         if results.is_empty() {
             return Ok(());
@@ -1349,13 +1220,10 @@ impl Db {
         .await
     }
 
-    /// Create the `registry` job's constraints and indexes if missing (see
-    /// `docker/queries.md`): unique `User.id`, `Team.id`, `Category.slug`, `Keyword.name`, and
-    /// range indexes on `User.login`, `PUBLISHED.at`, `OWNS.since`, `Version.published_at`,
-    /// `Crate.created_at`, and `Crate.downloads`. New indexes populate in the background.
+    /// New indexes populate in the background.
     ///
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     pub async fn ensure_registry_schema(&self) -> Result<(), Error> {
         for q in REGISTRY_SCHEMA_CYPHER {
             self.write(query(q)).await?;
@@ -1363,10 +1231,8 @@ impl Db {
         Ok(())
     }
 
-    /// Upsert `(User {id})` nodes with `login`, `name`, `gh_id`, `created_at`.
-    ///
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     pub async fn upsert_registry_users(&self, users: &[&RegistryUser]) -> Result<(), Error> {
         if users.is_empty() {
             return Ok(());
@@ -1392,10 +1258,8 @@ impl Db {
         .await
     }
 
-    /// Upsert `(Team {id})` nodes with `login`, `name`, `avatar`.
-    ///
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     pub async fn upsert_registry_teams(&self, teams: &[&RegistryTeam]) -> Result<(), Error> {
         if teams.is_empty() {
             return Ok(());
@@ -1427,10 +1291,8 @@ impl Db {
         .await
     }
 
-    /// Upsert `(Category {slug})` nodes with `name`, `description`, `path`, `crates`.
-    ///
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     pub async fn upsert_registry_categories(
         &self,
         categories: &[&RegistryCategory],
@@ -1481,13 +1343,10 @@ impl Db {
         .await
     }
 
-    /// Write crate-level registry facts: `Crate` properties, and replace the crate's incoming
-    /// `OWNS` and `PUBLISHED` and outgoing `IN_CATEGORY` and `HAS_KEYWORD` edges. Users, teams,
-    /// and categories must exist ([`Db::upsert_registry_users`] etc.); keywords are merged.
-    /// Crates without a `(Crate)` node are skipped.
+    /// Users, teams, and categories must exist first; crates without a `(Crate)` node are skipped.
     ///
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     #[allow(clippy::too_many_lines)]
     pub async fn set_registry_crates(&self, crates: &[RegistryCrate]) -> Result<(), Error> {
         if crates.is_empty() {
@@ -1598,14 +1457,8 @@ impl Db {
         .await
     }
 
-    /// Write version-level registry facts and the done-marker `meta_registry = marker`. A
-    /// version with a dump record gets `published_at`, `yanked`, `license`, `crate_size`,
-    /// `downloads`, `edition`, `rust_version`, `has_lib`, `bin_names`, and its uploader's
-    /// `(User)-[:PUBLISHED {at}]->(Version)` (replacing any other uploader's); one without gets
-    /// those removed and `registry_missing = true`.
-    ///
     /// # Errors
-    /// This function will return an `painter::db::Error` in the event of a database error.
+    /// On a database error.
     pub async fn set_registry_versions(
         &self,
         rows: &[RegistryVersion],
@@ -1703,8 +1556,6 @@ impl Db {
     }
 }
 
-/// One owner column of [`Db::set_registry_crates`]: per crate, the user (or team) owners
-/// mapped through `f`.
 fn owner_col<T>(
     crates: &[RegistryCrate],
     teams: bool,
@@ -1723,7 +1574,6 @@ fn owner_col<T>(
         .collect()
 }
 
-/// Constraints and indexes of the `registry` job, run by [`Db::ensure_registry_schema`].
 pub const REGISTRY_SCHEMA_CYPHER: [&str; 10] = [
     "CREATE CONSTRAINT const_user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE",
     "CREATE CONSTRAINT const_team_id IF NOT EXISTS FOR (t:Team) REQUIRE t.id IS UNIQUE",
@@ -1745,10 +1595,8 @@ mod tests {
     fn parse_semver_accepts_strict_and_lenient_versions() {
         let v = parse_semver("1.2.3").unwrap();
         assert_eq!((v.major, v.minor, v.patch), (1, 2, 3));
-        // lenient: missing patch
         let v = parse_semver("1.2").unwrap();
         assert_eq!((v.major, v.minor, v.patch), (1, 2, 0));
-        // prerelease and build metadata survive
         let v = parse_semver("1.0.0-alpha.1+build.5").unwrap();
         assert_eq!(v.pre.as_str(), "alpha.1");
         assert_eq!(v.build.as_str(), "build.5");
@@ -1756,8 +1604,7 @@ mod tests {
 
     #[test]
     fn parse_semver_falls_back_to_digit_stripping() {
-        // Not valid even for lenient_semver, but the index contains strings like this: the
-        // fallback keeps only the digits of the patch component.
+        // The index contains strings like this.
         assert!(lenient_semver::parse("1.2.3!!").is_err());
         let v = parse_semver("1.2.3!!").unwrap();
         assert_eq!((v.major, v.minor, v.patch), (1, 2, 3));
@@ -1791,7 +1638,7 @@ mod tests {
         assert!(backoff(1) >= Duration::from_millis(100));
         assert!(backoff(1) < Duration::from_millis(150));
         assert!(backoff(3) >= Duration::from_millis(400));
-        // The shift is clamped so an absurd attempt count cannot overflow.
+        // The shift is clamped so a huge attempt count cannot overflow.
         assert!(backoff(60) <= Duration::from_millis(51_250));
     }
 

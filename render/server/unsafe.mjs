@@ -1,15 +1,7 @@
-// Unsafe view: leaderboards, coverage, per-crate history, and dependency-closure
-// totals over the unsafe-code metrics `painter count-unsafe` stores on Version
-// nodes (unsafe_* / safe_* geiger counters, rs_* source sizes, forbids_unsafe,
-// has_build_script, unsafe_scanner / unsafe_scanned_at / unsafe_error).
-//
 import neo4j from 'neo4j-driver';
 
-// Every function takes `read(cypher, params)` resolving to plain row objects.
-// `scope` is 'latest' (versions flagged latest, served by idx_is_latest) or
-// 'all' (every version: a label scan, seconds on millions of versions).
+// `scope` 'latest' is served by idx_is_latest; 'all' is a label scan (seconds on millions of versions).
 
-/** Sortable columns of the leaderboard and the Cypher expression behind each. */
 export const SORTS = {
   total: 'v.unsafe_total',
   functions: 'v.unsafe_functions',
@@ -39,7 +31,6 @@ const RETURN_ROW = `
          v.unsafe_scanner AS scanner, toString(v.unsafe_scanned_at) AS scannedAt, v.unsafe_error AS error,
          density, share`;
 
-/** Unsafe expressions per thousand lines, and the unsafe share of all expressions. */
 const DERIVED = `
   WITH v,
        CASE WHEN v.rs_lines > 0 THEN 1000.0 * v.unsafe_exprs / v.rs_lines ELSE 0.0 END AS density,
@@ -48,11 +39,7 @@ const DERIVED = `
 
 const scopeClause = (scope) => (scope === 'all' ? 'true' : 'v.latest = true');
 
-/**
- * Coverage and totals: how many versions are scanned, how many have unsafe at all,
- * sums per category, and a histogram of unsafe_total. Aggregates every version
- * in scope, so callers should cache it.
- */
+// Aggregates every version in scope, so callers should cache it.
 export const unsafeStats = async (read, scope) => {
   const rows = await read(
     `MATCH (v:Version) WHERE ${scopeClause(scope)}
@@ -76,11 +63,7 @@ export const unsafeStats = async (read, scope) => {
   return { scope, ...rows[0] };
 };
 
-/**
- * The leaderboard: scanned versions in scope, filtered and ordered server-side.
- * `sort` is a key of SORTS; `forbids` / `build` are 'any' | 'yes' | 'no'.
- * Returns one row more than `limit` was asked for when more exist (`hasMore`).
- */
+// Returns one row more than `limit` when more exist (`hasMore`).
 export const unsafeTop = async (read, { scope, sort, desc, q, forbids, build, minLines, minUnsafe, limit, offset }) => {
   const order = SORTS[sort] ?? SORTS.total;
   const rows = await read(
@@ -103,7 +86,6 @@ export const unsafeTop = async (read, { scope, sort, desc, q, forbids, build, mi
   return { rows: hasMore ? rows.slice(0, limit) : rows, hasMore };
 };
 
-/** Every version of one crate with its metrics, oldest first (semver order). */
 export const unsafeCrate = async (read, name) =>
   read(
     `MATCH (:Crate {name: $name})-[:VERSION_OF]->(v:Version)
@@ -113,13 +95,7 @@ export const unsafeCrate = async (read, name) =>
     { name },
   );
 
-/**
- * Unsafe in the dependency closure of one crate version: its direct dependencies and,
- * through each dependency's latest version, their dependencies, `depth` hops out
- * (1 = direct only, at most 5). Dev-dependencies are skipped at every hop; optional
- * dependencies are included. Each dependency is reported at its latest version,
- * most unsafe first, capped at `limit`.
- */
+// Dev-dependencies are skipped at every hop; optional ones are included.
 export const unsafeDeps = async (read, { crate, version, depth, limit }) => {
   const hops = Math.min(5, Math.max(1, depth)) - 1;
   const [head] = await read(

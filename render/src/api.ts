@@ -1,5 +1,3 @@
-// Thin client for the render server's JSON API (same origin, /api/...).
-
 export interface GraphNode {
   id: string;
   labels: string[];
@@ -24,11 +22,9 @@ export interface GraphPayload {
     elapsedMs: number;
     truncated?: boolean;
     resolvedName?: string;
-    /** Deps view: edge cap applied, total crate->crate pairs in the DB (whole-graph only), cache hit. */
     limit?: number;
     totalPairs?: number | null;
     cached?: boolean;
-    /** Deps chain: filter text, whether it was a partial match, root crate names, depth reached. */
     query?: string;
     partial?: boolean;
     roots?: string[];
@@ -51,7 +47,6 @@ export interface Health {
   };
 }
 
-/** Which graph the UI shows. */
 export type View = 'default' | 'deps' | 'map' | 'callers' | 'unsafe' | 'build' | 'native' | 'diffs' | 'publishers' | 'releases' | 'supply';
 
 export const VIEWS: { id: View; label: string; title: string }[] = [
@@ -68,22 +63,17 @@ export const VIEWS: { id: View; label: string; title: string }[] = [
   { id: 'supply', label: 'Supply chain', title: 'Ownership signals on popular crates: single-owner crates, recent owner additions, first-time uploaders of the latest version' },
 ];
 
-/** Views that are tables, not a graph canvas: no search box, layout, or edge toggles. */
 export const TABLE_VIEWS: ReadonlySet<View> = new Set<View>(['callers', 'unsafe', 'build', 'native', 'diffs', 'publishers', 'releases', 'supply']);
 export const isTableView = (v: View) => TABLE_VIEWS.has(v);
 
-/** Callers view: one function that reaches the searched function. */
 export interface CallerRow {
-  /** Call levels from the searched function; 1 = calls it directly. */
   depth: number;
   crate: string;
   version: string;
   function: string;
-  /** The function this row calls on the way to the searched one. */
   calls: string;
   /** False when a version was pinned but the caller has no direct DEPENDS_ON to check it against. */
   verified: boolean;
-  /** This function, then each callee down to the searched function. */
   path: string[];
 }
 
@@ -94,13 +84,11 @@ export interface CallersResult {
     version: string | null;
     fn: string;
     exact: boolean;
-    /** Functions of the crate the search matched (one for an exact search). */
     targets: string[];
     maxDepth: number;
     depth: number;
     limit: number;
     truncated: boolean;
-    /** Nothing further out calls any row: the walk ended before max depth. */
     exhausted: boolean;
     unverified: number;
     /** Edges dropped because the caller's requirement excludes the pinned version. */
@@ -121,11 +109,9 @@ export interface CallersQuery {
 export interface CrateVersion {
   version: string;
   latest: boolean;
-  /** Has a call graph (HAS_FN functions), i.e. painter exported it. */
   exported: boolean;
 }
 
-/** Map view: one viewport's worth of elements from the LOD index. */
 export interface LodViewport {
   mode: 'crates' | 'cells';
   level: number;
@@ -161,16 +147,11 @@ export interface LodStatus {
   config: { iterations: number; budget: number; maxLevel: number };
 }
 
-// ---------------------------------------------------------------------------
-// Unsafe view (painter count-unsafe metrics on Version nodes)
-// ---------------------------------------------------------------------------
-
 export type UnsafeScope = 'latest' | 'all';
 export type UnsafeTri = 'any' | 'yes' | 'no';
 export type UnsafeCategory = 'functions' | 'exprs' | 'impls' | 'traits' | 'methods';
 export type UnsafeSort = UnsafeCategory | 'total' | 'density' | 'share' | 'lines' | 'files' | 'forbidFiles' | 'failed' | 'name';
 
-/** One crate version's unsafe metrics as the server returns them. */
 export interface UnsafeRow {
   name: string;
   version: string;
@@ -198,9 +179,7 @@ export interface UnsafeRow {
   scanner: string | null;
   scannedAt: string | null;
   error: string | null;
-  /** Unsafe expressions per thousand lines. */
   density: number;
-  /** Unsafe expressions / all expressions. */
   share: number;
 }
 
@@ -225,7 +204,6 @@ export interface UnsafeStats {
   lines: number;
   files: number;
   filesFailed: number;
-  /** Scanned versions with unsafe_total 0, 1–10, 11–100, 101–1000, >1000. */
   histogram: number[];
   elapsedMs: number;
   cached: boolean;
@@ -280,22 +258,14 @@ export interface UnsafeDepsResult {
   meta: { elapsedMs: number };
 }
 
-// ---------------------------------------------------------------------------
-// Build scripts / Native code / Diffs views (painter generate-metadata properties)
-// ---------------------------------------------------------------------------
-
-/** One crate version's build-script facts. Nulls where the build job has not run. */
 export interface BuildRow {
   name: string;
   version: string;
   latest: boolean;
   hasBuildScript: boolean | null;
-  /** Script path, normally `build.rs`. */
   path: string | null;
   lines: number | null;
-  /** `package.links`: the native library the script claims. */
   links: string | null;
-  /** `meta_build` marker (job revision); null = not scanned. */
   revision: string | null;
   error: string | null;
   rsLines: number | null;
@@ -316,7 +286,6 @@ export interface LinksRow {
 export interface BuildStats {
   scope: UnsafeScope;
   versions: number;
-  /** Versions with the build job's marker. */
   scanned: number;
   /** Versions where has_build_script is set at all (the unsafe scanner stored it too). */
   known: number;
@@ -324,12 +293,9 @@ export interface BuildStats {
   withBuild: number;
   withBuildScanned: number;
   withLinks: number;
-  /** Scripts not at the default `build.rs`. */
   custom: number;
-  /** Build script declared but not in the tarball. */
   missingScript: number;
   scriptLines: number;
-  /** Scanned build scripts by line count: 0–10, 11–50, 51–200, 201–1000, >1000. */
   histogram: number[];
   topLinks: LinksRow[];
   elapsedMs: number;
@@ -342,7 +308,6 @@ export interface BuildTopQuery {
   desc: boolean;
   q: string;
   links: UnsafeTri;
-  /** Exact `links` library name, '' for any. */
   link: string;
   custom: UnsafeTri;
   minLines: number;
@@ -352,7 +317,6 @@ export interface BuildTopQuery {
 
 export type NativeLang = 'c' | 'c++' | 'objc' | 'asm';
 
-/** One crate version's native-code facts. Nulls where the native job has not run. */
 export interface NativeRow {
   name: string;
   version: string;
@@ -362,7 +326,6 @@ export interface NativeRow {
   sourceFiles: number | null;
   headerFiles: number | null;
   sourceLines: number | null;
-  /** Non-blank lines in sources and headers. */
   lines: number | null;
   bytes: number | null;
   largestBytes: number | null;
@@ -394,7 +357,6 @@ export interface NativeStats {
   lines: number;
   bytes: number;
   prebuiltFiles: number;
-  /** Versions with native code by native_lines: 1–100, 101–1k, 1k–10k, 10k–100k, >100k. */
   histogram: number[];
   langs: { lang: string; versions: number; crates: number; lines: number }[];
   dirs: { dir: string; versions: number; crates: number }[];
@@ -415,12 +377,10 @@ export interface NativeTopQuery {
   offset: number;
 }
 
-/** One crate version's changes against its predecessor. Nulls where the diff job has not run. */
 export interface DiffRow {
   name: string;
   version: string;
   latest: boolean;
-  /** The version compared against; null for a crate's first version. */
   base: string | null;
   filesAdded: number | null;
   filesRemoved: number | null;
@@ -432,7 +392,6 @@ export interface DiffRow {
   approximate: boolean | null;
   revision: string | null;
   error: string | null;
-  /** Lines added + removed. */
   churn: number;
   filesChanged: number;
   rsLines: number | null;
@@ -450,7 +409,6 @@ export interface DiffFile {
 }
 
 export interface DiffVersion extends DiffRow {
-  /** Changed files, biggest first; null when the diff job has not run on this version. */
   files: DiffFile[] | null;
 }
 
@@ -459,10 +417,8 @@ export interface DiffStats {
   versions: number;
   scanned: number;
   unreadable: number;
-  /** Scanned versions with no predecessor. */
   firsts: number;
   approximate: number;
-  /** Versions identical to their predecessor. */
   unchanged: number;
   linesAdded: number;
   linesRemoved: number;
@@ -470,7 +426,6 @@ export interface DiffStats {
   filesRemoved: number;
   filesModified: number;
   filesTotal: number;
-  /** Non-first versions by churn: 0, 1–10, 11–100, 101–1k, 1k–10k, >10k. */
   histogram: number[];
   elapsedMs: number;
   cached: boolean;
@@ -488,18 +443,11 @@ export interface DiffTopQuery {
   offset: number;
 }
 
-// ---------------------------------------------------------------------------
-// Publishers / Releases / Supply chain views (crates.io registry data: User, Team,
-// OWNS, PUBLISHED, Category, Keyword, and the registry properties on Crate / Version)
-// ---------------------------------------------------------------------------
-
 export interface RegistryStats {
   users: number;
   teams: number;
   owns: number;
-  /** PUBLISHED->Crate edges: (user, crate) publisher pairs. */
   cratePublishers: number;
-  /** PUBLISHED->Version edges: uploads with a recorded uploader. */
   versionUploads: number;
   categories: number;
   keywords: number;
@@ -510,7 +458,6 @@ export interface RegistryStats {
   latestVersions: number;
   latestInRegistry: number;
   latestYanked: number;
-  /** `registry-1@<dump timestamp>` marker of the newest dump. */
   dump: string | null;
   versions: number;
   versionsInRegistry: number;
@@ -524,12 +471,10 @@ export interface RegistryStats {
 export interface UserHit {
   login: string;
   name: string | null;
-  /** Crates published (0 for teams). */
   crates: number;
   owns: number;
 }
 
-/** One crate in a publisher's profile: registry facts, the latest version's metadata, and the user's relation to it. */
 export interface PublisherCrate {
   name: string;
   downloads: number | null;
@@ -559,7 +504,6 @@ export interface PublisherProfile {
   createdAt: string | null;
   avatar: string | null;
   crates: PublisherCrate[];
-  /** Uploads per month (users only). */
   timeline: { year: number; month: number; uploads: number }[];
   totals: {
     crates: number;
@@ -595,7 +539,6 @@ export interface TopOwnerRow {
   login: string;
   name: string | null;
   crates: number;
-  /** Crates where this is the only owner. */
   sole: number;
   downloads: number;
   sample: string[];
@@ -615,7 +558,6 @@ export interface PublisherLeaderboards {
   byUploads: ProlificRow[];
   owners: TopOwnerRow[];
   publishers: TopPublisherRow[];
-  /** The download boards rank owners / publishers of this many top crates. */
   topCrates: number;
   elapsedMs: number;
   cached: boolean;
@@ -627,13 +569,11 @@ export type ReleaseSort = 'date' | 'downloads' | 'name';
 
 export interface ReleaseRow {
   name: string;
-  /** Null for crate rows. */
   version: string | null;
   /** Uploader; null when crates.io did not record one (or for Crate.created_at rows). */
   login: string | null;
   at: string;
   downloads: number | null;
-  // crate rows
   numVersions?: number | null;
   defaultVersion?: string | null;
   createdAt?: string | null;
@@ -642,7 +582,6 @@ export interface ReleaseRow {
   owners?: string[];
   ownerCount?: number;
   publisherCount?: number;
-  // version rows
   latest?: boolean;
   yanked?: boolean;
   license?: string | null;
@@ -693,7 +632,6 @@ export interface BusFactorRow {
   downloads: number;
   numVersions: number | null;
   updatedAt: string | null;
-  /** Crate-level dependency degree from the Map precompute, when built. */
   degree: number | null;
   trustpubOnly: boolean | null;
   repository: string | null;
@@ -835,15 +773,11 @@ export const api = {
     });
     return request<GraphPayload>(`/api/graph/crate/${encodeURIComponent(name)}?${params}`);
   },
-  /**
-   * Transitive crate-level dependency chain for every crate matching `q`
-   * (partial match from 3 characters, exact below). depth 0 = unlimited.
-   */
+  /** Partial match from 3 characters, exact below. */
   loadDepsChain: (q: string, limit: number, depth: number, exact = false) =>
     request<GraphPayload>(
       `/api/graph/deps/chain?${new URLSearchParams({ q, limit: String(limit), depth: String(depth), exact: exact ? '1' : '0' })}`,
     ),
-  /** Crate-level dependency graph. `crate` null loads the whole (capped) graph. */
   loadDeps: (crate: string | null, direction: 'in' | 'out' | 'both', limit: number) => {
     const params = new URLSearchParams({ direction, limit: String(limit) });
     if (crate) params.set('crate', crate);

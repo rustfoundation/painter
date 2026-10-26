@@ -37,7 +37,6 @@ body,
   height: 100vh;
 }
 
-/* ---------- toolbar ---------- */
 .toolbar {
   display: flex;
   align-items: center;
@@ -148,7 +147,6 @@ button.danger:hover:not(:disabled) {
   border-color: var(--danger);
 }
 
-/* segmented view switch */
 .views {
   display: inline-flex;
   border: 1px solid var(--border);
@@ -185,7 +183,6 @@ label.opt {
   flex: 1;
 }
 
-/* ---------- main area ---------- */
 .main {
   display: flex;
   flex: 1;
@@ -350,7 +347,6 @@ ul.legend li {
   font-size: 11px;
 }
 
-/* ---------- cypher ---------- */
 .cypher {
   background: var(--panel);
   border-top: 1px solid var(--border);
@@ -413,7 +409,6 @@ ul.legend li {
   background: var(--panel-2);
 }
 
-/* ---------- status bar ---------- */
 .statusbar {
   display: flex;
   align-items: center;
@@ -457,7 +452,6 @@ hr.rule {
   margin: 14px 0;
 }
 
-/* ---------- callers ---------- */
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
@@ -599,7 +593,6 @@ hr.rule {
   padding: 8px 12px;
 }
 
-/* ---------- unsafe ---------- */
 .unsafe {
   flex: 1;
   min-width: 0;
@@ -961,7 +954,6 @@ table.unsafe-deps-table td {
   width: 50px;
 }
 
-/* ---------- build scripts / native code / diffs views ---------- */
 .flag.links {
   border-color: #b88bff;
   color: #b88bff;
@@ -1101,7 +1093,6 @@ table.diff-files-table td.path {
   text-overflow: ellipsis;
 }
 
-/* ---------- publishers / releases / supply chain views (registry job) ---------- */
 .badge.user {
   background: #e36bae33;
   color: #f4a7d0;

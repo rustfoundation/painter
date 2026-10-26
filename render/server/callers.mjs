@@ -1,51 +1,27 @@
-// Reverse call-graph search over CALLS: who calls a function, directly or
-// through other functions.
-//
-// Calls are `(Version)-[:HAS_FN]->(:Fn)-[:CALLS]->(:Symbol)-[:IN]->(Crate)`,
-// with the calling function's name on `(:Fn)-[:IS]->(:Symbol)`. The caller
-// side is a concrete version, the callee side only a symbol of a crate
-// (painter never resolves the callee's version). So "callers of f in crate C
-// at version V" is answered like this:
-//
-//   * an edge from another version of C itself counts only if it is V
-//     (intra-crate calls);
-//   * an edge from some other crate's version counts when that version's
-//     DEPENDS_ON requirement on C admits V. With no direct DEPENDS_ON (the
-//     call came in through a generic instantiated elsewhere) the row is kept
-//     but marked unverified.
-//
-// The walk is breadth-first: every caller function becomes a new target one
-// level further out. A callsite whose symbol belongs to the caller's own
-// crate is an ordinary function of that version (callers: that version
-// itself plus dependents whose requirement admits it). A callsite whose
-// symbol belongs to some other crate is a monomorphised copy living in the
-// caller's binary, so only that same version can call it.
+// The callee side is only a Symbol of a crate (painter never resolves the callee's version). So callers of f in C at V are:
+// another version of C only if it is V; another crate's version if its DEPENDS_ON requirement on C admits V. With no direct
+// DEPENDS_ON (the call came through a generic instantiated elsewhere) the row is kept but marked unverified.
+// A callsite whose symbol belongs to a crate other than the caller's is a monomorphised copy in the caller's binary,
+// so only that same version can call it.
 
-/** Symbol crates painter never records as callees (mirrors analysis.rs BLOCKED_CRATES). */
+// Mirrors analysis.rs BLOCKED_CRATES.
 const BLOCKED_CRATES = new Set(['core', 'std', 'alloc']);
 
-/**
- * Crate a demangled symbol belongs to: the first identifier immediately
- * followed by `::` (same rule as `analysis::crate_of`), or null.
- */
+// Same rule as `analysis::crate_of`.
 export const crateOf = (symbol) => {
   const m = /[A-Za-z0-9_]+(?=::)/.exec(symbol);
   return m ? m[0] : null;
 };
 
-/** `crateOf` with painter's callee filter applied (`analysis::callee_crate`). */
+// Mirrors `analysis::callee_crate`.
 export const calleeCrate = (symbol) => {
   if (symbol.startsWith('llvm.') || symbol.startsWith('__rust')) return null;
   const c = crateOf(symbol);
   return c && !BLOCKED_CRATES.has(c) ? c : null;
 };
 
-/** Symbols spell `my-crate` as `my_crate`; compare crate names in that form. */
+// Symbols spell `my-crate` as `my_crate`.
 export const normCrate = (name) => String(name).replace(/-/g, '_');
-
-// ---------------------------------------------------------------------------
-// Cargo version requirements
-// ---------------------------------------------------------------------------
 
 const parseVersion = (s) => {
   const m = /^\s*v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?\s*$/.exec(s);
@@ -69,10 +45,6 @@ const cmpPre = (a, b) => {
 
 const cmp = (a, b) => a.major - b.major || a.minor - b.minor || a.patch - b.patch || cmpPre(a.pre, b.pre);
 
-/**
- * One comparator (`^1.2`, `~0.3.1`, `>=1.0, <2` is two of these, `1.*`, `*`)
- * as [lowerInclusive, upperExclusive] bounds; either may be null.
- */
 const comparatorBounds = (raw) => {
   const m = /^\s*(\^|~|=|>=|<=|>|<)?\s*v?(\*|\d+)(?:\.(\*|x|X|\d+))?(?:\.(\*|x|X|\d+))?(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?\s*$/.exec(raw);
   if (!m) return null;
@@ -85,7 +57,6 @@ const comparatorBounds = (raw) => {
   const pre = m[5] ? m[5].split('.') : [];
   const v = (a, b, c, p = []) => ({ major: a, minor: b, patch: c, pre: p });
   const lo = v(major, minor ?? 0, patch ?? 0, pre);
-  // Smallest version above everything the partial version covers.
   const next = minor === null ? v(major + 1, 0, 0) : patch === null ? v(major, minor + 1, 0) : v(major, minor, patch + 1);
   switch (op) {
     case '=':
@@ -109,10 +80,6 @@ const comparatorBounds = (raw) => {
   }
 };
 
-/**
- * Whether a Cargo requirement string (comma-separated comparators, all must
- * hold) admits `version`. Returns null when either side does not parse.
- */
 export const requirementMatches = (requirement, version) => {
   const ver = parseVersion(version);
   if (!ver) return null;
@@ -126,14 +93,7 @@ export const requirementMatches = (requirement, version) => {
   return true;
 };
 
-// ---------------------------------------------------------------------------
-// Walk
-// ---------------------------------------------------------------------------
-
-/**
- * Calls whose target is one of `targets`, from any version. Starts from the
- * Symbol.name uniqueness index, so each target is one seek plus its callers.
- */
+// Starts from the Symbol.name uniqueness index: one seek per target plus its callers.
 const GLOBAL_HOP = `
   UNWIND $targets AS tg
   MATCH (s:Symbol {name: tg})-[:IN]->(t:Crate)
@@ -143,7 +103,6 @@ const GLOBAL_HOP = `
   WITH v, cs, s, t, collect(DISTINCT d.requirement) AS reqs
   RETURN v.name AS name, v.version AS version, cs.name AS callsite, s.name AS target, t.name AS crate, reqs`;
 
-/** Calls from specific versions whose target is one of that version's `targets`. */
 const LOCAL_HOP = `
   UNWIND $locals AS l
   UNWIND l.targets AS tg
@@ -154,16 +113,6 @@ const LOCAL_HOP = `
 
 const versionKey = (name, version) => `${name}@${version}`;
 
-/**
- * Walk callers of `targets` (functions of crate `crate`, optionally pinned to
- * `version`) out to `maxDepth` levels or `limit` rows.
- *
- * `read(cypher, params)` runs a read query and resolves to plain row objects.
- *
- * Every row is one distinct (crate, version, function) that calls into the
- * search, at the smallest depth it was reached, with the function it calls
- * (`calls`) and the chain back to the searched function (`path`).
- */
 export const findCallers = async (read, { crate, version = null, targets, maxDepth, limit }) => {
   const rows = [];
   const seen = new Set();

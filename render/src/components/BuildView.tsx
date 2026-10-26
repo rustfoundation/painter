@@ -1,7 +1,3 @@
-// Build scripts view: a leaderboard of crate versions with a build script (painter's
-// generate-metadata `build` job: has_build_script, build_script path, build_script_lines,
-// links), coverage tiles, the most-linked native libraries, and a per-crate history.
-
 import { Fragment, useMemo, useState } from 'react';
 import { api, type BuildRow, type BuildSort, type BuildStats, type UnsafeScope, type UnsafeTri } from '../api';
 import {
@@ -47,7 +43,6 @@ const COLUMNS: Column<BuildSort>[] = [
 
 const HIST_LABELS = ['0–10', '11–50', '51–200', '201–1k', '>1k'];
 
-/** Native-code flags shared with the other views. */
 export function NativeFlags({ native, vendored, links, build }: { native?: boolean | null; vendored?: boolean | null; links?: string | null; build?: boolean | null }) {
   return (
     <>

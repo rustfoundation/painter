@@ -1,29 +1,17 @@
-//! `build` job: whether a version has a build script, where, how big, and what it links.
-//!
-//! Cargo runs `build.rs` at the crate root unless the manifest says otherwise: `package.build`
-//! names another script, or `build = false` turns it off. crates.io normalizes `Cargo.toml` on
-//! publish, so newer manifests state it explicitly; older ones rely on the default, which this
-//! job applies. `package.links` names the native library the build script links.
+//! Older manifests omit `build`, so the default `build.rs` is applied here.
 use super::source::SourceTree;
 
-/// Job revision, stored as `Version.meta_build` (this job's done-marker). Bump it when the
-/// detection changes to recompute every version.
+/// Done-marker (`Version.meta_build`); bump to recompute everything.
 pub const REVISION: &str = "build 1";
 
-/// Build-script facts of one version.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BuildInfo {
-    /// Cargo would run a build script for this version.
     pub has_build_script: bool,
-    /// The script's path when it has one (normally `build.rs`).
     pub path: Option<String>,
-    /// Lines in the script, when it is in the tarball and readable.
     pub lines: Option<u64>,
-    /// `package.links`.
     pub links: Option<String>,
 }
 
-/// Work out the build-script facts of a version.
 #[must_use]
 pub fn scan(tree: &SourceTree) -> BuildInfo {
     let path = match &tree.manifest.build {

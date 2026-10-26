@@ -1,12 +1,4 @@
-//! Build rules: pluggable policy deciding which crates, and which of their versions, the
-//! ecosystem builder compiles.
-//!
-//! Implement [`BuildRules`] to supply your own policy, or use one of the provided ones:
-//!
-//! - [`BuildEverything`]: every crate in the crates.io index.
-//! - [`NamedCrates`]: an explicit list of crate names.
-//! - [`EcosystemsRules`]: crate sets ranked by <https://ecosyste.ms> (downloads, reverse
-//!   dependencies, most-downloaded maintainers) and/or versions published after a date.
+//! Pluggable policy for which crates, and which of their versions, get compiled.
 
 use crate::ecosystems::{EcosystemsClient, PackageSort};
 use async_trait::async_trait;
@@ -22,23 +14,16 @@ pub enum Error {
     InvalidDate(String),
 }
 
-/// Policy deciding what the ecosystem builder compiles.
-///
-/// The builder first asks for [`candidate_crates`](Self::candidate_crates) to know which
-/// crates to visit, then calls [`select_versions`](Self::select_versions) once per crate to
-/// learn which versions to build. Both are async so implementations can consult external data
-/// sources; they are invoked with bounded concurrency.
-#[allow(clippy::double_must_use)] // fires on the `async_trait` expansion, not on our code
+#[allow(clippy::double_must_use)] // fires on the `async_trait` expansion
 #[async_trait]
 pub trait BuildRules: Send + Sync {
-    /// Names of crates to consider. `None` means every crate in the index.
+    /// `None` means every crate in the index.
     async fn candidate_crates(&self) -> Result<Option<Vec<String>>, Error>;
 
-    /// Which versions of `krate` to build. An empty vector skips the crate.
+    /// An empty vector skips the crate.
     async fn select_versions(&self, krate: &Crate) -> Result<Vec<Version>, Error>;
 }
 
-/// Versions of a crate as the index lists them, either the highest only or all non-yanked.
 #[must_use]
 pub fn index_versions(krate: &Crate, all_versions: bool) -> Vec<Version> {
     if all_versions {
@@ -53,10 +38,8 @@ pub fn index_versions(krate: &Crate, all_versions: bool) -> Vec<Version> {
     }
 }
 
-/// Build every crate in the index.
 #[derive(Debug, Clone, Default)]
 pub struct BuildEverything {
-    /// Build every non-yanked version instead of only the highest.
     pub all_versions: bool,
 }
 
@@ -71,11 +54,9 @@ impl BuildRules for BuildEverything {
     }
 }
 
-/// Build an explicit list of crates.
 #[derive(Debug, Clone, Default)]
 pub struct NamedCrates {
     pub names: Vec<String>,
-    /// Build every non-yanked version instead of only the highest.
     pub all_versions: bool,
 }
 
@@ -90,29 +71,20 @@ impl BuildRules for NamedCrates {
     }
 }
 
-/// Rules driven by ecosyste.ms rankings. The crate set is the union of `crates` and every
-/// enabled `top_*` selector; if all are empty, every crate in the index is a candidate. `newer_than` then
-/// drops versions published on or before that instant (using ecosyste.ms publish dates, one
-/// request per crate).
+/// `newer_than` costs one ecosyste.ms request per candidate crate.
 #[derive(Debug, Clone, Default)]
 pub struct EcosystemsRules {
     pub client: EcosystemsClient,
-    /// Crates always included in the candidate set, regardless of rankings.
     pub crates: Vec<String>,
-    /// Top N crates by total downloads.
     pub top_downloads: Option<usize>,
-    /// Top N crates by number of dependent packages.
     pub top_reverse_dependencies: Option<usize>,
-    /// Every crate of the top N maintainers, ranked by total downloads of their crates.
     pub top_maintainers: Option<usize>,
     /// Only versions published strictly after this instant.
     pub newer_than: Option<DateTime<Utc>>,
-    /// Consider every non-yanked version instead of only the highest.
     pub all_versions: bool,
 }
 
 impl EcosystemsRules {
-    /// Whether any crate-set selector is enabled.
     #[must_use]
     pub fn has_crate_selectors(&self) -> bool {
         !self.crates.is_empty()
@@ -121,10 +93,8 @@ impl EcosystemsRules {
             || self.top_maintainers.is_some()
     }
 
-    /// Parse a `YYYY-MM-DD` (midnight UTC) or RFC 3339 timestamp.
-    ///
     /// # Errors
-    /// Returns [`Error::InvalidDate`] if neither format matches.
+    /// [`Error::InvalidDate`] unless `YYYY-MM-DD` (midnight UTC) or RFC 3339.
     pub fn parse_date(s: &str) -> Result<DateTime<Utc>, Error> {
         if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
             return Ok(dt.with_timezone(&Utc));
@@ -137,7 +107,6 @@ impl EcosystemsRules {
     }
 }
 
-/// Append `names` to `out`, skipping any already present, preserving first-seen order.
 pub fn union_names<S: std::hash::BuildHasher>(
     out: &mut Vec<String>,
     seen: &mut HashSet<String, S>,
@@ -150,8 +119,7 @@ pub fn union_names<S: std::hash::BuildHasher>(
     }
 }
 
-/// Keep only versions whose publish date (looked up by version number) is strictly after
-/// `cutoff`. Versions with no known date are dropped.
+/// Versions with no known date are dropped.
 #[must_use]
 pub fn filter_newer_than<'a>(
     versions: Vec<Version>,
@@ -283,7 +251,7 @@ mod tests {
         let cutoff = utc("2024-01-01");
         let published = |v: &str| match v {
             "0.1.0" => Some(utc("2023-06-01")),
-            "0.2.0" => Some(utc("2024-01-01")), // exactly the cutoff: not strictly newer
+            "0.2.0" => Some(utc("2024-01-01")), // exactly the cutoff: not newer
             "0.3.0" => Some(utc("2024-02-01")),
             _ => None,
         };
@@ -328,7 +296,6 @@ mod tests {
         let rules = EcosystemsRules::default();
         assert!(!rules.has_crate_selectors());
         assert_eq!(rules.candidate_crates().await.unwrap(), None);
-        // No `newer_than`: versions pass straight through without any API call.
         let c = fake_crate("a", &[("0.1.0", false, &[])]);
         assert_eq!(rules.select_versions(&c).await.unwrap().len(), 1);
 
@@ -337,7 +304,6 @@ mod tests {
             ..EcosystemsRules::default()
         };
         assert!(rules.has_crate_selectors());
-        // Explicit crates need no API call either.
         assert_eq!(
             rules.candidate_crates().await.unwrap(),
             Some(vec!["serde".to_string()])

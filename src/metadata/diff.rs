@@ -1,27 +1,13 @@
-//! `diff` job: what changed in a version since the previous one, per file, as line counts.
-//!
-//! The previous version is the next lower one in semver order among the crate's versions
-//! (pre-releases sort before their release), which is what `diff_base` records. The first
-//! version is compared with nothing, so every file counts as added. Nothing of the diff itself
-//! is stored, only per changed file its path, status (`added`, `removed`, `modified`), lines
-//! added and removed, and whether it is binary, plus totals.
-//!
-//! Text is compared line by line with a Myers diff (`similar`), bounded by [`DIFF_TIMEOUT`] per
-//! file; a diff that hits the bound is approximate (still a valid edit, maybe not the
-//! smallest) and the version is flagged `diff_approximate`. A file is binary when it contains
-//! a NUL byte; binary or unloaded files count as changed when their bytes or size differ, with
-//! no line counts.
+//! Stores only per-file path/status/line counts, never the diff. The first version diffs against
+//! nothing; a NUL byte marks a file binary; hitting `DIFF_TIMEOUT` flags `diff_approximate`.
 use super::source::{SourceFile, SourceTree};
 use std::time::{Duration, Instant};
 
-/// Job revision, stored as `Version.meta_diff` (this job's done-marker). Bump it when the
-/// comparison changes to recompute every version.
+/// Done-marker (`Version.meta_diff`); bump when the comparison changes.
 pub const REVISION: &str = "diff 1";
 
-/// Longest a single file's line diff may take before it settles for an approximate result.
 pub const DIFF_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How a file changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Added,
@@ -30,7 +16,6 @@ pub enum Status {
 }
 
 impl Status {
-    /// The value stored in `diff_status`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -41,7 +26,6 @@ impl Status {
     }
 }
 
-/// One changed file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileChange {
     pub path: String,
@@ -51,16 +35,11 @@ pub struct FileChange {
     pub binary: bool,
 }
 
-/// A version's changes against its predecessor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiffInfo {
-    /// The version compared against; `None` for the first version.
     pub base: Option<String>,
-    /// Changed files, sorted by path. Unchanged files are left out.
     pub files: Vec<FileChange>,
-    /// Files in this version.
     pub files_total: u64,
-    /// Some file diff hit [`DIFF_TIMEOUT`] and its counts are approximate.
     pub approximate: bool,
 }
 
@@ -68,34 +47,28 @@ impl DiffInfo {
     fn count(&self, status: Status) -> u64 {
         self.files.iter().filter(|f| f.status == status).count() as u64
     }
-    /// Files added since the base.
     #[must_use]
     pub fn files_added(&self) -> u64 {
         self.count(Status::Added)
     }
-    /// Files removed since the base.
     #[must_use]
     pub fn files_removed(&self) -> u64 {
         self.count(Status::Removed)
     }
-    /// Files changed in place since the base.
     #[must_use]
     pub fn files_modified(&self) -> u64 {
         self.count(Status::Modified)
     }
-    /// Lines added over every changed file.
     #[must_use]
     pub fn lines_added(&self) -> u64 {
         self.files.iter().map(|f| f.added).sum()
     }
-    /// Lines removed over every changed file.
     #[must_use]
     pub fn lines_removed(&self) -> u64 {
         self.files.iter().map(|f| f.removed).sum()
     }
 }
 
-/// Text of a file for line diffing, or `None` when it is binary or not loaded.
 fn text_of(file: &SourceFile) -> Option<&[u8]> {
     let data = file.data.as_deref()?;
     (!data.contains(&0)).then_some(data)
@@ -109,7 +82,6 @@ fn line_count(data: &[u8]) -> u64 {
     }
 }
 
-/// Lines added and removed between two texts, and whether the diff hit the time bound.
 fn line_delta(old: &[u8], new: &[u8]) -> (u64, u64, bool) {
     let started = Instant::now();
     let diff = similar::TextDiff::configure()
@@ -131,7 +103,6 @@ fn line_delta(old: &[u8], new: &[u8]) -> (u64, u64, bool) {
     (added, removed, started.elapsed() >= DIFF_TIMEOUT)
 }
 
-/// Compare a version (`new`) with its predecessor (`old`, `None` for the first version).
 #[must_use]
 pub fn diff(old: Option<(&str, &SourceTree)>, new: &SourceTree) -> DiffInfo {
     let empty = SourceTree::default();
@@ -141,7 +112,7 @@ pub fn diff(old: Option<(&str, &SourceTree)>, new: &SourceTree) -> DiffInfo {
         files_total: new.files.len() as u64,
         ..DiffInfo::default()
     };
-    // Both file lists are sorted by path: merge them.
+    // Both file lists are sorted by path (SourceTree invariant), so merge.
     let mut olds = old_tree.files.iter().peekable();
     let mut news = new.files.iter().peekable();
     loop {

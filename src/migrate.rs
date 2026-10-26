@@ -1,24 +1,8 @@
-//! One-off rebuild of a database from the old `INVOKES` call schema to the normalised one.
+//! One-off rebuild from the `INVOKES` call schema to `HAS_FN`/`CALLS`/`Symbol`.
 //!
-//! The old schema stored one `(Version)-[:INVOKES {callsite, target}]->(Crate)` edge per
-//! compiled (caller, callee) pair, each carrying both demangled function names as strings; the
-//! monomorphised instances of a generic function demangle to the same name, so most calls were
-//! stored several times. The new one (see
-//! [`crate::db::Db::insert_calls`]) stores each distinct call once and each function name once:
-//!
-//! ```text
-//! (Version)-[:HAS_FN]->(:Fn)-[:IS]->(:Symbol {name})
-//! (:Fn)-[:CALLS {copies}]->(:Symbol)-[:IN]->(Crate)
-//! ```
-//!
-//! Deleting the old edges in place would not shrink Neo4j's store files, and Community has no
-//! store compaction, so the migration rebuilds the database instead: [`export_for_import`]
-//! streams every node and relationship out of the running database into CSV files for
-//! `neo4j-admin database import full`, folding duplicate calls into `copies` on the way
-//! ([`crate::db::collapse_calls`]). Everything else (`Crate`, `Version`, `LodMeta`,
-//! `VERSION_OF`, `DEPENDS_ON`, `LOD_DEP`) is copied with all its properties. The export refuses
-//! to run if the database holds a label, relationship type, or property it does not know how
-//! to copy, so nothing is dropped silently.
+//! Deleting old edges in place would not shrink Neo4j's store files and Community has no
+//! compaction, so this streams the database out as `neo4j-admin database import` CSVs instead.
+
 use crate::db::{CallRow, collapse_calls, symbol_key};
 use futures::StreamExt;
 use neo4rs::{Graph, query};
@@ -39,7 +23,6 @@ pub enum Error {
     MissingColumn(&'static str),
 }
 
-/// Node labels and their properties the export copies.
 const NODE_PROPERTIES: &[(&str, &[&str])] = &[
     (
         "Crate",
@@ -79,7 +62,6 @@ const NODE_PROPERTIES: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Relationship types and their properties the export copies (`INVOKES` is converted).
 const REL_PROPERTIES: &[(&str, &[&str])] = &[
     ("INVOKES", &["callsite", "target"]),
     ("VERSION_OF", &[]),
@@ -90,10 +72,8 @@ const REL_PROPERTIES: &[(&str, &[&str])] = &[
     ("LOD_DEP", &["versions"]),
 ];
 
-/// Versions whose calls are read at once.
 const VERSION_CONCURRENCY: usize = 16;
 
-/// Row counts of every file [`export_for_import`] wrote.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ExportSummary {
     pub crates: u64,
@@ -102,9 +82,7 @@ pub struct ExportSummary {
     pub version_of: u64,
     pub depends_on: u64,
     pub lod_dep: u64,
-    /// `INVOKES` edges read.
     pub invokes: u64,
-    /// Versions that had any `INVOKES`.
     pub versions_with_calls: u64,
     pub fns: u64,
     pub calls: u64,
@@ -112,15 +90,12 @@ pub struct ExportSummary {
     pub symbol_crates: u64,
 }
 
-/// One CSV file for `neo4j-admin import`. Strings are always quoted (so an empty string stays
-/// an empty string), absent values are left empty (no property), and numbers and booleans are
-/// written bare.
+/// Strings are always quoted so `""` stays an empty string; an empty field is no property.
 struct Csv {
     out: BufWriter<std::fs::File>,
     rows: u64,
 }
 
-/// One field of a [`Csv`] row.
 enum Field<'a> {
     Str(Option<&'a str>),
     Int(Option<i64>),
@@ -159,7 +134,6 @@ impl Csv {
     }
 }
 
-/// Write `s` as one quoted CSV field, doubling embedded quotes.
 fn write_quoted<W: Write>(out: &mut W, s: &str) -> std::io::Result<()> {
     out.write_all(b"\"")?;
     let mut rest = s;
@@ -172,23 +146,19 @@ fn write_quoted<W: Write>(out: &mut W, s: &str) -> std::io::Result<()> {
     out.write_all(b"\"")
 }
 
-/// `:ID(Version)` of a version: name and version cannot contain `@`.
+/// Neither name nor version can contain `@`.
 fn version_id(name: &str, version: &str) -> String {
     format!("{name}@{version}")
 }
 
-/// A required string column.
 fn need_str(row: &neo4rs::Row, col: &'static str) -> Result<String, Error> {
     row.get::<String>(col).ok_or(Error::MissingColumn(col))
 }
 
-/// A required list-of-strings column.
 fn need_strs(row: &neo4rs::Row, col: &'static str) -> Result<Vec<String>, Error> {
     row.get::<Vec<String>>(col).ok_or(Error::MissingColumn(col))
 }
 
-/// Fail unless every label, relationship type, and property in the database is one the export
-/// copies.
 async fn check_schema(graph: &Graph) -> Result<(), Error> {
     let mut unknown = Vec::new();
 
@@ -283,7 +253,6 @@ async fn export_crates(graph: &Graph, dir: &Path) -> Result<u64, Error> {
     csv.finish()
 }
 
-/// `Version` nodes and their `VERSION_OF` edges; returns (versions, `VERSION_OF` edges).
 async fn export_versions(graph: &Graph, dir: &Path) -> Result<(u64, u64), Error> {
     let mut nodes = Csv::create(
         dir,
@@ -456,7 +425,6 @@ async fn export_lod_dep(graph: &Graph, dir: &Path) -> Result<u64, Error> {
     csv.finish()
 }
 
-/// Every `INVOKES` edge of one version, collapsed into distinct calls.
 async fn version_calls(
     graph: Arc<Graph>,
     name: String,
@@ -484,7 +452,6 @@ async fn version_calls(
     Ok((name, version, edges, collapse_calls(raw)))
 }
 
-/// The call-graph files: `Symbol` and `Fn` nodes, `HAS_FN`, `IS`, `CALLS`, and `IN` edges.
 struct CallFiles {
     symbols: Csv,
     fns: Csv,
@@ -493,7 +460,6 @@ struct CallFiles {
     calls: Csv,
     symbol_in: Csv,
     seen_symbols: HashSet<String>,
-    /// `symbol \0 crate` pairs already written to `in.csv`.
     seen_in: HashSet<String>,
     next_fn: u64,
 }
@@ -517,8 +483,6 @@ impl CallFiles {
         })
     }
 
-    /// Write the `Symbol` for function `name` unless it already was, and return its key (see
-    /// [`symbol_key`]), which the relationship files refer to.
     fn symbol(&mut self, name: &str) -> Result<String, Error> {
         let (key, full) = symbol_key(name);
         if !self.seen_symbols.contains(key.as_ref()) {
@@ -529,7 +493,6 @@ impl CallFiles {
         Ok(key.into_owned())
     }
 
-    /// Write one version's calls (sorted by caller, as `collapse_calls` returns them).
     fn version(&mut self, name: &str, version: &str, calls: &[CallRow]) -> Result<(), Error> {
         let vid = version_id(name, version);
         for group in calls.chunk_by(|a, b| a.caller == b.caller) {
@@ -613,7 +576,7 @@ async fn export_calls(
     files.finish(summary)
 }
 
-/// Connect for the export: a large fetch size, since it streams hundreds of millions of rows.
+/// Large fetch size: the export streams hundreds of millions of rows.
 async fn connect(uri: &str, user: &str, password: &str) -> Result<Arc<Graph>, Error> {
     Ok(Arc::new(
         Graph::connect(
@@ -630,16 +593,10 @@ async fn connect(uri: &str, user: &str, password: &str) -> Result<Arc<Graph>, Er
     ))
 }
 
-/// Stream the whole database at `uri` into `neo4j-admin database import` CSV files in `out`,
-/// converting `INVOKES` to the normalised call schema (see the module docs). The database is
-/// only read. Run it while nothing writes to the database, or the files may mix states.
-///
-/// [`import_args`] lists the matching `neo4j-admin` arguments and [`SCHEMA_CYPHER`] the
-/// constraints and indexes to create after the import.
+/// Run while nothing writes to the database, or the files may mix states.
 ///
 /// # Errors
-/// Returns [`Error::UnknownSchema`] before writing anything if the database holds data the
-/// export would not copy, and database or I/O errors as they happen.
+/// [`Error::UnknownSchema`] before writing anything, else database or I/O errors.
 pub async fn export_for_import(
     uri: &str,
     user: &str,
@@ -671,8 +628,6 @@ pub async fn export_for_import(
     Ok(summary)
 }
 
-/// Every file [`export_for_import`] writes, as `neo4j-admin import` `--nodes` / `--relationships`
-/// arguments with paths under `dir` (the directory as the import process sees it).
 #[must_use]
 pub fn import_args(dir: &str) -> Vec<String> {
     let nodes = [
@@ -702,8 +657,6 @@ pub fn import_args(dir: &str) -> Vec<String> {
         .collect()
 }
 
-/// Constraints and indexes to create after the import, one statement per line (the same set as
-/// `docker/queries.md`).
 pub const SCHEMA_CYPHER: &str = "\
 CREATE CONSTRAINT const_crate_name IF NOT EXISTS FOR (n:Crate) REQUIRE n.name IS UNIQUE;
 CREATE CONSTRAINT const_version IF NOT EXISTS FOR (n:Version) REQUIRE (n.name, n.version) IS UNIQUE;
@@ -790,7 +743,6 @@ mod tests {
                 ],
             )
             .unwrap();
-        // A second version reuses `b::g` and calls it from `b::g` itself.
         files
             .version("a", "2.0.0", &[row("b::g", "b::g", "b", 2)])
             .unwrap();
@@ -799,8 +751,8 @@ mod tests {
 
         assert_eq!(summary.fns, 3);
         assert_eq!(summary.calls, 4);
-        assert_eq!(summary.symbols, 4); // a::f, b::g, c::h, a::k
-        assert_eq!(summary.symbol_crates, 2); // b::g in b, c::h in c
+        assert_eq!(summary.symbols, 4);
+        assert_eq!(summary.symbol_crates, 2);
         assert_eq!(
             read(dir.path(), "has_fn.csv"),
             ":START_ID(Version),:END_ID(Fn)\n\"a@1.0.0\",0\n\"a@1.0.0\",1\n\"a@2.0.0\",2\n"

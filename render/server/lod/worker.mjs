@@ -1,6 +1,4 @@
-// Worker thread that runs a LOD job so the multi-minute layout never blocks
-// the HTTP server's event loop. Started by jobs.mjs with workerData
-// { kind: 'build' | 'update', neo4j: {uri,user,password,database}, iterations, timeoutMs }.
+// Runs a LOD job off the HTTP server's event loop so the multi-minute layout never blocks it.
 
 import { parentPort, workerData } from 'node:worker_threads';
 import neo4j from 'neo4j-driver';

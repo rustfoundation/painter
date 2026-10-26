@@ -26,7 +26,7 @@ struct Args {
 /// Clap argument object for specifying the root paths to be used for this work session.
 /// See [`libpainter::Roots`] for the meaning of each directory.
 #[derive(clap::Args, Debug, Clone)]
-#[allow(clippy::struct_field_names)] // mirrors `libpainter::Roots`
+#[allow(clippy::struct_field_names)]
 struct RootsArgs {
     /// Root directory containing the extracted sources tree.
     #[arg(short = 's', value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
@@ -305,7 +305,7 @@ enum Command {
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 32)]
-#[allow(clippy::too_many_lines)] // one arm per subcommand
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<(), Error> {
     env_logger::init();
 
@@ -624,11 +624,9 @@ mod tests {
             rules
         };
 
-        // Nothing: whole index.
         let r = rules(&[]).into_rules().unwrap();
         assert_eq!(r.candidate_crates().await.unwrap(), None);
 
-        // --only alone: named crates, order preserved.
         let r = rules(&["--only", "serde", "--only", "tokio"])
             .into_rules()
             .unwrap();
@@ -637,8 +635,7 @@ mod tests {
             Some(vec!["serde".to_string(), "tokio".to_string()])
         );
 
-        // --newer-than switches to ecosyste.ms rules; with --only the candidate set still needs
-        // no network. An invalid date is rejected up front.
+        // With --only, candidate_crates needs no network even under ecosyste.ms rules.
         let r = rules(&["--only", "serde", "--newer-than", "2024-01-01"])
             .into_rules()
             .unwrap();

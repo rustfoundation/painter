@@ -1,8 +1,4 @@
-//! `compile-check`: reconcile the crates.io index against the bytecode root and the database.
-//!
-//! For every crate version the build rules select, report whether it has a bytecode directory,
-//! a `(Version)` node in Neo4j, and a call graph (`HAS_FN` functions, i.e. `export-all-neo4j`
-//! has run over it).
+//! `compile-check`: reconcile the index, the bytecode root, and the database.
 
 use crate::{
     compile,
@@ -19,10 +15,8 @@ use std::{
     sync::Arc,
 };
 
-/// How many crate names are looked up in the database per query.
 pub const DB_CHUNK: usize = 500;
 
-/// How many database status queries run concurrently.
 pub const DB_CONCURRENCY: usize = 16;
 
 #[derive(thiserror::Error, Debug)]
@@ -35,34 +29,28 @@ pub enum Error {
     DatabaseError(#[from] crate::db::Error),
 }
 
-/// Pipeline state of one selected crate version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionStatus {
     pub name: String,
     pub version: String,
-    /// `<bytecodes_root>/<name>-<version>/` exists and holds at least one `.bc` file.
     pub bytecode: bool,
-    /// A `(Version { name, version })` node exists.
     pub in_db: bool,
-    /// The `(Version)` node has a call graph: at least one `[:HAS_FN]` function.
+    /// At least one `[:HAS_FN]`; versions with no cross-crate calls never get one.
     pub exported: bool,
 }
 
 impl VersionStatus {
-    /// Every stage has run for this version.
     #[must_use]
     pub fn complete(&self) -> bool {
         self.bytecode && self.in_db && self.exported
     }
 }
 
-/// Totals over every selected version, plus the list of versions missing something.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
     pub statuses: Vec<VersionStatus>,
 }
 
-/// Counts for one row of the summary table.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Counts {
     pub total: usize,
@@ -91,14 +79,12 @@ impl Counts {
 }
 
 impl Report {
-    /// Per-version counts.
     #[must_use]
     pub fn versions(&self) -> Counts {
         Counts::from_statuses(self.statuses.iter())
     }
 
-    /// Per-crate counts. A crate counts towards a column only if *every* selected version of
-    /// it satisfies that column; it counts as missing if *any* selected version is missing.
+    /// A crate counts towards a column only if every selected version does.
     #[must_use]
     pub fn crates(&self) -> Counts {
         let mut by_crate: HashMap<&str, VersionStatus> = HashMap::new();
@@ -117,7 +103,6 @@ impl Report {
         Counts::from_statuses(by_crate.values())
     }
 
-    /// Versions missing at least one stage, sorted by name then version.
     #[must_use]
     pub fn missing(&self) -> Vec<&VersionStatus> {
         let mut v: Vec<_> = self.statuses.iter().filter(|s| !s.complete()).collect();
@@ -125,8 +110,6 @@ impl Report {
         v
     }
 
-    /// The summary table.
-    ///
     /// # Panics
     /// Never; writing to a `String` cannot fail.
     #[must_use]
@@ -160,8 +143,6 @@ impl Report {
         out
     }
 
-    /// One line per incomplete version: `name-version` followed by the missing stages.
-    ///
     /// # Panics
     /// Never; writing to a `String` cannot fail.
     #[must_use]
@@ -190,11 +171,8 @@ impl Report {
     }
 }
 
-/// Collect the `(name, version)` pairs that have a bytecode directory with at least one `.bc`.
-/// Directories are inspected in parallel on the rayon pool.
-///
 /// # Errors
-/// Returns `Error::IoError` if `bc_root` cannot be listed.
+/// If `bc_root` cannot be listed.
 pub fn scan_bytecodes(bc_root: &Path) -> Result<HashSet<(String, String)>, Error> {
     let entries: Vec<_> = std::fs::read_dir(bc_root)?.collect::<Result<_, _>>()?;
     Ok(entries
@@ -206,7 +184,7 @@ pub fn scan_bytecodes(bc_root: &Path) -> Result<HashSet<(String, String)>, Error
             let dir_name = entry.file_name();
             let dir_name = dir_name.to_str()?;
             if dir_name.starts_with('.') {
-                // e.g. compile's staging dir.
+                // Compile's staging dir.
                 return None;
             }
             let Some((name, version)) = split_full_name(dir_name) else {
@@ -227,15 +205,11 @@ pub fn scan_bytecodes(bc_root: &Path) -> Result<HashSet<(String, String)>, Error
         .collect())
 }
 
-/// Resolve `rules` against the index and check each selected version for bytecode, a database
-/// node, and an exported call graph.
-///
 /// # Panics
-/// Panics if the bytecode scan task panics.
+/// If the bytecode scan task panics.
 ///
 /// # Errors
-/// Returns `Error::PlanError` if the index or rules fail, `Error::IoError` if the bytecode root
-/// cannot be read, or `Error::DatabaseError` on a query failure.
+/// If planning fails, the bytecode root cannot be read, or a query fails.
 pub async fn compile_check(
     rules: &dyn BuildRules,
     rules_concurrency: usize,
@@ -248,8 +222,7 @@ pub async fn compile_check(
     names.sort_unstable();
     names.dedup();
 
-    // The directory scan is blocking filesystem work; run it off the async runtime while the
-    // database queries are in flight.
+    // Blocking filesystem work, overlapped with the database queries.
     log::info!("scanning bytecode root {}", bc_root.display());
     let scan = tokio::task::spawn_blocking({
         let bc_root = bc_root.to_path_buf();
@@ -345,7 +318,6 @@ mod tests {
         let table = report.render_summary();
         let versions_row = table.lines().find(|l| l.starts_with("versions")).unwrap();
         let cols: Vec<_> = versions_row.split_whitespace().collect();
-        //           label  index bc  db  exp |  nobc  nodb  neither
         assert_eq!(cols, ["versions", "2", "1", "1", "1", "|", "1", "1", "1"]);
         assert!(table.contains("exported"));
         assert_eq!(Report::default().render_missing(), "");

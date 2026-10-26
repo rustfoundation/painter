@@ -1,24 +1,6 @@
-//! `registry` job: crates.io registry facts that are not in the index or the tarballs, read from
-//! a crates.io database dump (`https://static.crates.io/db-dump.tar.gz`, extracted).
-//!
-//! Writes `(User)`, `(Team)`, `(Category)`, and `(Keyword)` nodes and these edges:
-//!
-//! - `(User)-[:PUBLISHED {at}]->(Version)`: who uploaded the version, and when (recorded by
-//!   crates.io since 2019-02-22; trusted-publishing uploads have no user).
-//! - `(User)-[:PUBLISHED {at, last, versions}]->(Crate)`: one per user who uploaded any version
-//!   of the crate; `at` is their first upload, `last` their latest, `versions` the count.
-//! - `(User|Team)-[:OWNS {since, added_by}]->(Crate)`: current owners.
-//! - `(Crate)-[:IN_CATEGORY]->(Category)`, `(Crate)-[:HAS_KEYWORD]->(Keyword)`.
-//!
-//! Plus `Version` properties (`published_at`, `yanked`, `license`, `crate_size`, `downloads`,
-//! `edition`, `rust_version`, `has_lib`, `bin_names`) and `Crate` properties (`created_at`,
-//! `updated_at`, `description`, `homepage`, `documentation`, `repository`, `downloads`,
-//! `trustpub_only`, `default_version`, `num_versions`). Dates are Neo4j `DateTime`s.
-//!
-//! The marker `meta_registry` is `registry-<rev>@<dump timestamp>`, so loading a newer dump
-//! makes every version stale and refreshes owners, downloads, and yanks. A version the dump does
-//! not know gets the marker and `registry_missing = true`. Crate-level facts are rewritten for
-//! every crate that has a pending version.
+//! Reads an extracted crates.io database dump: the index has no users or owners. Marker
+//! `meta_registry` is `registry-<rev>@<dump timestamp>`, so a newer dump makes every version stale.
+//! Trusted-publishing (and pre-2019-02-22) uploads have no `published_by`: no user `PUBLISHED`.
 use crate::db::{
     Db, MetaState, RegistryCategory, RegistryCrate, RegistryTeam, RegistryUser, RegistryVersion,
 };
@@ -29,11 +11,9 @@ use std::path::{Path, PathBuf};
 /// Bump to recompute the job everywhere.
 pub const REVISION: &str = "registry-1";
 
-/// Versions per write transaction.
 const VERSION_BATCH: usize = 1_000;
-/// Crates per write transaction (each rewrites its owner/publisher/category/keyword edges).
+/// Each crate rewrites its owner/publisher/category/keyword edges, hence the smaller batch.
 const CRATE_BATCH: usize = 250;
-/// Users, teams, categories, or keywords per write transaction.
 const NODE_BATCH: usize = 5_000;
 
 #[derive(Debug, thiserror::Error)]
@@ -48,10 +28,8 @@ pub enum Error {
     Metadata(#[from] serde_json::Error),
 }
 
-/// One version as the dump records it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VersionRecord {
-    /// RFC 3339, UTC.
     pub created_at: String,
     pub published_by: Option<u32>,
     pub yanked: bool,
@@ -64,17 +42,14 @@ pub struct VersionRecord {
     pub bin_names: Vec<String>,
 }
 
-/// An owner of a crate: a user or a team.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Owner {
     pub team: bool,
     pub id: u32,
-    /// RFC 3339, UTC.
     pub since: String,
     pub added_by: Option<u32>,
 }
 
-/// One crate as the dump records it.
 #[derive(Debug, Clone, Default)]
 pub struct CrateRecord {
     pub id: u32,
@@ -91,30 +66,24 @@ pub struct CrateRecord {
     pub owners: Vec<Owner>,
     pub categories: Vec<String>,
     pub keywords: Vec<String>,
-    /// By version string (the index's `vers`).
     pub versions: HashMap<String, VersionRecord>,
 }
 
-/// A loaded crates.io dump: everything the `registry` job writes, keyed by crate name.
 #[derive(Debug, Default)]
 pub struct Dump {
-    /// `metadata.json` `timestamp`.
     pub timestamp: String,
     pub crates: HashMap<String, CrateRecord>,
     pub users: HashMap<u32, RegistryUser>,
     pub teams: HashMap<u32, RegistryTeam>,
-    /// By category id.
     pub categories: HashMap<u32, RegistryCategory>,
 }
 
-/// The `meta_registry` value a version carries once written from this dump.
 #[must_use]
 pub fn marker(dump_timestamp: &str) -> String {
     format!("{REVISION}@{dump_timestamp}")
 }
 
-/// A Postgres `timestamptz` text (`2019-03-11 21:46:06.123+00`) as RFC 3339 UTC; empty if
-/// unparsable.
+/// Empty if unparsable.
 #[must_use]
 pub fn pg_timestamp(s: &str) -> String {
     chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%#z").map_or_else(
@@ -126,7 +95,6 @@ pub fn pg_timestamp(s: &str) -> String {
     )
 }
 
-/// A Postgres text array (`{a,"b c"}`) as its elements.
 #[must_use]
 pub fn pg_array(s: &str) -> Vec<String> {
     let Some(inner) = s.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
@@ -162,8 +130,7 @@ fn pg_bool(s: &str) -> bool {
     s == "t"
 }
 
-/// The dump directory: `dir` itself if it holds `metadata.json`, else its newest subdirectory
-/// that does (the tarball unpacks into a dated directory).
+/// The tarball unpacks into a dated directory, so `dir` may be its parent.
 ///
 /// # Errors
 /// [`Error::NotADump`] if neither holds `metadata.json`.
@@ -309,8 +276,7 @@ fn crate_mut<'a>(
     crates.get_mut(names.get(&crate_id)?)
 }
 
-/// Load the tables the job needs from an extracted dump (see [`resolve_dir`]). Takes a minute
-/// and a few GB for the full dump; `crates.csv` READMEs and `versions.csv` features are skipped.
+/// Skips `crates.csv` READMEs and `versions.csv` features: ~3-4 GB RSS for the full dump.
 ///
 /// # Errors
 /// Unreadable or malformed files.
@@ -448,7 +414,6 @@ pub fn load(dir: &Path) -> Result<Dump, Error> {
     Ok(dump)
 }
 
-/// Per-user upload summary of one crate: `(user id, first, last, versions)`.
 #[must_use]
 pub fn publishers(c: &CrateRecord) -> Vec<(u32, String, String, i64)> {
     let mut by_user: BTreeMap<u32, (String, String, i64)> = BTreeMap::new();
@@ -474,24 +439,16 @@ pub fn publishers(c: &CrateRecord) -> Vec<(u32, String, String, i64)> {
         .collect()
 }
 
-/// Totals of one `registry` run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Summary {
-    /// Versions written (found or not).
     pub versions: u64,
-    /// Written versions the dump does not know (`registry_missing`).
     pub missing: u64,
-    /// Versions with a `PUBLISHED` edge.
     pub published: u64,
     pub crates: u64,
     pub users: u64,
     pub teams: u64,
 }
 
-/// Write the registry facts for every version in `states` whose `meta_registry` is not this
-/// dump's [`marker`] (all of them with `rescan`), and the crate-level facts of their crates.
-/// Creates the job's constraints and indexes first (`IF NOT EXISTS`).
-///
 /// # Errors
 /// Database errors; everything written before stays.
 #[allow(clippy::too_many_lines)]
@@ -529,7 +486,6 @@ pub async fn run(
     }
     db.ensure_registry_schema().await?;
 
-    // Nodes the crate and version edges point at.
     let mut users: HashSet<u32> = HashSet::new();
     let mut teams: HashSet<u32> = HashSet::new();
     for c in crate_names.iter().filter_map(|n| dump.crates.get(*n)) {
@@ -698,7 +654,6 @@ mod tests {
         std::fs::write(dir.join("data").join(file), body).unwrap();
     }
 
-    /// A two-crate dump in the real column layout (columns in dump order, extras included).
     fn fixture() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("2026-10-26-020019");

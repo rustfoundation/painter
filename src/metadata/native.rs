@@ -1,38 +1,16 @@
-//! `native` job: does a version vendor C, C++, Objective-C, or assembly code, or ship prebuilt
-//! native binaries?
-//!
-//! Many `-sys` crates carry a small `.c` shim or a couple of headers just to bind a system
-//! library; that is not vendoring a library. So every native file is measured (non-blank lines
-//! and bytes, sources and headers apart), and [`NativeInfo::vendored`] is only set when there is
-//! enough of it to be a library in its own right:
-//!
-//! - at least [`VENDORED_SOURCE_LINES`] non-blank lines in native *source* files, or
-//! - at least [`VENDORED_TOTAL_LINES`] in sources and headers together (header-only libraries),
-//!   or
-//! - at least [`VENDORED_DIR_LINES`] under a conventional vendoring directory (`vendor/`,
-//!   `third_party/`, `deps/`, `external/`, `contrib/`, `submodules/`, ...), where even a small
-//!   amount is somebody else's code.
-//!
-//! The raw numbers are stored too, so other thresholds can be applied in Cypher. Prebuilt
-//! static or shared libraries and object files (`.a`, `.lib`, `.so`, `.dll`, `.dylib`, `.o`,
-//! `.obj`) are counted separately.
+//! Small `.c` shims in `-sys` crates are not vendoring, so `vendored` needs a line threshold.
+//! Raw counts are stored so the thresholds can be re-cut in Cypher.
 use super::source::SourceTree;
 use std::collections::BTreeSet;
 
-/// Job revision, stored as `Version.meta_native` (this job's done-marker). Bump it when the
-/// detection or thresholds change to recompute every version.
+/// Done-marker (`Version.meta_native`); bump when detection or thresholds change.
 pub const REVISION: &str = "native 1";
 
-/// Non-blank lines in native source files (not headers) that make a version "vendored".
 pub const VENDORED_SOURCE_LINES: u64 = 1_000;
-/// Non-blank lines in native sources and headers together that make it "vendored".
 pub const VENDORED_TOTAL_LINES: u64 = 5_000;
-/// Non-blank native lines under a vendoring directory that make it "vendored".
 pub const VENDORED_DIR_LINES: u64 = 200;
-/// Most top-level directories of native code listed in `native_dirs`.
 const MAX_DIRS: usize = 16;
 
-/// Directory names that conventionally hold someone else's code.
 const VENDOR_DIRS: &[&str] = &[
     "vendor",
     "vendored",
@@ -47,7 +25,6 @@ const VENDOR_DIRS: &[&str] = &[
     "submodules",
 ];
 
-/// Language of a native file and whether it is a header.
 fn classify(ext: &str) -> Option<(&'static str, bool)> {
     Some(match ext {
         "c" => ("c", false),
@@ -64,42 +41,28 @@ fn is_prebuilt(ext: &str) -> bool {
     matches!(ext, "a" | "lib" | "so" | "dll" | "dylib" | "o" | "obj")
 }
 
-/// Native-code facts of one version.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NativeInfo {
-    /// Native source files (`.c`, `.cpp`, `.cc`, `.m`, `.s`, ...).
     pub source_files: u64,
-    /// Native headers (`.h`, `.hpp`, ...).
     pub header_files: u64,
-    /// Non-blank lines in native source files.
     pub source_lines: u64,
-    /// Non-blank lines in native sources and headers.
     pub total_lines: u64,
-    /// Bytes in native sources and headers.
     pub bytes: u64,
-    /// Size of the largest native file.
     pub largest_bytes: u64,
-    /// Non-blank native lines under a vendoring directory (see the module docs).
     pub vendor_dir_lines: u64,
-    /// Languages present: `c`, `c++`, `objc`, `asm`.
     pub langs: Vec<String>,
-    /// Top-level directories holding native files (`.` for the crate root), at most 16.
     pub dirs: Vec<String>,
-    /// Prebuilt native binaries (`.a`, `.so`, `.dll`, `.o`, ...).
     pub prebuilt_files: u64,
-    /// Enough native code to count as a vendored library (see the module docs).
     pub vendored: bool,
 }
 
 impl NativeInfo {
-    /// Any native source or header at all.
     #[must_use]
     pub fn has_native_code(&self) -> bool {
         self.source_files + self.header_files > 0
     }
 }
 
-/// Measure a version's native code.
 #[must_use]
 pub fn scan(tree: &SourceTree) -> NativeInfo {
     let mut info = NativeInfo::default();

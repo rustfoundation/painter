@@ -3,21 +3,14 @@ use crates_index::{Crate, Index};
 use futures::StreamExt;
 use std::sync::Arc;
 
-/// How many crates are written to the database concurrently by the bulk import.
 pub const IMPORT_CONCURRENCY: usize = 32;
 
-/// Crates whose `latest` flag is being written at once.
 const SET_LATEST_CONCURRENCY: usize = 64;
 
-/// Environment variable naming a local clone of the crates.io git index.
 pub const INDEX_PATH_ENV: &str = "PAINTER_INDEX_PATH";
 
-/// Open the crates.io index. If `PAINTER_INDEX_PATH` is set, that directory is used as an
-/// existing git clone of <https://github.com/rust-lang/crates.io-index>; otherwise cargo's
-/// default index location is used (which `crates-index` will clone if it is missing).
-///
 /// # Errors
-/// Returns the underlying `crates_index::Error` if the index cannot be opened.
+/// Fails if the index cannot be opened.
 pub fn open_index() -> Result<Index, crates_index::Error> {
     match std::env::var_os(INDEX_PATH_ENV) {
         Some(path) => {
@@ -36,22 +29,13 @@ pub enum Error {
     DatabaseError(#[from] crate::db::Error),
 }
 
-///
-/// # Panics
-/// asdf
 /// # Errors
-/// asdf
+/// Fails if the index cannot be opened.
 pub async fn update_missing_versions(conn: Arc<Db>) -> Result<(), Error> {
     let index = open_index()?;
 
     let do_crate = |c: Crate, db: Arc<Db>| async move {
         if let Ok(true) = db.crate_exists(c.name()).await {
-            //log::info!("Missing crate: {}", c.name());
-            //if let Err(e) = insert_fresh_crate(c.clone(), db.clone()).await {
-            //    log::error!("Failed crate: {}", c.name());
-            //    log::error!("Failed crate: {}", e);
-            //}
-
             for v in c.versions() {
                 if let Ok(false) = db.version_exists(v.name(), v.version()).await {
                     log::info!("Missing version: {}-{}", v.name(), v.version());
@@ -73,11 +57,8 @@ pub async fn update_missing_versions(conn: Arc<Db>) -> Result<(), Error> {
     Ok(())
 }
 
-///
-/// # Panics
-/// asdf
 /// # Errors
-/// asdf
+/// Fails if the index cannot be opened.
 pub async fn update_missing_crates(conn: Arc<Db>) -> Result<(), Error> {
     let index = open_index()?;
 
@@ -103,7 +84,6 @@ pub async fn update_missing_crates(conn: Arc<Db>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Convert an index crate into batched version rows.
 #[must_use]
 pub fn version_rows(c: &Crate) -> Vec<VersionRow> {
     c.versions()
@@ -125,10 +105,6 @@ pub fn version_rows(c: &Crate) -> Vec<VersionRow> {
         .collect()
 }
 
-/// Insert a crate and all of its versions with one database round trip, skipping versions that
-/// already exist, so an interrupted import can be resumed by re-running it. Transient errors
-/// (deadlocks between writers merging the same `Crate` nodes) are retried inside [`Db`].
-///
 /// # Errors
 /// Returns `Error::DatabaseError` on a failed query.
 pub async fn insert_fresh_crate(c: Crate, db: Arc<Db>) -> Result<(), Error> {
@@ -138,12 +114,8 @@ pub async fn insert_fresh_crate(c: Crate, db: Arc<Db>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Idempotently import (or refresh) a single crate and all of its versions from the index.
-/// Existing nodes and relationships are matched with `MERGE`, so this is safe to run against a
-/// database that already contains the crate.
-///
 /// # Errors
-/// Returns `Error::DatabaseError` on any failed query.
+/// Returns `Error::DatabaseError` on a failed query.
 pub async fn upsert_crate(c: Crate, db: Arc<Db>) -> Result<(), Error> {
     log::trace!("~Crate({})", c.name());
     for v in c.versions() {
@@ -169,12 +141,8 @@ pub async fn upsert_crate(c: Crate, db: Arc<Db>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Import the named crates (all versions) from the index, idempotently. Unknown names are
-/// logged and skipped.
-///
 /// # Errors
-/// Returns `Error::IndexError` if the index cannot be opened, or `Error::DatabaseError` on a
-/// failed query.
+/// Returns `Error::IndexError` if the index cannot be opened, or `Error::DatabaseError` on a failed query.
 pub async fn import_crates<S: AsRef<str>>(names: &[S], db: Arc<Db>) -> Result<(), Error> {
     let index = open_index()?;
 
@@ -192,11 +160,6 @@ pub async fn import_crates<S: AsRef<str>>(names: &[S], db: Arc<Db>) -> Result<()
     Ok(())
 }
 
-/// Import every crate in the index (or only `only`, if non-empty): all versions, `VERSION_OF`,
-/// and `DEPENDS_ON`. Versions already present are skipped, so re-running resumes an interrupted
-/// import. One write per crate, `IMPORT_CONCURRENCY` crates in flight at once. Per-crate
-/// failures are logged and counted, not fatal.
-///
 /// # Errors
 /// Returns `Error::IndexError` if the index cannot be opened.
 pub async fn create_fresh_db<S: AsRef<str>>(conn: Arc<Db>, only: &[S]) -> Result<(), Error> {
@@ -251,13 +214,8 @@ pub async fn create_fresh_db<S: AsRef<str>>(conn: Arc<Db>, only: &[S]) -> Result
     Ok(())
 }
 
-/// Flag the highest version of every crate in the index with `latest = true` and clear it on
-/// the others. The index is walked on rayon (`crates_parallel`) and streamed through a bounded
-/// channel while `SET_LATEST_CONCURRENCY` crates are written at once; failures are logged and
-/// counted.
-///
 /// # Errors
-/// Returns `Error::IndexError` if the crates.io index cannot be opened.
+/// Returns `Error::IndexError` if the index cannot be opened.
 ///
 /// # Panics
 /// Panics if the index walk task panics.
@@ -315,12 +273,9 @@ pub async fn set_latest_versions(conn: Arc<Db>) -> Result<(), Error> {
 pub(crate) mod test_support {
     use crates_index::Crate;
 
-    /// One dependency of a fake index record: `(name, req, optional, package_rename)`.
     pub type FakeDep<'a> = (&'a str, &'a str, bool, Option<&'a str>);
-    /// One version of a fake index record: `(version, yanked, deps)`.
     pub type FakeVersion<'a> = (&'a str, bool, &'a [FakeDep<'a>]);
 
-    /// Build an index `Crate` from [`FakeVersion`] records.
     pub fn fake_crate(name: &str, versions: &[FakeVersion<'_>]) -> Crate {
         let mut lines = Vec::new();
         for (vers, yanked, deps) in versions {
@@ -374,7 +329,7 @@ mod tests {
         assert_eq!(d.kind, "Normal");
         assert!(d.optional);
 
-        // `package = "..."` renames: the row carries the real crate name, not the alias.
+        // `package = "..."` renames: the row carries the real crate name.
         let d = &rows[1].dependencies[0];
         assert_eq!(d.name, "tokio-renamed");
         assert!(!d.optional);

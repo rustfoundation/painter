@@ -1,15 +1,5 @@
-// In-memory level-of-detail index over the precomputed layout.
-//
-// Holds every crate's position (typed arrays) and the crate-level LOD_DEP
-// edges. A viewport query picks the coarsest grid level whose non-empty cells
-// inside the view fit the element budget, then returns either cluster nodes
-// ("N crates") or, when few enough remain, the individual crates, plus the
-// aggregated edges between whatever is visible.
-//
-// Nothing is precomputed per level: a viewport costs one pass over the points
-// in the view per level tried, and one pass over all edges. On a full
-// crates.io graph (hundreds of thousands of crates, ~1-2M edges) that is tens
-// of milliseconds, which is cheaper than holding per-level edge tables.
+// Nothing is precomputed per level: a viewport costs one pass over the in-view points per level tried plus one over all edges
+// (tens of ms on a full graph), which is cheaper than holding per-level edge tables.
 
 import { loadLodPositions, streamRead } from './neo4j-io.mjs';
 
@@ -49,14 +39,12 @@ export class LodIndex {
     const pad = Math.max(maxX - minX, maxY - minY, 1) * 0.01;
     this.bounds = { minX: minX - pad, minY: minY - pad, maxX: maxX + pad, maxY: maxY + pad };
     this.span = Math.max(this.bounds.maxX - this.bounds.minX, this.bounds.maxY - this.bounds.minY);
-    // Normalised coordinates in [0,1) for cell bucketing.
     this.nx = new Float32Array(n);
     this.ny = new Float32Array(n);
     for (let i = 0; i < n; i++) {
       this.nx[i] = (this.x[i] - this.bounds.minX) / this.span;
       this.ny[i] = (this.y[i] - this.bounds.minY) / this.span;
     }
-    // Edges as index pairs.
     const m = edges.length;
     this.ea = new Int32Array(m);
     this.eb = new Int32Array(m);
@@ -75,11 +63,9 @@ export class LodIndex {
     this.loadedAt = new Date().toISOString();
   }
 
-  /** Load positions and LOD_DEP edges from Neo4j. Returns null when no build exists. */
   static async load(driver, database, { timeoutMs, maxLevel }) {
     const { positions, meta } = await loadLodPositions(driver, database, { timeoutMs });
-    // LodMeta is written last by a build, so "positions but no meta" means a
-    // build is mid-write: report not ready rather than serve a partial map.
+    // LodMeta is written last, so positions without meta means a build is mid-write: report not ready.
     if (positions.length === 0 || !meta || !meta.built_at) return null;
     const edges = [];
     await streamRead(driver, database, `MATCH (a:Crate)-[r:LOD_DEP]->(b:Crate) RETURN a.name AS a, b.name AS b, r.versions AS n`, {}, {
@@ -94,7 +80,6 @@ export class LodIndex {
     return packCell(level, Math.min(g - 1, Math.floor(this.nx[i] * g)), Math.min(g - 1, Math.floor(this.ny[i] * g)));
   }
 
-  /** Indices of crates inside a layout-space bbox. */
   inView(x0, y0, x1, y1) {
     const out = [];
     for (let i = 0; i < this.count; i++) {
@@ -103,23 +88,14 @@ export class LodIndex {
     return out;
   }
 
-  /**
-   * Viewport query. `bbox` in layout coordinates; `budget` max nodes.
-   * Returns { mode: 'crates' | 'cells', level, nodes, rels, meta }.
-   */
-  /**
-   * `minCell`: smallest cell size (layout units) worth drawing as a cluster;
-   * the client derives it from its zoom so clusters keep a minimum on-screen
-   * spacing. Levels whose cells are smaller are not used.
-   */
+  // `minCell` is derived from the client's zoom so clusters keep a minimum on-screen spacing.
   viewport(bbox, { budget, maxRels = budget, minCell = 0 }) {
     const started = Date.now();
     const x0 = Math.min(bbox.x0, bbox.x1);
     const x1 = Math.max(bbox.x0, bbox.x1);
     const y0 = Math.min(bbox.y0, bbox.y1);
     const y1 = Math.max(bbox.y0, bbox.y1);
-    // The whole-map view (every crate inside the bbox) is the most common and
-    // the most expensive query; memoise it per budget.
+    // The whole-map view is the most common and most expensive query; memoise it per budget.
     const whole = x0 <= this.bounds.minX && y0 <= this.bounds.minY && x1 >= this.bounds.maxX && y1 >= this.bounds.maxY;
     const levelCap = minCell > 0 ? Math.max(0, Math.min(this.maxLevel, Math.floor(Math.log2(this.span / minCell)))) : this.maxLevel;
     const cacheKey = `${budget}:${maxRels}:${levelCap}`;
@@ -140,9 +116,7 @@ export class LodIndex {
       return this.cratesPayload(idx, { maxRels, started, inView: idx.length, level: this.maxLevel });
     }
 
-    // Finest level whose cell count fits the budget. Count distinct cells per
-    // level from coarse to fine with numeric keys, bailing out of a level as
-    // soon as it exceeds the budget; only the winning level is materialised.
+    // Count distinct cells per level coarse to fine, bailing out once over budget; only the winning level is materialised.
     let level = 0;
     for (let l = 1; l <= levelCap; l++) {
       const g = 1 << l;
@@ -212,7 +186,6 @@ export class LodIndex {
 
   cellsPayload(cells, { level, maxRels, started, inView }) {
     const nodes = [];
-    // Visible element index per crate: -1 hidden, otherwise index into `ids`.
     const elemOf = new Int32Array(this.count).fill(-1);
     const ids = [];
     const g = 1 << level;
@@ -269,7 +242,6 @@ export class LodIndex {
         },
       });
     }
-    // Aggregate edges between visible elements with numeric keys.
     const n = ids.length;
     const agg = new Map();
     for (let k = 0; k < this.edgeCount; k++) {
@@ -305,14 +277,12 @@ export class LodIndex {
     };
   }
 
-  /** Position of one crate, or null. */
   locate(name) {
     const i = this.byName.get(name);
     if (i === undefined) return null;
     return { name, x: this.x[i], y: this.y[i], community: this.community[i], degree: this.degree[i] };
   }
 
-  /** Crate names containing `q` (case-insensitive), highest degree first. */
   search(q, limit = 20) {
     const needle = q.toLowerCase();
     const hits = [];

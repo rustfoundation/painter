@@ -5,14 +5,12 @@ import { fmtBytes, fmtCompact, fmtDate, fmtDateTime, UserLink } from './meta';
 
 interface Props {
   view: View;
-  /** Deps view: load a crate's crate-level dependencies / dependents. */
   onExpandDeps: (name: string, direction: 'in' | 'out' | 'both') => void;
   selected: GraphNode | GraphRel | null;
   nodeById: (id: string) => GraphNode | undefined;
   onExpand: (id: string, direction: 'in' | 'out' | 'both', types: ExpandType[]) => void;
   onRemove: (id: string) => void;
   onLoadCrate: (name: string) => void;
-  /** Open a crates.io login in the Publishers view. */
   onOpenUser: (login: string) => void;
   busy: boolean;
 }
@@ -34,7 +32,6 @@ const UNSAFE_CATEGORIES: { key: string; label: string; color: string }[] = [
   { key: 'methods', label: 'unsafe methods', color: '#2BB673' },
 ];
 
-/** `count-unsafe` metrics of a Version, when painter has scanned it. */
 function UnsafeSummary({ p }: { p: Record<string, unknown> }) {
   const num = (k: string) => (typeof p[k] === 'number' ? (p[k] as number) : null);
   if (!p.unsafe_scanner) {
@@ -121,7 +118,6 @@ function UnsafeSummary({ p }: { p: Record<string, unknown> }) {
 const numOf = (p: Record<string, unknown>, k: string) => (typeof p[k] === 'number' ? (p[k] as number) : null);
 const n = (v: number | null) => (v === null ? '—' : v.toLocaleString());
 
-/** `generate-metadata` build job: has_build_script, build_script, build_script_lines, links. */
 function BuildSummary({ p }: { p: Record<string, unknown> }) {
   if (!p.meta_build) {
     return (
@@ -165,7 +161,6 @@ function BuildSummary({ p }: { p: Record<string, unknown> }) {
   );
 }
 
-/** `generate-metadata` native job: has_native_code, vendored_native, native_* counts. */
 function NativeSummary({ p }: { p: Record<string, unknown> }) {
   if (!p.meta_native) {
     return (
@@ -238,7 +233,6 @@ function NativeSummary({ p }: { p: Record<string, unknown> }) {
   );
 }
 
-/** `generate-metadata` diff job: files and lines changed since the previous version. */
 function DiffSummary({ p }: { p: Record<string, unknown> }) {
   if (!p.meta_diff) {
     return (
@@ -314,10 +308,6 @@ const ExtLink = ({ href, label }: { href: string; label?: string }) => (
   </a>
 );
 
-/**
- * Registry facts of a Crate: description, links, downloads, dates (node properties)
- * plus owners, publishers, categories, and keywords fetched from /api/registry/crate.
- */
 function CrateRegistrySummary({ p, onOpenUser }: { p: Record<string, unknown>; onOpenUser: (login: string) => void }) {
   const name = String(p.name ?? '');
   const [reg, setReg] = useState<CrateRegistry | null>(null);
@@ -484,7 +474,6 @@ function CrateRegistrySummary({ p, onOpenUser }: { p: Record<string, unknown>; o
   );
 }
 
-/** Registry facts of a Version: published_at, uploader (fetched), yanked, license, size, downloads, edition, MSRV, binaries. */
 function VersionRegistrySummary({ p, onOpenUser }: { p: Record<string, unknown>; onOpenUser: (login: string) => void }) {
   const name = String(p.name ?? '');
   const version = String(p.version ?? '');
@@ -562,7 +551,6 @@ function VersionRegistrySummary({ p, onOpenUser }: { p: Record<string, unknown>;
   );
 }
 
-/** Keys the summaries above already present; the raw table below skips them. */
 const SUMMARISED = /^(diff_(paths|status|added|removed|binary)|description)$/;
 
 function Properties({ props }: { props: Record<string, unknown> }) {

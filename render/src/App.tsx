@@ -53,15 +53,11 @@ export function App() {
   const [showRelCaptions, setShowRelCaptions] = useState(false);
   const [view, setView] = useState<View>('default');
   const [depsLimit, setDepsLimit] = useState(DEFAULT_DEPS_LIMIT);
-  /** Deps view: max hops from the roots, 0 = unlimited. */
   const [depsDepth, setDepsDepth] = useState(0);
-  /** meta of the last deps-view load, for the status bar. */
   const [depsMeta, setDepsMeta] = useState<GraphPayload['meta'] | null>(null);
-  /** Map view: crate to jump to, element budget per viewport, last viewport meta. */
   const [mapTarget, setMapTarget] = useState<{ name: string; nonce: number } | null>(null);
   const [mapBudget, setMapBudget] = useState(600);
   const [mapMeta, setMapMeta] = useState<{ mode: string; level: number; inView: number; total: number; nodes: number; rels: number; elapsedMs: number } | null>(null);
-  /** Publishers view: login to open, set from the details panel and the other registry views. */
   const [publisherTarget, setPublisherTarget] = useState<{ login: string; nonce: number } | null>(null);
 
   const fitAll = useCallback(() => {
@@ -71,7 +67,6 @@ export function App() {
     if (ids.length) nvl.fit(ids, { animated: true });
   }, []);
 
-  // Health / stats polling for the status bar.
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
@@ -100,11 +95,9 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Name of the crate the last load resolved to (partial input like "serd" loads "serde").
+  // Resolved name: the server accepts partial input ("serd" loads "serde").
   const [loadedName, setLoadedName] = useState<string | null>(null);
 
-  // Load a crate's neighbourhood from the toolbar (or "Load crate" in details).
-  // The server accepts partial names and reports the crate it picked.
   const loadCrate = useCallback(
     async (input: string) => {
       setBusy(true);
@@ -126,7 +119,6 @@ export function App() {
     [options, fitAll],
   );
 
-  // Deps view: crate-level graph. `crate` null loads the whole (capped) graph.
   const loadDeps = useCallback(
     async (crate: string | null, direction: 'in' | 'out' | 'both' = 'both', replace = false) => {
       setBusy(true);
@@ -153,7 +145,6 @@ export function App() {
     [depsLimit, fitAll],
   );
 
-  // Deps view: full transitive dependency chain of every crate matching the filter.
   // Replaces the canvas; expansions from the details panel merge via loadDeps.
   const loadChain = useCallback(
     async (q: string, exact = false) => {
@@ -180,7 +171,6 @@ export function App() {
     [depsLimit, depsDepth, fitAll],
   );
 
-  // Switching views starts from an empty canvas.
   const switchView = useCallback(
     (next: View) => {
       if (next === view) return;
@@ -193,7 +183,6 @@ export function App() {
     [view],
   );
 
-  /** Toolbar Load: per-view behaviour. */
   const load = useCallback(
     (input: string, exact = false) => {
       if (view === 'map') {
@@ -205,7 +194,6 @@ export function App() {
     [view, loadChain, loadCrate],
   );
 
-  /** From the map: switch to Deps and draw the chain of one crate. */
   const openInDeps = useCallback(
     (name: string) => {
       setView('deps');
@@ -219,7 +207,6 @@ export function App() {
     [loadChain],
   );
 
-  /** From the Unsafe / Build scripts / Native code / Diffs views: switch to Default and load one crate. */
   const openInGraph = useCallback(
     (name: string) => {
       setView('default');
@@ -231,7 +218,6 @@ export function App() {
     [loadCrate],
   );
 
-  /** From anywhere: switch to Publishers and open one crates.io login. */
   const openUser = useCallback((login: string) => {
     setView('publishers');
     setError(null);
@@ -285,7 +271,7 @@ export function App() {
 
   const selected: GraphNode | GraphRel | null = selectedId ? (store.nodes.get(selectedId) ?? store.rels.get(selectedId) ?? null) : null;
 
-  // Debug hook for headless checks (same name the Map view uses).
+  // Debug hook for headless checks.
   useEffect(() => {
     (window as unknown as { __painterNvl?: unknown }).__painterNvl = nvlRef.current;
   });
@@ -324,8 +310,7 @@ export function App() {
       },
       onHover: true,
       onPan: true,
-      // Mouse-wheel / pinch zoom. The key must be `onZoomAndPan`; any other
-      // name leaves NVL's zoom interaction unattached.
+      // Key must be `onZoomAndPan`; any other name leaves NVL zoom unattached.
       onZoomAndPan: true,
       onDrag: true,
     }),

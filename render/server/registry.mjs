@@ -1,18 +1,5 @@
-// Publishers, Releases, and Supply-chain views over the crates.io registry data the
-// `painter generate-metadata --job registry` job stores from a crates.io DB dump:
-//   (User {id, login, name, gh_id, created_at}), (Team {id, login, name, avatar})
-//   (User)-[:PUBLISHED {at}]->(Version)                    the uploader (recorded since ~2017)
-//   (User)-[:PUBLISHED {at, last, versions}]->(Crate)      first / last upload of the crate, count
-//   (User|Team)-[:OWNS {since, added_by}]->(Crate)         current owners; added_by is a login
-//   (Crate)-[:IN_CATEGORY]->(Category {slug, name}), (Crate)-[:HAS_KEYWORD]->(Keyword {name})
-//   Version.{published_at, yanked, license, crate_size, downloads, edition, rust_version, has_lib, bin_names}
-//   Crate.{created_at, updated_at, description, homepage, documentation, repository, downloads,
-//          trustpub_only, default_version, num_versions, registry_id}
-// Every function takes `read(cypher, params)` resolving to plain row objects. Dates are
-// returned as ISO strings (`toString(datetime)`), never driver temporal objects. Every
-// query is index-backed (User.login, PUBLISHED.at, OWNS.since, Version.published_at,
-// Crate.created_at, Crate.downloads) and LIMITed; the only whole-relationship-type
-// aggregations are the publisher leaderboards, which the routes cache.
+// Dates are ISO strings (`toString(datetime)`), never driver temporal objects. Queries are index-backed
+// and LIMITed; only the publisher leaderboards aggregate a whole relationship type, so the routes cache them.
 import neo4j from 'neo4j-driver';
 
 const page = (rows, limit) => {
@@ -22,7 +9,6 @@ const page = (rows, limit) => {
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
-/** `YYYY-MM-DD` or any Date-parsable string -> ISO instant; `fallback` when empty or invalid. */
 export const parseInstant = (value, fallback) => {
   const s = String(value ?? '').trim();
   if (!s) return fallback;
@@ -31,10 +17,7 @@ export const parseInstant = (value, fallback) => {
   return Number.isNaN(d.getTime()) ? fallback : d.toISOString();
 };
 
-/**
- * `[from, to)` for a timeframe request. A plain `to` date is inclusive in the UI, so it
- * becomes the start of the next day. Defaults: the last `defaultDays` days.
- */
+// A plain `to` date is inclusive in the UI, so it becomes the start of the next day.
 export const dateRange = (fromValue, toValue, defaultDays = 7) => {
   const now = new Date();
   const toRaw = String(toValue ?? '').trim();
@@ -45,14 +28,7 @@ export const dateRange = (fromValue, toValue, defaultDays = 7) => {
   return Date.parse(from) < Date.parse(to) ? { from, to } : { from: to, to: from };
 };
 
-// ---------------------------------------------------------------------------
-// Coverage
-// ---------------------------------------------------------------------------
-
-/**
- * How much of the graph the registry job has reached. The counts come from the count
- * store; the version coverage is a label scan of every version (seconds): cache it.
- */
+// Version coverage is a label scan of every version (seconds), so callers cache it.
 export const registryStats = async (read) => {
   const [counts, crates, latest, all] = await Promise.all([
     read(
@@ -86,15 +62,7 @@ export const registryStats = async (read) => {
   return { ...counts[0], ...crates[0], ...latest[0], ...all[0] };
 };
 
-// ---------------------------------------------------------------------------
-// Publishers: user search, profile, leaderboards
-// ---------------------------------------------------------------------------
-
-/**
- * Login prefix search. `STARTS WITH` is case-sensitive and served by idx_user_login,
- * so the typed text, its lowercase, and its capitalised spelling are all tried.
- * Teams (1.5k nodes, no index needed) match anywhere in the login.
- */
+// `STARTS WITH` is case-sensitive and served by idx_user_login, so try the typed, lowercase and capitalised spellings.
 export const searchUsers = async (read, q, limit) => {
   const variants = [...new Set([q, q.toLowerCase(), q.toUpperCase(), q.charAt(0).toUpperCase() + q.slice(1)])];
   const [users, teams] = await Promise.all([
@@ -115,7 +83,6 @@ export const searchUsers = async (read, q, limit) => {
   return { users, teams };
 };
 
-/** Crate facts shared by the profile's published / owned lists: registry props plus the latest version's metadata. */
 const CRATE_FACTS = `
   OPTIONAL MATCH (c)-[:VERSION_OF]->(lv:Version {latest: true})
   WITH c, rel, head(collect(lv)) AS lv
@@ -128,12 +95,6 @@ const CRATE_FACTS = `
 
 const CRATE_LIST_LIMIT = 5000;
 
-/**
- * One publisher (User) or Team: node properties, every crate they published (first /
- * last upload, count) or own (since, added_by) merged by crate name with the crate's
- * downloads and latest-version metadata, a per-month upload timeline, and totals.
- * Null when no User or Team has that login.
- */
 export const userProfile = async (read, login) => {
   const [who] = await read(
     `OPTIONAL MATCH (u:User {login: $login})
@@ -205,11 +166,7 @@ export const userProfile = async (read, login) => {
 
 const TOP_CRATES_FOR_OWNERS = 5000;
 
-/**
- * Leaderboards. The two "prolific" boards aggregate every PUBLISHED->Crate edge
- * (355k, ~4 s each); the two download boards look at the top 5,000 crates by
- * downloads (idx_crate_downloads) and rank their owners / publishers. Cached by the route.
- */
+// The prolific boards aggregate every PUBLISHED->Crate edge (355k, ~4 s each); the download boards use the top 5,000 crates (idx_crate_downloads).
 export const publisherLeaderboards = async (read, limit = 100) => {
   const prolific = (order) =>
     read(
@@ -245,10 +202,6 @@ export const publisherLeaderboards = async (read, limit = 100) => {
   return { byCrates, byUploads, owners, publishers, topCrates: TOP_CRATES_FOR_OWNERS };
 };
 
-// ---------------------------------------------------------------------------
-// Releases: crates / versions published in a timeframe
-// ---------------------------------------------------------------------------
-
 export const RELEASE_SOURCES = {
   crates: ['created', 'publisher'],
   versions: ['publisher', 'published_at'],
@@ -268,16 +221,8 @@ const VERSION_RELEASE_ROW = `
          v.rust_version AS rustVersion, v.unsafe_total AS unsafeTotal, coalesce(v.has_build_script, false) AS hasBuildScript,
          coalesce(v.has_native_code, false) AS hasNativeCode, coalesce(v.vendored_native, false) AS vendoredNative, extra`;
 
-/**
- * Crates or versions published in `[from, to)`.
- *   kind=crates,   source=created      Crate.created_at: the crate's first-ever release (idx_crate_created_at)
- *   kind=crates,   source=publisher    PUBLISHED->Crate .at: a user's first upload of a crate (idx_published_at);
- *                                      `extra.joined` is true when the crate already existed (a new publisher)
- *   kind=versions, source=publisher    PUBLISHED->Version .at: uploads with a known uploader
- *   kind=versions, source=published_at Version.published_at: every version, uploader when recorded
- * `sort=date` walks the index in order (fast for any range); `downloads` / `name` sort
- * everything in the range, so the route gives them the long timeout.
- */
+// `sort=date` walks the index in order; downloads / name sort the whole range, so the route gives them the long timeout.
+// `extra.joined` is true when the crate already existed (a new publisher).
 export const releases = async (read, { kind, source, from, to, q, minDownloads, sort, desc, limit, offset }) => {
   const dir = desc ? 'DESC' : 'ASC';
   const params = { from, to, q: q.toLowerCase(), minDownloads: neo4j.int(minDownloads), offset: neo4j.int(offset), limit: neo4j.int(limit + 1) };
@@ -314,10 +259,7 @@ export const releases = async (read, { kind, source, from, to, q, minDownloads, 
   return page(rows, limit);
 };
 
-/**
- * Releases per day (ranges up to 92 days) or per month in `[from, to)`, for the timeline
- * strip above the table: a scan of the range, so the route caches it per range.
- */
+// Scans the whole range, so the route caches it per range.
 export const releasesHistogram = async (read, { kind, source, from, to }) => {
   const days = (Date.parse(to) - Date.parse(from)) / 86_400_000;
   const unit = days <= 92 ? 'day' : 'month';
@@ -337,18 +279,9 @@ export const releasesHistogram = async (read, { kind, source, from, to }) => {
   return { kind, source, from, to, unit, buckets, total: buckets.reduce((a, b) => a + b.n, 0) };
 };
 
-// ---------------------------------------------------------------------------
-// Supply-chain signals
-// ---------------------------------------------------------------------------
-
-/** The `top` most-downloaded crates (idx_crate_downloads), the scope of the top-N boards. */
 const TOP_CRATES = `MATCH (c:Crate) WHERE c.downloads IS NOT NULL WITH c ORDER BY c.downloads DESC LIMIT $top`;
 
-/**
- * Bus factor: among the top `top` crates by downloads, those owned by exactly one
- * User and no Team. `degree` is the crate-level dependency degree from the Map
- * precompute when it exists (counting DEPENDS_ON edges live would scan millions).
- */
+// `degree` comes from the Map precompute when it exists; counting DEPENDS_ON edges live would scan millions.
 export const busFactor = async (read, { top, limit, offset }) => {
   const rows = await read(
     `${TOP_CRATES}
@@ -367,11 +300,6 @@ export const busFactor = async (read, { top, limit, offset }) => {
   return page(rows, limit);
 };
 
-/**
- * Owners added since `since` (idx_owns_since) to crates with at least `minDownloads`
- * downloads. `self` 'exclude' (default) keeps only owners added by someone else
- * (added_by <> login); 'include' keeps every addition.
- */
 export const ownerAdditions = async (read, { since, minDownloads, self, limit, offset }) => {
   const rows = await read(
     `MATCH (o)-[r:OWNS]->(c:Crate)
@@ -388,11 +316,6 @@ export const ownerAdditions = async (read, { since, minDownloads, self, limit, o
   return page(rows, limit);
 };
 
-/**
- * Among the top `top` crates by downloads with more than one version: the latest
- * version was uploaded by someone whose only upload of that crate it is
- * (PUBLISHED->Crate `versions` = 1), i.e. a first-time uploader shipped the current release.
- */
 export const newUploaders = async (read, { top, limit, offset }) => {
   const rows = await read(
     `${TOP_CRATES}
@@ -410,11 +333,6 @@ export const newUploaders = async (read, { top, limit, offset }) => {
   return page(rows, limit);
 };
 
-// ---------------------------------------------------------------------------
-// Side panel: one crate's / version's registry facts
-// ---------------------------------------------------------------------------
-
-/** Owners, publishers, categories, and keywords of one crate; null when the crate does not exist. */
 export const crateRegistry = async (read, name) => {
   const [row] = await read(
     `MATCH (c:Crate {name: $name})
@@ -435,7 +353,6 @@ export const crateRegistry = async (read, name) => {
   return row;
 };
 
-/** The uploader of one version, null fields when crates.io did not record one. */
 export const versionPublisher = async (read, { crate, version }) => {
   const [row] = await read(
     `MATCH (:Crate {name: $crate})-[:VERSION_OF]->(v:Version {version: $version})

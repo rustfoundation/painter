@@ -1,5 +1,4 @@
 # syntax=docker/dockerfile:1
-# Stage 1: build the NVL frontend.
 FROM node:22-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
@@ -8,7 +7,6 @@ COPY tsconfig.json vite.config.ts index.html ./
 COPY src ./src
 RUN npm run build
 
-# Stage 2: runtime image with only the server and its production deps.
 FROM node:22-alpine
 WORKDIR /app
 ENV NODE_ENV=production \

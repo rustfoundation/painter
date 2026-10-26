@@ -1,11 +1,3 @@
-// painter-render: a small HTTP server that
-//   1. owns the Neo4j driver (configured from the environment, see config.mjs),
-//   2. exposes a read-only JSON API tailored to the painter graph schema,
-//   3. serves the built NVL frontend from ../dist.
-//
-// The browser never talks to Neo4j directly, so credentials stay server side
-// and the frontend only needs to know where this server is (same origin).
-
 import express from 'express';
 import neo4j from 'neo4j-driver';
 import path from 'node:path';
@@ -56,10 +48,6 @@ const distDir = path.resolve(here, '..', 'dist');
 
 const log = (...args) => console.log(new Date().toISOString(), ...args);
 
-// ---------------------------------------------------------------------------
-// Neo4j
-// ---------------------------------------------------------------------------
-
 const driver = neo4j.driver(config.neo4j.uri, neo4j.auth.basic(config.neo4j.user, config.neo4j.password), {
   maxConnectionPoolSize: 16,
   connectionAcquisitionTimeout: 10_000,
@@ -72,15 +60,13 @@ const clampLimit = (value, fallback) => {
   return Math.min(n, config.neo4j.maxRows);
 };
 
-/** Run a Cypher query in a read transaction and return the collected graph. */
 const readGraph = async (cypher, params = {}, { timeoutMs = config.neo4j.queryTimeoutMs } = {}) => {
   const session = driver.session({ database: config.neo4j.database, defaultAccessMode: neo4j.session.READ });
   try {
     const started = Date.now();
     const result = await session.executeRead((tx) => tx.run(cypher, params), { timeout: timeoutMs });
     const elapsedMs = Date.now() - started;
-    // Neo4j 5 can end a timed-out read as an empty stream instead of raising
-    // TransactionTimedOut; treat "nothing back, took the whole budget" as a timeout.
+    // Neo4j 5 can end a timed-out read as an empty stream instead of raising.
     if (result.records.length === 0 && elapsedMs >= timeoutMs * 0.95) {
       const err = new Error(`query timed out after ${elapsedMs} ms (limit ${timeoutMs} ms); the database may be busy`);
       err.code = 'Neo.ClientError.Transaction.TransactionTimedOut';
@@ -112,17 +98,12 @@ const waitForNeo4j = async () => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// HTTP
-// ---------------------------------------------------------------------------
-
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '256kb' }));
 
 const api = express.Router();
 
-/** Wrap async handlers so rejections become 500 responses instead of hanging. */
 const wrap = (fn) => (req, res, next) => fn(req, res, next).catch(next);
 
 api.get(
@@ -140,7 +121,6 @@ api.get(
   }),
 );
 
-/** Summary counts, used for the status bar. Cheap with the count store. */
 api.get(
   '/stats',
   wrap(async (_req, res) => {
@@ -155,12 +135,7 @@ api.get(
   }),
 );
 
-/**
- * Crate name search: case-insensitive partial match anywhere in the name.
- * Prefix matches rank first, then shorter names, so "serd" lists serde,
- * serde_json, ... before e.g. "xserde". A TEXT index on Crate.name
- * (docker/queries.md) makes CONTAINS fast; without it this is a label scan.
- */
+// A TEXT index on Crate.name (docker/queries.md) makes CONTAINS fast; without it this is a label scan.
 const searchCrates = async (q, limit) =>
   readGraph(
     `MATCH (c:Crate) WHERE toLower(c.name) CONTAINS $q
@@ -171,10 +146,6 @@ const searchCrates = async (q, limit) =>
     { q, limit: neo4j.int(limit) },
   ).then((g) => g.rows.map((r) => r.name));
 
-/**
- * Resolve user input to a crate name: exact match first, otherwise the best
- * partial match as ranked by searchCrates. Returns null when nothing matches.
- */
 const resolveCrateName = async (input) => {
   const q = String(input ?? '').trim();
   if (!q) return null;
@@ -194,12 +165,7 @@ api.get(
   }),
 );
 
-/**
- * Build a synthetic aggregated INVOKES relationship. The graph stores calls as
- * (Version)-[:HAS_FN]->(:Fn)-[:CALLS]->(:Symbol)-[:IN]->(Crate), far too dense
- * to draw; we collapse them into one edge per (Version, Crate) pair carrying
- * the number of distinct calls and sample target symbols.
- */
+// Calls are too dense to draw, so collapse them to one edge per (Version, Crate).
 const aggregatedInvokes = (fromId, toId, count, targets) => ({
   id: `agg:${fromId}->${toId}:INVOKES`,
   type: 'INVOKES',
@@ -208,21 +174,6 @@ const aggregatedInvokes = (fromId, toId, count, targets) => ({
   properties: { count, targets, aggregated: true },
 });
 
-/**
- * Load a crate with its versions and, optionally, their outgoing DEPENDS_ON
- * and INVOKES edges and incoming dependents. `:name` may be a partial name;
- * it is resolved to the best match and reported back as meta.resolvedName.
- *
- * Query params:
- *   versions   = latest | all            (default latest)
- *   deps       = true | false            (default true)   Version-[:DEPENDS_ON]->Crate
- *   invokes    = true | false            (default true)   calls from a Version into each Crate (aggregated per crate)
- *   dependents = true | false            (default false)  Version-[:DEPENDS_ON]->(this Crate), with their Crate
- *   limit      = per-relationship-type cap (default 200)
- *
- * "latest" prefers `v.latest = true` (set by `painter set-latest-versions`) and
- * otherwise falls back to the highest semver triple.
- */
 api.get(
   '/graph/crate/:name',
   wrap(async (req, res) => {
@@ -237,8 +188,7 @@ api.get(
     const dependents = req.query.dependents === 'true';
     const limit = neo4j.int(clampLimit(req.query.limit, 200));
 
-    // VERSION_OF is created as (Crate)-[:VERSION_OF]->(Version) by db.rs; the
-    // README says the opposite, so match it undirected to be safe.
+    // db.rs creates (Crate)-[:VERSION_OF]->(Version) but the README says the reverse.
     const g = await readGraph(
       `MATCH (c:Crate {name: $name})
        OPTIONAL MATCH (c)-[:VERSION_OF]-(v:Version)
@@ -294,18 +244,11 @@ api.get(
   }),
 );
 
-/**
- * Expand a node: return its neighbours over the given relationship types.
- * Body: { id: elementId, direction?: 'in'|'out'|'both', types?: string[], limit?: number }
- * INVOKES neighbours (calls from a Version into a Crate, see aggregatedInvokes)
- * are aggregated per crate like in /graph/crate.
- */
 api.post(
   '/graph/expand',
   wrap(async (req, res) => {
     const { id, direction = 'both', types = [], limit } = req.body ?? {};
     if (typeof id !== 'string' || !id) return res.status(400).json({ error: 'id (elementId) is required' });
-    // OWNS / PUBLISHED bring User and Team nodes onto the canvas (registry job).
     const allowed = ['VERSION_OF', 'DEPENDS_ON', 'INVOKES', 'OWNS', 'PUBLISHED'];
     const requested = Array.isArray(types) && types.length ? types.filter((t) => allowed.includes(t)) : allowed;
     const plain = requested.filter((t) => t !== 'INVOKES');
@@ -322,7 +265,6 @@ api.post(
       : { nodes: [], rels: [], rows: [], meta: { records: 0, elapsedMs: 0 } };
 
     if (requested.includes('INVOKES')) {
-      // Calls run Version -> Crate: outgoing from a Version, incoming to a Crate.
       const inv = await readGraph(
         `MATCH (n) WHERE elementId(n) = $id
          CALL {
@@ -348,14 +290,6 @@ api.post(
   }),
 );
 
-// ---------------------------------------------------------------------------
-// Crate-level dependency view
-// ---------------------------------------------------------------------------
-
-/**
- * Synthetic crate->crate edge: "some version of `from` depends on `to`".
- * `versions` is how many distinct versions of `from` declare the dependency.
- */
 const aggregatedDependsOn = (fromId, toId, versions) => ({
   id: `dep:${fromId}->${toId}`,
   type: 'DEPENDS_ON',
@@ -371,14 +305,9 @@ const depsFromRows = (g) => {
   return g;
 };
 
-/** In-memory cache for the (expensive) whole-graph query, keyed by limit. Only non-empty results are cached. */
 const depsCache = new Map();
 
-/**
- * Total distinct crate->crate pairs. Informational only, so it is computed in
- * the background and never blocks a response: null until known, refreshed
- * after depsCacheMs so it tracks an import in progress.
- */
+// Informational only: computed in the background so it never blocks a response.
 let depsTotalPairs = { value: null, at: 0, inFlight: null };
 
 const totalCratePairs = () => {
@@ -408,20 +337,7 @@ const clampDepsLimit = (value) => {
   return Math.min(n, config.depsMaxEdges);
 };
 
-/**
- * Crate-level dependency graph: only `(Crate)` nodes and aggregated
- * `DEPENDS_ON` edges. Every version of a crate is folded into the crate, and
- * an edge A->B exists if any version of A depends on B.
- *
- * Query params:
- *   crate     = name (may be partial)   neighbourhood of one crate; omit for the whole graph
- *   direction = out | in | both         (default both; only with `crate`)
- *   limit     = max edges               (default RENDER_DEPS_DEFAULT_EDGES, capped by RENDER_DEPS_MAX_EDGES)
- *
- * Without `crate` the response is the `limit` most-used crate->crate edges
- * (ranked by how many versions declare them), so a capped view still shows
- * the core of the ecosystem. meta.totalPairs reports the uncapped size.
- */
+// Without `crate`, return the most-used edges (by version count) so a capped view still shows the ecosystem core.
 api.get(
   '/graph/deps',
   wrap(async (req, res) => {
@@ -433,10 +349,8 @@ api.get(
       if (cached && Date.now() - cached.at < config.depsCacheMs) {
         return res.json({ ...cached.payload, meta: { ...cached.payload.meta, cached: true } });
       }
-      // Version nodes carry the crate name, so the VERSION_OF hop is unnecessary:
-      // group DEPENDS_ON edges by (v.name, b) and resolve the source Crate only
-      // for the `limit` winners. This scans every DEPENDS_ON edge once, which is
-      // why it gets its own (long) timeout.
+      // Version nodes carry the crate name, so skip the VERSION_OF hop and resolve the source Crate only
+      // for the `limit` winners. Scans every DEPENDS_ON edge once, hence the long timeout.
       const g = depsFromRows(
         await readGraph(
           `MATCH (v:Version)-[:DEPENDS_ON]->(b:Crate)
@@ -503,23 +417,6 @@ api.get(
   }),
 );
 
-/**
- * Transitive dependency chain, crate level.
- *
- * Query params:
- *   q      = filter text. A crate named exactly `q` is the only root when it
- *            exists. Otherwise, with 3+ characters, every crate whose name
- *            contains `q` (case-insensitive) is a root.
- *   limit  = max edges in the response (default RENDER_DEPS_DEFAULT_EDGES, capped by RENDER_DEPS_MAX_EDGES)
- *   depth  = max hops from the roots, 0 = unlimited (default 0)
- *   exact  = 1 to force an exact name match regardless of length (suggestion picked)
- *
- * Breadth-first from the roots: each level is one query that resolves the
- * crate-level dependencies (any version of A depends on B) of the whole
- * frontier. Stops when the frontier is empty, `depth` is reached, or the edge
- * cap is hit; meta reports which. Root nodes are always included even if
- * they have no dependencies.
- */
 api.get(
   '/graph/deps/chain',
   wrap(async (req, res) => {
@@ -530,7 +427,6 @@ api.get(
     const forceExact = req.query.exact === '1' || req.query.exact === 'true';
     const started = Date.now();
 
-    // Roots: the exact crate if it exists; otherwise all partial matches (3+ chars).
     let rootsGraph = await readGraph(`MATCH (c:Crate {name: $q}) RETURN c`, { q });
     let exact = rootsGraph.nodes.length > 0;
     let partial = false;
@@ -561,7 +457,7 @@ api.get(
         truncated = true;
         break;
       }
-      // Crate.name is unique-constrained (indexed); Version.name is reached via VERSION_OF.
+      // Crate.name is unique-constrained (indexed).
       const level = depsFromRows(
         await readGraph(
           `MATCH (a:Crate) WHERE a.name IN $names
@@ -614,22 +510,10 @@ api.get(
   }),
 );
 
-// ---------------------------------------------------------------------------
-// Callers view: reverse call graph over CALLS (see callers.mjs)
-// ---------------------------------------------------------------------------
-
-/**
- * A called Symbol is IN the crate named by its path, which spells `my-crate`
- * as `my_crate`; accept either spelling for the callee crate.
- */
+// Symbol paths spell `my-crate` as `my_crate`; accept either.
 const crateSpellings = (name) => [...new Set([name, normCrate(name), name.replace(/_/g, '-')])];
 
-/**
- * Functions of a crate that something calls: Symbols IN it whose name
- * contains `q` (case-insensitive), most-called first (`calls` = distinct
- * calling functions). Names ending in `q` rank first so `spawn` finds
- * `tokio::task::spawn::spawn`.
- */
+// Names ending in `q` rank first so `spawn` finds `tokio::task::spawn::spawn`.
 const searchFunctions = async (crate, q, limit) =>
   readGraph(
     `MATCH (t:Crate) WHERE t.name IN $names
@@ -641,7 +525,6 @@ const searchFunctions = async (crate, q, limit) =>
     { names: crateSpellings(crate), q: q.toLowerCase(), limit: neo4j.int(limit) },
   ).then((g) => g.rows);
 
-/** `?crate&q&limit`: function-name suggestions for the Callers view. */
 api.get(
   '/functions/search',
   wrap(async (req, res) => {
@@ -651,7 +534,6 @@ api.get(
   }),
 );
 
-/** Every version of a crate, newest first (semver triple, then pre-releases last). */
 api.get(
   '/crates/:name/versions',
   wrap(async (req, res) => {
@@ -665,19 +547,6 @@ api.get(
   }),
 );
 
-/**
- * Who calls a function, directly or transitively.
- *
- * Query params:
- *   crate   = crate that defines the function (required)
- *   fn      = function: the full demangled name, or text contained in it (required)
- *   match   = exact | contains   (default contains; contains takes every matching
- *             target into the crate, up to 500)
- *   version = pin the crate version; callers must be that version (same crate) or
- *             declare a DEPENDS_ON requirement that admits it. Empty = any version.
- *   depth   = max call levels to walk outwards (default 3, max 10)
- *   limit   = max rows (default and cap NEO4J_MAX_ROWS)
- */
 api.get(
   '/callers',
   wrap(async (req, res) => {
@@ -728,12 +597,6 @@ api.get(
   }),
 );
 
-// ---------------------------------------------------------------------------
-// Level-of-detail map: precompute jobs
-// ---------------------------------------------------------------------------
-
-// In-memory viewport index. Loaded lazily on first use and reloaded after a
-// job finishes; `lodState` tells the UI whether a build exists / is loading.
 let lodIndex = null;
 let lodLoading = null;
 let lodLoadError = null;
@@ -769,13 +632,8 @@ const lodJobs = createLodJobs({
   },
 });
 
-/** Resolve the index or send a 503 describing why it is not available. Returns null after responding. */
-// ---------------------------------------------------------------------------
-// Unsafe view: count-unsafe metrics on Version nodes (see unsafe.mjs)
-// ---------------------------------------------------------------------------
-
 const readRows = (cypher, params) => readGraph(cypher, params).then((g) => g.rows);
-/** For the whole-scope stats aggregations: a label scan of every version, which under import load can exceed the default timeout. */
+/** Label scan of every version; under import load it can exceed the default timeout. */
 const readRowsSlow = (cypher, params) => readGraph(cypher, params, { timeoutMs: config.depsTimeoutMs }).then((g) => g.rows);
 const unsafeScope = (v) => (v === 'all' ? 'all' : 'latest');
 const unsafeTri = (v) => (v === 'yes' || v === 'no' ? v : 'any');
@@ -784,11 +642,10 @@ const nonNegInt = (v, fallback = 0) => {
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 };
 
-/** Stats aggregate every version in scope (seconds for `all`); cache them briefly. */
+/** Stats aggregate every version in scope (seconds for `all`), so cache them. */
 const unsafeStatsCache = new Map();
 const UNSAFE_STATS_TTL_MS = 60_000;
 
-/** `?scope=latest|all`: coverage, totals per category, and an unsafe_total histogram. */
 api.get(
   '/unsafe/stats',
   wrap(async (req, res) => {
@@ -802,10 +659,6 @@ api.get(
   }),
 );
 
-/**
- * `?scope&sort&dir&q&forbids&build&minLines&minUnsafe&limit&offset`: the leaderboard,
- * ordered and filtered server-side. `sort` is one of unsafe.mjs SORTS.
- */
 api.get(
   '/unsafe/top',
   wrap(async (req, res) => {
@@ -828,7 +681,6 @@ api.get(
   }),
 );
 
-/** Every version of a crate with its metrics, oldest first. */
 api.get(
   '/unsafe/crate/:name',
   wrap(async (req, res) => {
@@ -837,7 +689,6 @@ api.get(
   }),
 );
 
-/** `?crate&version&depth&limit`: unsafe in a version's dependency closure (version defaults to latest). */
 api.get(
   '/unsafe/deps',
   wrap(async (req, res) => {
@@ -855,16 +706,9 @@ api.get(
   }),
 );
 
-// ---------------------------------------------------------------------------
-// Build scripts / Native code / Diffs views: generate-metadata properties on
-// Version nodes (see metadata.mjs). Same shape as the Unsafe routes: cached
-// stats per scope, a server-sorted leaderboard with `hasMore`, a per-crate history.
-// ---------------------------------------------------------------------------
-
 const metaStatsCache = new Map();
 const META_STATS_TTL_MS = 60_000;
 
-/** Serve `fn(readRowsSlow, scope)` from a 60 s cache keyed by view and scope. */
 const cachedStats = (key, fn) =>
   wrap(async (req, res) => {
     const scope = unsafeScope(req.query.scope);
@@ -879,10 +723,8 @@ const cachedStats = (key, fn) =>
 
 const sortKey = (sorts, requested, fallback) => (Object.hasOwn(sorts, String(requested)) ? String(requested) : fallback);
 
-/** `?scope`: build-script coverage, sizes, and the top `links` libraries. */
 api.get('/build/stats', cachedStats('build', buildStats));
 
-/** `?scope&sort&dir&q&links&link&custom&minLines&limit&offset`: versions with a build script (`link` = exact `links` name). */
 api.get(
   '/build/top',
   wrap(async (req, res) => {
@@ -905,7 +747,6 @@ api.get(
   }),
 );
 
-/** `?scope&limit`: `links` libraries ranked by distinct crates. */
 api.get(
   '/build/links',
   wrap(async (req, res) => {
@@ -915,7 +756,6 @@ api.get(
   }),
 );
 
-/** Every version of a crate with its build-script facts, oldest first. */
 api.get(
   '/build/crate/:name',
   wrap(async (req, res) => {
@@ -924,12 +764,10 @@ api.get(
   }),
 );
 
-/** `?scope`: native-code coverage, totals, language / directory breakdowns. */
 api.get('/native/stats', cachedStats('native', nativeStats));
 
 const NATIVE_LANGS = new Set(['c', 'c++', 'objc', 'asm']);
 
-/** `?scope&sort&dir&q&vendored&prebuilt&lang&minLines&limit&offset`: versions with native code. */
 api.get(
   '/native/top',
   wrap(async (req, res) => {
@@ -953,7 +791,6 @@ api.get(
   }),
 );
 
-/** Every version of a crate with its native-code facts, oldest first. */
 api.get(
   '/native/crate/:name',
   wrap(async (req, res) => {
@@ -962,10 +799,8 @@ api.get(
   }),
 );
 
-/** `?scope`: diff coverage, totals, and a churn histogram. */
 api.get('/diffs/stats', cachedStats('diffs', diffStats));
 
-/** `?scope&sort&dir&q&firsts&approximate&minChurn&limit&offset`: the biggest version-to-version changes. */
 api.get(
   '/diffs/top',
   wrap(async (req, res) => {
@@ -988,7 +823,6 @@ api.get(
   }),
 );
 
-/** Every version of a crate with its diff totals, oldest first: the change history. */
 api.get(
   '/diffs/crate/:name',
   wrap(async (req, res) => {
@@ -997,7 +831,6 @@ api.get(
   }),
 );
 
-/** `?crate&version`: the changed files of one version against its predecessor. */
 api.get(
   '/diffs/version',
   wrap(async (req, res) => {
@@ -1010,16 +843,11 @@ api.get(
   }),
 );
 
-// ---------------------------------------------------------------------------
-// Publishers / Releases / Supply chain views: crates.io registry data (users, teams,
-// OWNS, PUBLISHED, dates; see registry.mjs). Everything is index-backed and LIMITed;
-// the leaderboards and coverage stats aggregate whole relationship types and are cached.
-// ---------------------------------------------------------------------------
+// Leaderboards and coverage stats aggregate whole relationship types, hence cached.
 
 const REGISTRY_CACHE_TTL_MS = 10 * 60_000;
 const registryCache = new Map();
 
-/** Serve `fn()` from a 10 min cache under `key`, with the long timeout (same pattern as the stats endpoints). */
 const cachedRegistry = async (key, fn) => {
   const hit = registryCache.get(key);
   if (hit && Date.now() - hit.at < REGISTRY_CACHE_TTL_MS) return { ...hit.value, cached: true };
@@ -1029,7 +857,6 @@ const cachedRegistry = async (key, fn) => {
   return { ...value, cached: false };
 };
 
-/** Registry coverage: users, teams, owners, uploads, how many crates / versions the dump reached. */
 api.get(
   '/registry/stats',
   wrap(async (_req, res) => {
@@ -1037,7 +864,6 @@ api.get(
   }),
 );
 
-/** `?q&limit`: users whose login starts with `q` (index seek), plus teams containing it. */
 api.get(
   '/publishers/search',
   wrap(async (req, res) => {
@@ -1047,7 +873,6 @@ api.get(
   }),
 );
 
-/** One user or team: crates published / owned, upload timeline, totals. */
 api.get(
   '/publishers/user/:login',
   wrap(async (req, res) => {
@@ -1059,7 +884,6 @@ api.get(
   }),
 );
 
-/** Most prolific publishers (crates, uploads) and the owners / publishers of the most-downloaded crates. */
 api.get(
   '/publishers/leaderboards',
   wrap(async (_req, res) => {
@@ -1074,11 +898,7 @@ const releaseArgs = (query) => {
   return { kind, source, ...dateRange(query.from, query.to, kind === 'crates' ? 30 : 7) };
 };
 
-/**
- * `?kind=crates|versions&source&from&to&q&minDownloads&sort=date|downloads|name&dir&limit&offset`:
- * crates or versions published in `[from, to]` (`to` inclusive as a date). Sorting by
- * anything but the date materialises the whole range, so it gets the long timeout.
- */
+// Sorting by anything but the date materialises the whole range, so it gets the long timeout.
 api.get(
   '/releases',
   wrap(async (req, res) => {
@@ -1098,7 +918,6 @@ api.get(
   }),
 );
 
-/** `?kind&source&from&to`: releases per day (<= 92 days) or month in the range; cached per range. */
 api.get(
   '/releases/histogram',
   wrap(async (req, res) => {
@@ -1109,7 +928,6 @@ api.get(
 
 const topN = (v) => Math.min(50_000, Math.max(100, nonNegInt(v, 2000) || 2000));
 
-/** `?top&limit&offset`: among the top N crates by downloads, those with exactly one User owner and no Team. */
 api.get(
   '/supply/bus-factor',
   wrap(async (req, res) => {
@@ -1120,7 +938,6 @@ api.get(
   }),
 );
 
-/** `?since&minDownloads&self=exclude|include&limit&offset`: owners added since a date to popular crates. */
 api.get(
   '/supply/owner-additions',
   wrap(async (req, res) => {
@@ -1133,7 +950,6 @@ api.get(
   }),
 );
 
-/** `?top&limit&offset`: among the top N crates, latest versions uploaded by a first-time uploader of the crate. */
 api.get(
   '/supply/new-uploaders',
   wrap(async (req, res) => {
@@ -1144,7 +960,6 @@ api.get(
   }),
 );
 
-/** Owners, publishers, categories, keywords of one crate (side panel). */
 api.get(
   '/registry/crate/:name',
   wrap(async (req, res) => {
@@ -1155,7 +970,6 @@ api.get(
   }),
 );
 
-/** `?crate&version`: who uploaded one version and when (side panel). */
 api.get(
   '/registry/version',
   wrap(async (req, res) => {
@@ -1186,10 +1000,6 @@ const requireLod = async (res) => {
   return null;
 };
 
-/**
- * Viewport query for the Map view. Query: x0,y0,x1,y1 (layout coords), budget.
- * Returns GraphPayload-shaped nodes (Crate or Cluster) and aggregated DEPENDS_ON rels.
- */
 api.get(
   '/lod/viewport',
   wrap(async (req, res) => {
@@ -1198,7 +1008,6 @@ api.get(
     const num = (k) => Number.parseFloat(req.query[k]);
     const bbox = { x0: num('x0'), y0: num('y0'), x1: num('x1'), y1: num('y1') };
     if (![bbox.x0, bbox.y0, bbox.x1, bbox.y1].every(Number.isFinite)) {
-      // No bbox: the whole map.
       Object.assign(bbox, { x0: idx.bounds.minX, y0: idx.bounds.minY, x1: idx.bounds.maxX, y1: idx.bounds.maxY });
     }
     const budget = Math.max(10, Math.min(Number.parseInt(req.query.budget ?? '', 10) || config.lod.budget, 5000));
@@ -1207,7 +1016,6 @@ api.get(
   }),
 );
 
-/** Where a crate sits on the map, for "jump to". 404 if unknown or unpositioned. */
 api.get(
   '/lod/locate',
   wrap(async (req, res) => {
@@ -1220,7 +1028,6 @@ api.get(
   }),
 );
 
-/** Name search over positioned crates (in memory; no database round trip). */
 api.get(
   '/lod/search',
   wrap(async (req, res) => {
@@ -1231,13 +1038,12 @@ api.get(
   }),
 );
 
-/** Build/update job state plus the persisted LodMeta. */
 api.get(
   '/lod/status',
   wrap(async (_req, res) => {
     const meta = (await readGraph(`MATCH (m:LodMeta {id: 'default'}) RETURN properties(m) AS m`)).rows[0]?.m ?? null;
     const unpositioned = (await readGraph(`MATCH (c:Crate) WHERE c.lod_x IS NULL RETURN count(c) AS n`)).rows[0]?.n ?? null;
-    // A build run outside this process (CLI, another instance) changes built_at: reload.
+    // A build run elsewhere (CLI, another instance) changes built_at.
     const dbBuiltAt = meta?.built_at ? String(meta.built_at) : null;
     const idxBuiltAt = lodIndex?.meta?.built_at ? String(lodIndex.meta.built_at) : null;
     if (!lodLoading && !lodJobs.status().running && ((lodIndex && dbBuiltAt !== idxBuiltAt) || (!lodIndex && dbBuiltAt))) {
@@ -1256,11 +1062,6 @@ api.get(
   }),
 );
 
-/**
- * Start a full rebuild (communities + layout + LOD_DEP edges).
- * Body: { iterations?, reuseEdges?: bool (skip aggregation, use stored LOD_DEP), resume?: bool (continue from checkpoint) }.
- * 409 if a job is running.
- */
 api.post(
   '/lod/rebuild',
   wrap(async (req, res) => {
@@ -1275,7 +1076,6 @@ api.post(
   }),
 );
 
-/** Place crates added since the last build (cheap, incremental). 409 if a job is running. */
 api.post(
   '/lod/update',
   wrap(async (_req, res) => {
@@ -1283,7 +1083,6 @@ api.post(
   }),
 );
 
-/** Fetch a single node (with properties) by elementId. */
 api.get(
   '/node/:id',
   wrap(async (req, res) => {
@@ -1293,7 +1092,6 @@ api.get(
   }),
 );
 
-/** Ad-hoc Cypher. Always a read transaction; result rows are capped. */
 api.post(
   '/cypher',
   wrap(async (req, res) => {
@@ -1323,7 +1121,6 @@ const stripRows = ({ nodes, rels, meta }) => ({ nodes, rels, meta });
 
 app.use('/api', api);
 
-// Error handler: Neo4j errors carry a `code`; surface it so the UI can show it.
 // eslint-disable-next-line no-unused-vars
 app.use('/api', (err, _req, res, _next) => {
   const status =
@@ -1340,8 +1137,7 @@ app.use('/api', (err, _req, res, _next) => {
   res.status(status).json({ error: err.message, code: err.code ?? null });
 });
 
-// Static frontend (production). In development Vite serves the frontend and
-// proxies /api to this server, so dist may not exist.
+// In development Vite serves the frontend and proxies /api, so dist may not exist.
 if (existsSync(distDir)) {
   app.use(express.static(distDir, { index: 'index.html', maxAge: '1h' }));
   app.get(/^(?!\/api\/).*/, (_req, res) => res.sendFile(path.join(distDir, 'index.html')));
@@ -1354,22 +1150,16 @@ if (existsSync(distDir)) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Startup / shutdown
-// ---------------------------------------------------------------------------
-
 log('starting with config', JSON.stringify(describeConfig()));
 
 const server = app.listen(config.port, config.host, () => {
   log(`listening on http://${config.host}:${config.port}`);
 });
 
-// Do not block serving on Neo4j being up; the compose stack may start the
-// database slower than this container. /api/health reports the real state.
+// The compose stack may start the database slower than this container; /api/health reports the real state.
 waitForNeo4j()
   .then(() => {
-    // Registry coverage is a label scan of every version (seconds, tens of seconds under
-    // import load); warm its 10 min cache once so the first Publishers visit has numbers.
+    // Label scan of every version (tens of seconds under import load): warm the cache for the first Publishers visit.
     cachedRegistry('stats', registryStats)
       .then((s) => log(`registry stats warmed in ${s.elapsedMs} ms`))
       .catch((err) => log(`registry stats warm-up failed: ${err.message}`));

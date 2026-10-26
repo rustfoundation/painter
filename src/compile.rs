@@ -10,41 +10,29 @@ use walkdir::WalkDir;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    /// Filesystem failure while copying bitcode.
     #[error("IO Error: {0}")]
     IoError(#[from] std::io::Error),
-    /// `cargo rustc` exited non-zero; carries its stderr.
     #[error("Crate compilation failed:\n{0}")]
     CompileFailed(String),
-    /// `cargo clean` exited non-zero.
     #[error("Clean stage failed")]
     CleanFailure(std::process::Output),
-    /// The bounded compile pool could not be built.
     #[error("Thread pool error: {0}")]
     ThreadPool(#[from] rayon::ThreadPoolBuildError),
-    /// Bitcode could not be parsed.
     #[error("LLVM IR failure: {0}")]
     LLVMError(String),
-    /// The crates.io index could not be opened or walked.
     #[error("Indexing Error: {0}")]
     IndexError(#[from] crates_index::Error),
-    /// Crate extraction or lookup failure.
     #[error("Crate FS Error: {0}")]
     CrateFsError(#[from] crate::crate_fs::Error),
-    /// Build-rule resolution failure.
     #[error("Build rules error: {0}")]
     RulesError(#[from] crate::rules::Error),
 }
 
-/// Executes a cargo clean within the crates sources directory. This is executed within the
-/// `Roots::sources_root` directory inside a given crates version folder.
-///
 /// # Panics
-/// This function will panic if executing `cargo` or `rustc` fails due to OS process execution problems.
-/// It will not panic on failure of the command itself.
+/// If `cargo` cannot be spawned.
+///
 /// # Errors
-/// returns an instance of `Error::CleanFailure`, containing the output of stdout and stderr from the
-/// execution.
+/// `Error::CleanFailure` if `cargo clean` exits non-zero.
 pub fn clean(path: &Path, toolchain: &str) -> Result<(), Error> {
     let output = std::process::Command::new("cargo")
         .arg(format!("+{toolchain}"))
@@ -63,28 +51,18 @@ pub fn clean(path: &Path, toolchain: &str) -> Result<(), Error> {
     }
 }
 
-/// Directory under the bytecode root where [`compile_crate`] assembles a version's bitcode before
-/// renaming it into place. Dot-prefixed so bytecode scans and exports skip it.
+/// Dot-prefixed so bytecode scans and exports skip it.
 pub const STAGING_DIR: &str = ".painter-staging";
 
-/// Cargo `--config` override that builds every dependency at `opt-level=0`. Only the crate under
-/// analysis emits bitcode, so optimizing its dependencies is wasted work. `"*"` does not match
-/// workspace members, so the analyzed crate keeps the release profile; generic and `#[inline]`
-/// code from dependencies is codegened inside it and is optimized as before.
+/// Only the analyzed crate emits bitcode, so optimizing dependencies is wasted work. `"*"` does
+/// not match workspace members, so the analyzed crate keeps the release profile.
 pub const DEPS_OPT_LEVEL: &str = r#"profile.release.package."*".opt-level=0"#;
 
-/// Executes a cargo rustc  within the crates sources directory. This is executed within the
-/// `Roots::sources_root` directory inside a given crates version folder.
-///
 /// # Panics
-/// This function will panic if executing `cargo` or `rustc` fails due to OS process execution problems.
-/// It will not panic on failure of the command itself.
-///
-/// This function will panic if the stdout or stderr from `rustc` fails to UTF-8 decode.
+/// If `cargo` cannot be spawned.
 ///
 /// # Errors
-/// returns an instance of `Error::CompileFailed`, containing the output of stdout and stderr from the
-/// execution.
+/// `Error::CompileFailed` with the tail of stderr if the build fails.
 pub fn compile_crate<PS: AsRef<Path>, PC: AsRef<Path>>(
     name: &str,
     version: &str,
@@ -97,9 +75,7 @@ pub fn compile_crate<PS: AsRef<Path>, PC: AsRef<Path>>(
 
     log::info!("Compiling: {} @ {}", fullname, output_dir.display());
 
-    // Build the crate with rustc, emitting llvm-bc. We also disable LTO to prevent some inlining
-    // to gain better cross-crate function call introspection.
-    // TODO: We should further limit optimizations and inlining to get an even better picture.
+    // LTO off: less cross-crate inlining keeps more call edges visible.
     let output = std::process::Command::new("cargo")
         .arg(format!("+{toolchain}"))
         .args([
@@ -113,8 +89,7 @@ pub fn compile_crate<PS: AsRef<Path>, PC: AsRef<Path>>(
             "--emit=llvm-bc",
             "-C",
             "lto=off",
-            // Crates published years ago often `#![deny(...)]` lints that newer compilers now
-            // fire; cap them to warnings exactly as cargo does for registry dependencies.
+            // Old crates `#![deny(...)]` lints that newer compilers now fire.
             "--cap-lints=warn",
         ])
         .current_dir(src_path.as_ref())
@@ -124,9 +99,8 @@ pub fn compile_crate<PS: AsRef<Path>, PC: AsRef<Path>>(
     log::trace!("Compiled: {fullname} with result: {output:?}");
 
     if output.status.success() {
-        // Copy the emitted .bc files into a staging dir and rename it into place, so a
-        // `<name>-<version>` dir in the bytecode root is always complete: an interrupted copy
-        // never looks like a finished build to update-only or to a concurrent exporter.
+        // Stage then rename so a `<name>-<version>` dir is always complete: an interrupted copy
+        // must not look finished to update-only or a concurrent exporter.
         let staging = bc_root.as_ref().join(STAGING_DIR).join(&fullname);
         if staging.exists() {
             std::fs::remove_dir_all(&staging)?;
@@ -151,12 +125,11 @@ pub fn compile_crate<PS: AsRef<Path>, PC: AsRef<Path>>(
 
         clean(src_path.as_ref(), toolchain)?;
     } else {
-        // Best effort clean; the compile failure is the error worth reporting.
         if let Err(e) = clean(src_path.as_ref(), toolchain) {
             log::warn!("{fullname}: clean after failed compile also failed: {e}");
         }
 
-        // Keep only the tail of stderr: rustc output for a broken crate can run to megabytes.
+        // rustc output for a broken crate can run to megabytes.
         let stderr = String::from_utf8_lossy(&output.stderr);
         let tail: Vec<&str> = stderr.lines().rev().take(40).collect();
         let tail: Vec<&str> = tail.into_iter().rev().collect();
@@ -166,18 +139,13 @@ pub fn compile_crate<PS: AsRef<Path>, PC: AsRef<Path>>(
     Ok(())
 }
 
-/// Options controlling [`compile_all`].
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
-    /// Skip crate versions that already have a bytecode directory.
     pub update_only: bool,
-    /// rustup toolchain name passed as `cargo +<toolchain>`.
     pub toolchain: String,
-    /// How many crates to resolve through the rules concurrently (bounds requests to external
-    /// data sources such as ecosyste.ms).
+    /// Bounds requests to external sources such as ecosyste.ms.
     pub rules_concurrency: usize,
-    /// How many crates to compile at once. `None` uses one per CPU. Each compile is itself a
-    /// `cargo` process that may spawn several `rustc` jobs for dependencies.
+    /// `None` is one per CPU. Each job is a `cargo` that may spawn more `rustc`s for dependencies.
     pub jobs: Option<usize>,
 }
 
@@ -192,13 +160,10 @@ impl Default for CompileOptions {
     }
 }
 
-/// Toolchain used when none is specified.
 pub const DEFAULT_TOOLCHAIN: &str = "1.67";
 
-/// Compile one version of a crate: extract it through `fs`, build, and copy bitcode into
-/// `bc_root`. Failures are logged, not returned, so a bad crate never stops the sweep. The
-/// extraction is deleted afterwards, including one left behind by an interrupted earlier run,
-/// so the sources root only holds the crates currently being built.
+/// Failures are logged, not returned, so a bad crate never stops the sweep. The extraction is
+/// always purged so the sources root only holds in-flight crates.
 fn compile_version(
     name: &str,
     version: &str,
@@ -238,8 +203,6 @@ fn compile_version(
     purge(&entry);
 }
 
-/// Ask `rules` which versions of each crate to build, with bounded concurrency. Rule failures
-/// for an individual crate are logged and that crate is skipped.
 async fn select_work(
     mut crates: tokio::sync::mpsc::Receiver<Crate>,
     rules: &dyn BuildRules,
@@ -268,17 +231,13 @@ async fn select_work(
     work
 }
 
-/// How many parsed index entries may be queued between the index walk and the rules.
 const PLAN_QUEUE: usize = 4096;
 
-/// Build the list of `(name, version)` pairs that `rules` selects from the index.
-///
 /// # Panics
-/// Panics if the index walk task panics.
+/// If the index walk task panics.
 ///
 /// # Errors
-/// Returns `Error::IndexError` if the crates.io index cannot be opened, or `Error::RulesError`
-/// if the rules cannot produce their candidate set.
+/// If the index cannot be opened or the rules cannot produce their candidate set.
 pub async fn plan(
     rules: &dyn BuildRules,
     concurrency: usize,
@@ -286,8 +245,7 @@ pub async fn plan(
     let index = open_index()?;
     let (tx, rx) = tokio::sync::mpsc::channel(PLAN_QUEUE);
 
-    // The index walk parses git blobs and is CPU bound; run it on rayon (one repository handle
-    // per worker) and stream crates to the rules through a bounded channel.
+    // Parsing git blobs is CPU bound; the bounded channel keeps the walk from outrunning the rules.
     let walker = if let Some(names) = rules.candidate_crates().await? {
         log::info!("rules selected {} candidate crates", names.len());
         tokio::task::spawn_blocking(move || {
@@ -298,8 +256,7 @@ pub async fn plan(
                             return;
                         }
                     }
-                    // Expected with ecosyste.ms data: it keeps records of crates deleted from
-                    // crates.io.
+                    // ecosyste.ms keeps records of crates deleted from crates.io.
                     None => log::warn!("Crate not found in index, skipping: {name}"),
                 }
             }
@@ -309,7 +266,7 @@ pub async fn plan(
         tokio::task::spawn_blocking(move || {
             index.crates_parallel().for_each(|c| match c {
                 Ok(c) => {
-                    // The receiver only goes away when the consumer gave up; nothing to do.
+                    // The receiver only goes away when the consumer gave up.
                     let _ = tx.blocking_send(c);
                 }
                 Err(e) => log::error!("index walk failed: {e}"),
@@ -324,13 +281,8 @@ pub async fn plan(
     Ok(work)
 }
 
-/// Compile every crate version that `rules` selects, in parallel, extracting sources through
-/// `fs` on demand.
-///
 /// # Errors
-/// Returns `Error::IndexError` if the crates.io index cannot be opened, `Error::RulesError`
-/// if the rules fail, or `Error::ThreadPool` if the compile pool cannot be created. Individual
-/// crate build failures are logged and skipped.
+/// If planning fails or the compile pool cannot be built. Per-crate build failures are logged.
 pub async fn compile_all<P: AsRef<Path> + Send + Sync>(
     fs: CrateFs,
     bc_root: P,
@@ -347,8 +299,7 @@ pub async fn compile_all<P: AsRef<Path> + Send + Sync>(
         std::fs::remove_dir_all(&staging)?;
     }
 
-    // A dedicated pool so `jobs` bounds the number of concurrent `cargo` processes regardless
-    // of how many threads the global rayon pool has.
+    // Dedicated pool so `jobs` bounds concurrent `cargo` processes.
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(opts.jobs.unwrap_or(0))
         .build()?;
@@ -373,18 +324,14 @@ pub async fn compile_all<P: AsRef<Path> + Send + Sync>(
 pub(crate) mod test_support {
     use std::path::Path;
 
-    /// Environment variable overriding the toolchain used by tests that really invoke cargo.
     pub const TEST_TOOLCHAIN_ENV: &str = "PAINTER_TEST_TOOLCHAIN";
 
-    /// Toolchain used by tests that really invoke cargo. Its LLVM must not be newer than the
-    /// LLVM `llvm-ir` links against or the emitted bitcode is unreadable (e.g. Rust 1.99 ships
-    /// LLVM 23, which LLVM 22 rejects with "Invalid record"). 1.96.1 ships LLVM 22.
+    /// Its LLVM must not be newer than the one `llvm-ir` links against (1.99 ships LLVM 23,
+    /// rejected with "Invalid record"). 1.96.1 ships LLVM 22.
     pub fn test_toolchain() -> String {
         std::env::var(TEST_TOOLCHAIN_ENV).unwrap_or_else(|_| "1.96.1".to_string())
     }
 
-    /// Write a minimal library crate `<name>-<version>` under `root` with one cross-function
-    /// call that survives optimisation, and return its directory.
     pub fn write_fixture_crate(root: &Path, name: &str, version: &str) -> std::path::PathBuf {
         let dir = root.join(format!("{name}-{version}"));
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -420,8 +367,6 @@ mod tests {
         assert_eq!(o.jobs, None);
     }
 
-    /// `compile_all`'s per-version step deletes the extraction after building, and deletes a
-    /// stale one when it skips an already-built version.
     #[test]
     fn compile_version_removes_sources() {
         let tmp = tempfile::tempdir().unwrap();
@@ -431,7 +376,6 @@ mod tests {
         std::fs::create_dir_all(&crates).unwrap();
         std::fs::create_dir_all(&sources).unwrap();
 
-        // Pack the fixture as crates/painter_fixture-0.1.0.crate.
         let staging = tmp.path().join("staging");
         let dir = write_fixture_crate(&staging, "painter_fixture", "0.1.0");
         let gz = flate2::write::GzEncoder::new(
@@ -452,7 +396,7 @@ mod tests {
         let extracted = sources.join("painter_fixture-0.1.0");
         assert!(!extracted.exists(), "sources survived the build");
 
-        // A stale extraction of the now-built version, as an interrupted run leaves behind.
+        // As an interrupted run leaves behind.
         std::fs::create_dir_all(extracted.join("src")).unwrap();
         compile_version("painter_fixture", "0.1.0", &fs, &bc_root, &opts);
         assert!(
@@ -491,7 +435,6 @@ mod tests {
             "staging dir not renamed into place"
         );
 
-        // The bitcode is readable by the linked LLVM and contains the intra-crate call.
         let calls = crate::analysis::extract_calls(&out).unwrap();
         assert!(
             calls

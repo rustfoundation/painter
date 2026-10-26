@@ -1,8 +1,3 @@
-// Native code view: crate versions shipping C / C++ / Objective-C / assembly sources,
-// headers, or prebuilt binaries (painter's generate-metadata `native` job: has_native_code,
-// vendored_native, native_* counts, native_langs, native_dirs, native_prebuilt_files),
-// with coverage tiles, language and directory breakdowns, and a per-crate history.
-
 import { Fragment, useMemo, useState } from 'react';
 import { api, type NativeLang, type NativeRow, type NativeSort, type NativeStats, type UnsafeScope, type UnsafeTri } from '../api';
 import { NativeFlags } from './BuildView';
@@ -59,7 +54,6 @@ const COLUMNS: Column<NativeSort>[] = [
 
 const HIST_LABELS = ['1–100', '101–1k', '1k–10k', '10k–100k', '>100k'];
 
-/** Small coloured chips for the languages of a row. */
 export function LangChips({ langs }: { langs: string[] }) {
   return (
     <span className="lang-chips">

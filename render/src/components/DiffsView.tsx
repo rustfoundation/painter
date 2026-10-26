@@ -1,8 +1,3 @@
-// Diffs view: what changed between consecutive versions of a crate (painter's
-// generate-metadata `diff` job: diff_base, files / lines added / removed / modified,
-// diff_approximate, and the per-file lists). A leaderboard of the biggest changes,
-// coverage tiles, a per-crate change history, and the changed files of one version.
-
 import { Fragment, useMemo, useState } from 'react';
 import { api, type DiffFile, type DiffFirsts, type DiffRow, type DiffSort, type DiffStats, type DiffVersion, type UnsafeScope, type UnsafeTri } from '../api';
 import {
@@ -52,7 +47,6 @@ const COLUMNS: Column<DiffSort>[] = [
 
 const HIST_LABELS = ['0', '1–10', '11–100', '101–1k', '1k–10k', '>10k'];
 
-/** Horizontal added / removed bar, log-scaled against the biggest row on screen. */
 export function ChurnBar({ added, removed, max, width = 120 }: { added: number; removed: number; max: number; width?: number }) {
   const total = added + removed;
   if (!total) return <span className="mix empty" style={{ width }} />;
@@ -65,7 +59,6 @@ export function ChurnBar({ added, removed, max, width = 120 }: { added: number; 
   );
 }
 
-/** Diff flags shared with the side panel. */
 export function DiffFlags({ base, approximate, unchanged }: { base: string | null; approximate: boolean | null; unchanged?: boolean }) {
   return (
     <>
@@ -134,7 +127,6 @@ function DiffHistory({ name, versions, selected, onPick }: { name: string; versi
   );
 }
 
-/** Changed files of one version. */
 function FilesPanel({ v }: { v: DiffVersion }) {
   const files = v.files ?? [];
   const max = Math.max(1, ...files.map((f) => f.added + f.removed));
@@ -191,9 +183,7 @@ export function DiffsView({ busy, onBusy, onError, onOpenCrate }: Props) {
   const [minChurn, setMinChurn] = useState(0);
   const [limit, setLimit] = useState(100);
   const [expanded, setExpanded] = useState<string | null>(null);
-  /** Changed-file lists by `name@version`. */
   const [files, setFiles] = useState<Record<string, DiffVersion | 'loading'>>({});
-  /** Which version's files each expanded crate shows. */
   const [picked, setPicked] = useState<Record<string, string>>({});
 
   const stats = useStats<DiffStats>(api.diffStats, scope, onError);

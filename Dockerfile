@@ -1,5 +1,3 @@
-# painter: every subcommand, including compile-all, inside one image.
-#
 #   docker build -t painter .
 #   docker run --rm --network host --cpus 12 --memory 16g --memory-swap 16g \
 #       -v /storage/crates/index:/data/index -v /storage/crates/crates:/data/crates:ro \
@@ -8,14 +6,9 @@
 #       painter compile-all --toolchain 1.96.1 --only serde \
 #       -s /data/sources -c /data/crates -b /data/bytecodes
 #
-# CPU and memory limits cannot live in an image; pass them to `docker run` as above.
-# --memory-swap equal to --memory forbids extra swap. Rust's available_parallelism honors
-# --cpus, so compile-all's default -j and cargo's job count follow it (nproc does not).
+# Limits cannot live in an image; Rust's available_parallelism honors --cpus (nproc does not).
 # --network host reaches the host neo4j at bolt://127.0.0.1:7687. Outputs are root-owned.
-#
-# compile-all shells out to `cargo +<toolchain> rustc`, so the runtime image carries rustup and
-# the ecosystem compile toolchains (PAINTER_TOOLCHAINS) next to the painter binary. Their
-# bitcode must be readable by LLVM 22 (what painter links), so do not add toolchains that ship
+# Toolchain bitcode must be readable by LLVM 22 (what painter links): no toolchain that ships
 # a newer LLVM (stable 1.99 ships LLVM 23).
 
 ARG DEBIAN_CODENAME=bookworm
@@ -25,7 +18,7 @@ FROM rust:1-${DEBIAN_CODENAME} AS builder
 ARG DEBIAN_CODENAME
 ARG LLVM_VERSION
 
-# llvm-sys links LLVM statically: it needs the dev package, Polly, and LLVM's system libs.
+# llvm-sys links LLVM statically: needs Polly and LLVM's system libs.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates gnupg wget; \
@@ -41,7 +34,7 @@ RUN set -eux; \
 ENV LLVM_SYS_221_PREFIX=/usr/lib/llvm-${LLVM_VERSION}
 
 WORKDIR /src
-# Cargo.lock is gitignored; the glob copies it when present and builds unlocked otherwise.
+# Cargo.lock is gitignored; the glob tolerates its absence.
 COPY Cargo.toml Cargo.lock* ./
 COPY llvm-ir llvm-ir
 COPY llvm-ir-analysis llvm-ir-analysis
@@ -54,8 +47,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM debian:${DEBIAN_CODENAME}-slim
 ARG PAINTER_TOOLCHAINS="1.67 1.96.1"
 
-# Crates compiled by compile-all run their own build scripts, so give them the usual native
-# toolchain and the -dev packages most -sys crates probe for.
+# Compiled crates run their own build scripts and probe for -sys dev packages.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
@@ -74,10 +66,8 @@ RUN set -eux; \
     rm -rf "$RUSTUP_HOME/downloads" "$RUSTUP_HOME/tmp"; \
     for tc in ${PAINTER_TOOLCHAINS}; do cargo "+$tc" --version; done
 
-# sccache is installed but off: compile-all only uses it when the container sets
-# RUSTC_WRAPPER=sccache (docker ctl.sh does with SCCACHE=1). It then caches dependency rlibs
-# across crates; the analyzed crate (--emit=llvm-bc), proc macros, and build scripts are never
-# cached.
+# sccache is inert unless RUSTC_WRAPPER=sccache. The analyzed crate (--emit=llvm-bc), proc
+# macros, and build scripts are never cached.
 ARG SCCACHE_VERSION=0.18.0
 ARG SCCACHE_SHA256=45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
 RUN set -eux; \
@@ -95,11 +85,8 @@ COPY --from=builder /out/bin/painter /usr/local/bin/
 # The index is a bind-mounted git clone owned by the host user; let libgit2 open it as root.
 RUN git config --system --add safe.directory '*'
 
-# Mount points: index clone, .crate store, extracted sources,
-# bytecode output. CARGO_HOME/registry is worth a volume too so dependency downloads persist.
-# CARGO_BUILD_JOBS caps rustc jobs per cargo process: compile-all runs up to -j cargo
-# processes (one per CPU by default), so 12 CPUs make at most 24 rustc processes, not 144.
-# Override with -e CARGO_BUILD_JOBS=N.
+# compile-all runs up to -j cargo processes (one per CPU), so cap rustc jobs per process:
+# 12 CPUs make at most 24 rustc processes, not 144.
 ENV PAINTER_INDEX_PATH=/data/index \
     RUST_LOG=info \
     CARGO_BUILD_JOBS=2

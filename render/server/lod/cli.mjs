@@ -1,14 +1,7 @@
 #!/usr/bin/env node
-// CLI for the LOD pipeline, using the same environment configuration as the
-// server (see ../config.mjs). Runs in-process and prints progress.
-//
-//   node server/lod/cli.mjs build [--iterations N] [--reuse-edges] [--resume]
-//                                 [--checkpoint PATH] [--checkpoint-every N]
-//       full rebuild. --reuse-edges skips the DEPENDS_ON aggregation and uses the
-//       LOD_DEP edges already stored; --resume continues from the checkpoint file
-//       (or stored positions) and runs only the remaining iterations.
-//   node server/lod/cli.mjs update                   place crates added since the last build
-//   node server/lod/cli.mjs status                   show LodMeta
+// Same environment configuration as the server (../config.mjs).
+// Usage: build [--iterations N] [--reuse-edges] [--resume] [--checkpoint PATH] [--checkpoint-every N] | update | status
+// --reuse-edges skips the DEPENDS_ON aggregation; --resume continues from the checkpoint file or stored positions.
 
 import neo4j from 'neo4j-driver';
 import { config } from '../config.mjs';

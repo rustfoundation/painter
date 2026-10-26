@@ -1,8 +1,3 @@
-// Unsafe view: a leaderboard of crate versions by unsafe-code metrics (painter's
-// count-unsafe stage: geiger counters per category, source size, forbid(unsafe_code),
-// build scripts), with coverage tiles, server-side sort/filter, a per-crate history
-// and the unsafe carried in by a version's dependency closure.
-
 import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   api,
@@ -20,7 +15,6 @@ interface Props {
   busy: boolean;
   onBusy: (busy: boolean) => void;
   onError: (message: string | null) => void;
-  /** Open a crate in the Default graph view. */
   onOpenCrate: (name: string) => void;
 }
 
@@ -43,7 +37,6 @@ const COLUMNS: { key: UnsafeSort; label: string; title: string; num?: boolean }[
 
 const HISTOGRAM_LABELS = ['0', '1–10', '11–100', '101–1k', '>1k'];
 
-/** The safe counterpart of a category on a row or the stats. */
 const safeOf = (x: UnsafeRow | UnsafeStats, k: UnsafeCategory): number =>
   ({ functions: x.safeFunctions, exprs: x.safeExprs, impls: x.safeImpls, traits: x.safeTraits, methods: x.safeMethods })[k] ?? 0;
 
@@ -53,7 +46,6 @@ const pct = (part: number | undefined, whole: number | undefined) =>
 const errorMessage = (err: unknown) =>
   err instanceof ApiError ? (err.code ? `${err.message} [${err.code}]` : err.message) : err instanceof Error ? err.message : String(err);
 
-/** Stacked bar of the five categories, proportional to the row's total. */
 function MixBar({ row, width = 120 }: { row: Pick<UnsafeRow, UnsafeCategory | 'total'>; width?: number }) {
   if (!row.total) return <span className="mix empty" style={{ width }} />;
   return (
@@ -66,7 +58,6 @@ function MixBar({ row, width = 120 }: { row: Pick<UnsafeRow, UnsafeCategory | 't
   );
 }
 
-/** Flag badges shared by the table and the detail panels. */
 function Flags({ forbids, build, failed }: { forbids: boolean | null | undefined; build: boolean; failed?: number }) {
   return (
     <>
@@ -89,7 +80,6 @@ function Flags({ forbids, build, failed }: { forbids: boolean | null | undefined
   );
 }
 
-/** Per-version history of one crate: a bar per version, latest highlighted. */
 function CrateHistory({ name, versions, onPick }: { name: string; versions: UnsafeRow[]; onPick: (v: UnsafeRow) => void }) {
   const max = Math.max(1, ...versions.map((v) => v.total ?? 0));
   const scanned = versions.filter((v) => v.scanner && !v.error);
@@ -135,7 +125,6 @@ function MixBarVertical({ row }: { row: Pick<UnsafeRow, UnsafeCategory | 'total'
   );
 }
 
-/** Unsafe carried in through a version's dependency closure. */
 function DepsPanel({ result, onOpenCrate }: { result: UnsafeDepsResult; onOpenCrate: (name: string) => void }) {
   const s = result.summary;
   return (

@@ -1,7 +1,3 @@
-// Single-slot job manager for LOD builds and updates. One job at a time; the
-// work happens in a worker thread (worker.mjs). `onFinished` lets the server
-// reload its in-memory LOD index when a job completes.
-
 import { Worker } from 'node:worker_threads';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,8 +5,8 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 
 export const createLodJobs = ({ config, log, onFinished }) => {
-  let current = null; // { kind, startedAt, phase, done, total, message, worker }
-  let last = null; // { kind, startedAt, finishedAt, ok, error, result, elapsedMs }
+  let current = null;
+  let last = null;
 
   const status = () => ({
     running: current ? { kind: current.kind, startedAt: current.startedAt, phase: current.phase, done: current.done, total: current.total, message: current.message } : null,

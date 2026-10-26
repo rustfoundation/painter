@@ -27,19 +27,14 @@ CREATE INDEX idx_crate_created_at IF NOT EXISTS FOR (c:Crate) ON (c.created_at);
 CREATE INDEX idx_crate_downloads IF NOT EXISTS FOR (c:Crate) ON (c.downloads);
 ```
 
-- `const_symbol_name`: required by painter's export (`MERGE` on `Symbol.name` under
-  concurrency) and serves every function lookup below and the UI Callers view.
-- `idx_symbol_name_text`: `CONTAINS` / `ENDS WITH` searches on function names.
-- `idx_crate_name_text`: UI partial-name search.
-- `idx_has_build_script`, `idx_version_links`, `idx_has_native_code`, `idx_vendored_native`,
-  `idx_diff_lines_added`: the UI Build scripts / Native code / Diffs views (`generate-metadata`
-  properties): leaderboards seek `has_build_script = true`, `links = $x` / `links IS NOT NULL`,
-  `has_native_code = true`, and sort by `diff_lines_added` without scanning every version.
-  Each populated in seconds on 3.2M versions (2026-10-26).
-- `const_user_id` ... `idx_crate_downloads`: the `registry` metadata job (`db::REGISTRY_SCHEMA_CYPHER`,
-  which creates them itself). `idx_user_login` serves "crates published by user" and
-  `idx_published_at` (a relationship range index) "crates published in a timeframe".
-- Map build adds `crate_lod_x`, `crate_lod_community`, `Crate.lod_*`, `LOD_DEP` (see `render/README.md`).
+- `const_symbol_name`: `MERGE` on `Symbol.name` relies on it under concurrency; it also serves every
+  function lookup and the UI Callers view.
+- `idx_symbol_name_text`, `idx_crate_name_text`: `CONTAINS` / `ENDS WITH` and partial-name search.
+- `idx_has_build_script` ... `idx_diff_lines_added`: let the UI leaderboards seek instead of scanning
+  every version.
+- `const_user_id` ... `idx_crate_downloads`: created by the `registry` job itself
+  (`db::REGISTRY_SCHEMA_CYPHER`). `idx_published_at` is a relationship range index.
+- The Map build adds its own `Crate.lod_*` indexes and `LOD_DEP` (see `render/README.md`).
 
 Enterprise only:
 
@@ -49,17 +44,15 @@ CREATE CONSTRAINT FOR (n:Version) REQUIRE (n.name, n.version) IS NODE KEY;
 
 # Schema notes
 
-- `(Crate)-[:VERSION_OF]->(Version)`: crate to version.
-- Calls: `(Version)-[:HAS_FN]->(:Fn)-[:IS]->(:Symbol)` is a function of a version (the caller),
-  `(:Fn)-[:CALLS {copies}]->(:Symbol)-[:IN]->(Crate)` a function it calls. One `Fn` per
-  (version, calling function), one `CALLS` per distinct call, one `Symbol` per demangled
-  function name, shared by every version. `copies` = compiled (caller, callee) pairs behind the
-  call: monomorphised instances of generic functions demangle to the same name.
-- A symbol's crate is the first path segment of its name, matched to an existing `Crate`
-  (`num_traits` is `num-traits`); the callee version is unknown. Only called symbols have `IN`.
-- Before 2026-10-25 calls were `(Version)-[:INVOKES {callsite, target}]->(Crate)`, one edge per
-  compiled pair; `painter export-for-import` converts a database of that shape.
-- Reach versions through `(:Crate {name})`. `(:Version {name})` without `version` scans every version.
+- `(Crate)-[:VERSION_OF]->(Version)`: crate to version. Reach versions through `(:Crate {name})`;
+  `(:Version {name})` without `version` cannot use the `(name, version)` index and scans every version.
+- Calls: `(Version)-[:HAS_FN]->(:Fn)-[:IS]->(:Symbol)` is the caller,
+  `(:Fn)-[:CALLS {copies}]->(:Symbol)-[:IN]->(Crate)` a callee. `Symbol` is one node per demangled
+  name, shared by every version; `copies` > 1 because monomorphised generics demangle to the same name.
+- A symbol's crate is the first path segment of its name (`num_traits` matches `num-traits`); the callee
+  version is unknown. Only called symbols have `IN`.
+- Databases from before 2026-10-25 hold `(Version)-[:INVOKES]->(Crate)` instead;
+  `painter export-for-import` converts them.
 
 # Crates and versions
 
@@ -86,7 +79,7 @@ MATCH (v:Version) WHERE v.latest IS NOT NULL
 CALL { WITH v REMOVE v.latest } IN TRANSACTIONS OF 10000 ROWS
 ```
 
-Run with `:auto` in the browser. Restore with `painter set-latest-versions`.
+Run with `:auto` in the browser.
 
 # Dependencies
 
@@ -113,7 +106,7 @@ RETURN DISTINCT c.name
 
 ### Transitive dependents, crates
 
-Any version, up to 3 hops. Large for popular crates.
+Any version, up to 3 hops; large for popular crates.
 
 ```cypher
 MATCH (c:Crate)
@@ -133,11 +126,11 @@ MATCH (v)-[:DEPENDS_ON]->(:Crate)
 RETURN DISTINCT dep.name
 ```
 
-Follows each dependency's latest version, not the version the requirement resolves to.
+Follows each dependency's latest version, not the one the requirement resolves to.
 
 ### Most direct dependents
 
-Scans every `DEPENDS_ON` (minutes).
+Scans every `DEPENDS_ON`; minutes.
 
 ```cypher
 MATCH (v:Version)-[:DEPENDS_ON]->(c:Crate)
@@ -147,7 +140,7 @@ ORDER BY crates DESC LIMIT 10
 
 # Function calls
 
-Function names are full demangled paths. Find the exact name first.
+Names are full demangled paths; find the exact name first.
 
 ### Functions of a crate that are called
 
@@ -157,8 +150,6 @@ WHERE s.name CONTAINS 'copy_from_slice'
 RETURN s.name, COUNT { (s)<-[:CALLS]-() } AS callers
 ORDER BY callers DESC
 ```
-
-`callers` = calling functions, one per (version, function).
 
 ### What a version calls
 
@@ -210,8 +201,7 @@ RETURN c.name
 
 ### Transitive callers, all sources
 
-A caller's `Symbol` is the same node as that function's callee `Symbol`, so each level is one
-more `<-[:CALLS]-(:Fn)-[:IS]->` hop. Change `{1,2}` for more levels.
+A caller's `Symbol` is the same node as its callee `Symbol`, so each level is one more hop.
 
 ```cypher
 MATCH (:Symbol {name: 'bytes::bytes::Bytes::copy_from_slice'})
@@ -231,12 +221,10 @@ RETURN DISTINCT v2.name, v2.version, c2.name, c1.name AS via
 LIMIT 500
 ```
 
-Not version-checked: a hop matches every version that calls a function of that name. The UI
-Callers view adds requirement checks and walks up to 10 levels.
+Not version-checked: a hop matches every version that calls a function of that name (the UI Callers
+view adds requirement checks).
 
 ### Transitive callers in one crate version
-
-Call chains inside a single version.
 
 ```cypher
 MATCH (v:Version {name: 'rust-s3', version: '0.37.2'})
@@ -247,13 +235,13 @@ OPTIONAL MATCH (c2)<-[:CALLS]-(f3:Fn)-[:IS]->(c3:Symbol) WHERE (v)-[:HAS_FN]->(f
 RETURN DISTINCT c1.name, c2.name, c3.name
 ```
 
-Each row is one chain, nearest caller first; `null` = chain ends.
+`null` = chain ends.
 
 # Version metadata
 
-`painter generate-metadata` stores these on each `Version`. Each job also leaves a done-marker
-(its revision): `unsafe_scanner` (e.g. `geiger 0.5.0`), `meta_build`, `meta_native`,
-`meta_diff`. `meta_error` is set while a version's tarball cannot be read.
+`painter generate-metadata` stores these on each `Version`, plus a done-marker per job
+(`unsafe_scanner`, `meta_build`, `meta_native`, `meta_diff`). `meta_error` is set while the tarball
+cannot be read.
 
 **unsafe**
 
@@ -263,8 +251,7 @@ Each row is one chain, nearest caller first; `null` = chain ends.
   `rs_bytes`, `rs_forbid_files` (files with `#![forbid(unsafe_code)]`).
 - `forbids_unsafe`: the crate root (`[lib] path`, else `src/lib.rs`, else `src/main.rs`) forbids
   unsafe; absent when no root file parsed.
-- `unsafe_scanned_at`; `unsafe_error` instead of counts when the tarball was missing or
-  unreadable.
+- `unsafe_scanned_at`; `unsafe_error` instead of counts when the tarball is missing or unreadable.
 
 **build**
 
@@ -274,9 +261,9 @@ Each row is one chain, nearest caller first; `null` = chain ends.
 **native**
 
 - `has_native_code`: any C, C++, Objective-C, or assembly source or header.
-- `vendored_native`: enough of it to be a vendored library rather than a binding shim: at least
-  1,000 non-blank lines in native sources, or 5,000 in sources and headers together, or 200
-  under a vendoring directory (`vendor/`, `third_party/`, `deps/`, `external/`, `contrib/`, ...).
+- `vendored_native`: a vendored library rather than a binding shim: >= 1,000 non-blank source lines,
+  or >= 5,000 with headers, or >= 200 under `vendor/`, `third_party/`, `deps/`, `external/`,
+  `contrib/`, ... Raw counts are stored so the thresholds can be re-cut.
 - `native_source_files`, `native_header_files`, `native_source_lines`, `native_lines` (sources
   and headers, non-blank), `native_bytes`, `native_largest_bytes`, `native_vendor_dir_lines`,
   `native_langs` (`c`, `c++`, `objc`, `asm`), `native_dirs` (top-level directories holding native
@@ -284,7 +271,7 @@ Each row is one chain, nearest caller first; `null` = chain ends.
 
 **diff** (against the previous version in semver order; the first version against nothing)
 
-- `diff_base` (that version; absent for the first), `diff_files_total`,
+- `diff_base` (absent for the first), `diff_files_total`,
   `diff_files_added` / `_removed` / `_modified`, `diff_lines_added` / `_removed`,
   `diff_approximate` (a file's diff hit the 2 s bound and is approximate).
 - Per changed file, as parallel lists (index `i` of each is one file): `diff_paths`,
@@ -328,7 +315,7 @@ ORDER BY crates DESC LIMIT 25
 
 ### Biggest version-to-version changes
 
-Excludes first versions (everything counts as added there).
+Excludes first versions (everything counts as added).
 
 ```cypher
 MATCH (v:Version)
@@ -371,8 +358,6 @@ RETURN count(v) AS versions,
 
 ### Unsafe density of latest versions
 
-Unsafe expressions per thousand lines, crates over 10k lines.
-
 ```cypher
 MATCH (v:Version)
 WHERE v.latest AND v.rs_lines > 10000
@@ -410,8 +395,6 @@ RETURN count(v)
 
 ### Unsafe in direct dependencies
 
-Latest version of each dependency.
-
 ```cypher
 MATCH (:Crate {name: 'rocket'})-[:VERSION_OF]->(v:Version)
 WHERE v.latest
@@ -425,12 +408,13 @@ ORDER BY dv.unsafe_total DESC
 
 `painter generate-metadata --job registry --cratesio-dump DIR` (or `create-fresh-db` /
 `import-crates --cratesio-dump DIR`) loads an extracted crates.io database dump
-(`https://static.crates.io/db-dump.tar.gz`):
+(`https://static.crates.io/db-dump.tar.gz`). The index has no users, so this is the only source of
+uploaders and owners.
 
 - `(User {id, login, name, gh_id, created_at})`, `(Team {id, login, name, avatar})`
-- `(User)-[:PUBLISHED {at}]->(Version)`: the uploader. crates.io only records it since
-  2019-02-22, and trusted-publishing uploads (since 2025-07, ~18% of uploads by 2026-09) have no
-  user, so `Version.published_at` is the complete date and per-user counts undercount CI publishing
+- `(User)-[:PUBLISHED {at}]->(Version)`: the uploader. Only recorded since 2019-02-22 and absent for
+  trusted-publishing uploads, so `Version.published_at` is the complete date and per-user counts
+  undercount CI publishing
 - `(User)-[:PUBLISHED {at, last, versions}]->(Crate)`: first and last upload, upload count
 - `(User|Team)-[:OWNS {since, added_by}]->(Crate)`: current owners; `added_by` is a login
 - `(Crate)-[:IN_CATEGORY]->(Category {slug, name, description, path, crates})`,
@@ -505,12 +489,11 @@ RETURN a, type, b, n
 LIMIT 100
 ```
 
-Scans every relationship (slow); none should repeat.
+Scans every relationship (slow).
 
 ### Unreferenced symbols
 
-Re-exporting a version deletes its `Fn` nodes but leaves `Symbol`s, which other versions share.
-Symbols nothing refers to any more:
+Re-exporting a version deletes its `Fn`s but leaves `Symbol`s, which other versions share.
 
 ```cypher
 MATCH (s:Symbol) WHERE NOT EXISTS { (s)<-[:CALLS]-() } AND NOT EXISTS { (s)<-[:IS]-() }

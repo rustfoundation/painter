@@ -5,15 +5,9 @@ use rustc_demangle::demangle;
 
 use std::{io::Write, path::Path, sync::Arc};
 
-/// Callee crates that are never recorded as invocations: the standard library family and
-/// compiler/runtime intrinsics.
 const BLOCKED_CRATES: &[&str] = &["core", "std", "alloc"];
 
-/// Determine the crate a demangled Rust symbol belongs to: the first identifier that is
-/// immediately followed by `::`. Handles trait-impl paths such as
-/// `<serde::de::X as core::fmt::Display>::fmt` (gives `serde`) and
-/// `<&T as serde::Serialize>::serialize` (gives `serde`). Returns `None` for symbols without a
-/// path (e.g. `__rust_alloc`, `llvm.memcpy.p0.i64`).
+/// The first identifier followed by `::`, so `<serde::X as core::fmt::Display>::fmt` is `serde`.
 #[must_use]
 pub fn crate_of(demangled: &str) -> Option<&str> {
     let bytes = demangled.as_bytes();
@@ -34,7 +28,6 @@ pub fn crate_of(demangled: &str) -> Option<&str> {
     None
 }
 
-/// Whether a demangled callee should be recorded as a cross-crate invocation.
 #[must_use]
 pub fn callee_crate(demangled: &str) -> Option<&str> {
     if demangled.starts_with("llvm.") || demangled.starts_with("__rust") {
@@ -48,19 +41,15 @@ pub fn callee_crate(demangled: &str) -> Option<&str> {
     }
 }
 
-/// Bitcode modules [`export_crate_db`] parses at once. Parsing is CPU and memory heavy (a large
-/// crate's module takes gigabytes) and runs off the async runtime: parsed inline it stalled
-/// every other export in the same `join_all`, and Neo4j drops a connection that does not
-/// finish authenticating within 30 s.
+/// Parsing takes gigabytes for a large crate. Run inline it stalled the whole `join_all` chunk and
+/// Neo4j dropped connections that did not authenticate within 30 s.
 static PARSE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
-/// Above this many `_` in a path segment, [`crate_name_candidates`] stops enumerating every
-/// `-`/`_` spelling and only tries all-`_` and all-`-`.
+/// Bounds the 2^n spelling enumeration in [`crate_name_candidates`].
 const MAX_SEPARATOR_VARIANTS: usize = 6;
 
-/// Crate names that a crate's path segment in a demangled symbol (`ident`) can stand for.
-/// Rust writes the crate `foo-bar` as `foo_bar`, and crates.io treats `-` and `_` as the same
-/// in names, so every `_` may be either. `ident` itself comes first.
+/// Rust paths write `foo-bar` as `foo_bar` and crates.io treats `-`/`_` alike, so every `_` may
+/// be either. `ident` itself comes first.
 #[must_use]
 pub fn crate_name_candidates(ident: &str) -> Vec<String> {
     let seps: Vec<usize> = ident.match_indices('_').map(|(i, _)| i).collect();
@@ -83,7 +72,6 @@ pub fn crate_name_candidates(ident: &str) -> Vec<String> {
         .collect()
 }
 
-/// The first of `ident`'s [`crate_name_candidates`] that is in `existing`.
 #[must_use]
 pub fn resolve_crate_name<S: std::hash::BuildHasher>(
     ident: &str,
@@ -94,15 +82,13 @@ pub fn resolve_crate_name<S: std::hash::BuildHasher>(
         .find(|c| existing.contains(c))
 }
 
-/// Extract all function calls/invocations within a bytecode file. Returns a `Vec<(String,String)>`
-/// of (caller, callee) demangled function names.
+/// Returns (caller, callee) demangled names.
 ///
 /// # Panics
-/// This function will panic if iterating the `Roots::bytecode_root` fails.
+/// If the directory cannot be read or the bitcode fails to parse.
 ///
-/// This function will panic if an LLVM parsing error occurs while parsing the bytecode.
 /// # Errors
-/// TODO: Failure cases currently panic and should be moved to errors.
+/// Never; failures panic.
 #[allow(clippy::unnecessary_wraps)]
 pub fn extract_calls<P: AsRef<Path>>(crate_bc_dir: P) -> Result<Vec<(String, String)>, Error> {
     let mut calls = Vec::<(String, String)>::new();
@@ -136,15 +122,11 @@ pub fn extract_calls<P: AsRef<Path>>(crate_bc_dir: P) -> Result<Vec<(String, Str
     Ok(calls)
 }
 
-/// Extracts all calls within a  single crates bytecode. Then, perform database insertions of each
-/// call into the database.
-///
 /// # Panics
-/// This function panics if extracting the filename of a crates full name from its path fails,
-/// or if parsing the bitcode panics.
+/// If the directory name is not UTF-8 or the bitcode fails to parse.
 ///
 /// # Errors
-/// Returns `painter::analysis::Error` on failure of database insertion.
+/// If the name does not split or a database call fails.
 #[allow(clippy::needless_pass_by_value)]
 pub async fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P, db: Arc<Db>) -> Result<(), Error> {
     let calls = {
@@ -162,15 +144,13 @@ pub async fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P, db: Arc<Db>) -> Re
     let (crate_name, crate_version) = crate::crate_fs::split_full_name(crate_fullname)
         .ok_or_else(|| Error::CrateNameError(crate_fullname.to_string()))?;
 
-    // A re-import replaces the version's whole call graph: `insert_calls` deletes the existing
-    // `(:Fn)` nodes and creates the new ones.
+    // `insert_calls` replaces the version's whole call graph.
     if db.has_call_graph(crate_name, crate_version).await? {
         log::info!("{crate_fullname}: replacing existing call graph");
     }
 
     log::trace!("Importing: {crate_name}");
 
-    // `extract_calls` only keeps callees with a recordable crate.
     let rows: Vec<(String, String, String)> = calls
         .into_iter()
         .filter_map(|(caller, callee)| {
@@ -179,8 +159,7 @@ pub async fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P, db: Arc<Db>) -> Re
         })
         .collect();
 
-    // Map each callee crate as written in Rust paths (`num_traits`) to its `(Crate)` node's
-    // name (`num-traits`). Calls into names that match no crate are dropped below.
+    // Rust paths say `num_traits`, the node is `num-traits`; unmatched names are dropped below.
     let idents: std::collections::BTreeSet<&str> = rows.iter().map(|r| r.2.as_str()).collect();
     let candidates: Vec<String> = idents
         .iter()
@@ -205,17 +184,16 @@ pub async fn export_crate_db<P: AsRef<Path>>(crate_bc_dir: P, db: Arc<Db>) -> Re
     Ok(())
 }
 
-/// Iterate across all crates in the bytecode root, and call `export_crate_db`
-///
 /// # Panics
-/// This function panics if there are permissions issues reading the bytecode root directory.
+/// If the bytecode root cannot be read.
+///
 /// # Errors
-/// Returns `painter::analysis::Error` on failure.
+/// Never; per-crate failures are logged and counted.
 pub async fn export_all_db<P: AsRef<Path>>(bc_root: P, db: Arc<Db>) -> Result<(), Error> {
     let dirs: Vec<_> = std::fs::read_dir(&bc_root)
         .unwrap()
         .filter_map(Result::ok)
-        // Dot-dirs are not crate versions (e.g. compile's staging dir).
+        // Skips compile's staging dir.
         .filter(|e| e.path().is_dir() && !e.file_name().to_string_lossy().starts_with('.'))
         .collect();
 
@@ -295,7 +273,6 @@ mod tests {
         assert_eq!(many[0], "a_b_c");
         many.sort();
         assert_eq!(many, ["a-b-c", "a-b_c", "a_b-c", "a_b_c"]);
-        // Too many separators to enumerate: only the two uniform spellings.
         assert_eq!(
             crate_name_candidates("a_b_c_d_e_f_g_h"),
             ["a_b_c_d_e_f_g_h", "a-b-c-d-e-f-g-h"]
@@ -339,7 +316,6 @@ mod tests {
                 "std/core/intrinsic callee leaked through the filter: {callee}"
             );
         }
-        // The serde fixture calls into serde itself; demangled names must be legible paths.
         assert!(calls.iter().any(|(_, callee)| callee.starts_with("serde::")
             || callee.contains(" as serde::")
             || callee.contains("<serde::")));
@@ -357,7 +333,6 @@ mod tests {
 
     #[test]
     fn export_crate_csv_writes_one_row_per_call() {
-        // Copy the fixture so the CSV lands in a scratch dir named like a crate version.
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("serde-1.0.0");
         std::fs::create_dir(&dir).unwrap();

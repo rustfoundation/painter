@@ -1,23 +1,5 @@
-// Level-of-detail precompute pipeline.
-//
-// Full build (`runBuild`):
-//   1. aggregate  (Version)-[:DEPENDS_ON]->(Crate) into crate-level edges
-//   2. edges      persist them as (Crate)-[:LOD_DEP {versions}]->(Crate)
-//   3. graph      build an undirected graphology graph over all crates
-//   4. communities Louvain community detection (semantic grouping / colours)
-//   5. layout     ForceAtlas2 (Barnes-Hut) seeded by community, isolated
-//                 crates on an outer ring
-//   6. positions  persist Crate.lod_x / lod_y / lod_community / lod_degree
-//   7. meta       (:LodMeta {id:'default'}) with counts, bounds, timings
-//
-// Incremental update (`runUpdate`): crates that have no position yet (added by
-// an import after the last build) get their crate-level edges aggregated from
-// DEPENDS_ON, persisted as LOD_DEP, and are placed at the centroid of their
-// already-positioned neighbours with the majority community. Cheap, keeps the
-// map usable between full rebuilds; it does not move existing crates.
-//
-// Both are pure functions over a driver so they can run in a worker thread or
-// from the CLI. Progress is reported through `onProgress({phase, done, total, message})`.
+// Pure functions over a driver so they run in a worker thread or from the CLI.
+// The incremental update places new crates without moving existing ones, so the map stays usable between full rebuilds.
 
 import Graph from 'graphology';
 import louvain from 'graphology-communities-louvain';
@@ -39,7 +21,6 @@ import {
 
 const SPLIT = '\u0000';
 
-/** Deterministic pseudo-random in [0,1) from a string, for stable jitter and seeding. */
 const hash01 = (s) => {
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) {
@@ -49,10 +30,7 @@ const hash01 = (s) => {
   return ((h >>> 0) % 1_000_003) / 1_000_003;
 };
 
-/**
- * Build the graphology graph from `names` and `[aIdx, bIdx, versions]` edges.
- * Undirected with summed weights: Louvain and ForceAtlas2 both want that.
- */
+// Undirected with summed weights: Louvain and ForceAtlas2 both want that.
 export const buildGraph = (names, edges) => {
   const graph = new Graph({ type: 'undirected', multi: false, allowSelfLoops: false });
   for (const name of names) graph.addNode(name);
@@ -67,11 +45,7 @@ export const buildGraph = (names, edges) => {
   return graph;
 };
 
-/**
- * Seed positions: connected crates by community on a circle (so ForceAtlas2
- * starts near its answer), isolated crates on an outer ring sorted by name.
- * Returns the number of isolated crates.
- */
+// Connected crates are seeded by community so ForceAtlas2 starts near its answer.
 const seedPositions = (graph, communities) => {
   const connected = [];
   const isolated = [];
@@ -98,14 +72,7 @@ const seedPositions = (graph, communities) => {
   return isolated.length;
 };
 
-/**
- * Run ForceAtlas2 on the connected part only (isolated crates keep their ring
- * position), in rounds so progress can be reported.
- */
-/**
- * Checkpoint file: `{ iterationsDone, positions: { name: [x, y] } }`. Written
- * atomically (tmp + rename) so a crash mid-write never leaves a torn file.
- */
+// Written atomically (tmp + rename) so a crash mid-write never leaves a torn file.
 const writeCheckpoint = (path, iterationsDone, graph) => {
   const positions = {};
   graph.forEachNode((n, a) => {
@@ -180,19 +147,6 @@ const bounds = (rows) => {
   return { minX, minY, maxX, maxY };
 };
 
-/**
- * Full rebuild. `opts.iterations` ForceAtlas2 iterations (default 300),
- * `opts.timeoutMs` for the big streaming reads.
- */
-/**
- * Options:
- *   iterations      total ForceAtlas2 iterations (default 300)
- *   reuseEdges      skip aggregation and use the LOD_DEP edges already in the database
- *   resume          start from the checkpoint file (if present) or, failing that, from
- *                   Crate.lod_x/lod_y when they exist; remaining iterations are run
- *   checkpointPath  file to checkpoint positions to every `checkpointEvery` iterations
- *   checkpointEvery default 20
- */
 export const runBuild = async (driver, database, opts = {}) => {
   const {
     iterations = 300,
@@ -222,7 +176,6 @@ export const runBuild = async (driver, database, opts = {}) => {
     if (edges.length === 0) throw new Error('reuseEdges requested but no LOD_DEP edges exist; run without it');
     log(`graph: reused ${edges.length.toLocaleString()} stored LOD_DEP edges`);
   } else {
-    // 1. aggregate
     mark('aggregate');
     onProgress({ phase: 'aggregate', message: 'aggregating DEPENDS_ON into crate-level edges' });
     const agg = await aggregateDependsOn(driver, database, {
@@ -237,7 +190,6 @@ export const runBuild = async (driver, database, opts = {}) => {
     agg.clear();
     log(`aggregate: ${triples.length.toLocaleString()} crate-level edges in ${Date.now() - timings.aggregate} ms`);
 
-    // 2. persist edges
     mark('edges');
     onProgress({ phase: 'edges', done: 0, total: triples.length, message: 'deleting previous LOD_DEP edges' });
     await deleteLodEdges(driver, database, { onProgress: (n) => onProgress({ phase: 'edges', message: `deleted ${n.toLocaleString()}` }) });
@@ -246,7 +198,7 @@ export const runBuild = async (driver, database, opts = {}) => {
     });
     log(`edges: wrote ${triples.length.toLocaleString()} LOD_DEP in ${Date.now() - timings.edges} ms`);
 
-    // 3. graph (re-read names so crates that only appear as targets are included)
+    // Re-read names so crates that only appear as targets are included.
     mark('graph');
     onProgress({ phase: 'graph', message: 'loading crate list' });
     names = [];
@@ -269,14 +221,12 @@ export const runBuild = async (driver, database, opts = {}) => {
   const graph = buildGraph(names, edges);
   log(`graph: ${graph.order.toLocaleString()} crates, ${graph.size.toLocaleString()} edges in ${Date.now() - timings.graph} ms`);
 
-  // 4. communities
   mark('communities');
   onProgress({ phase: 'communities', message: 'Louvain community detection' });
   const communities = louvain(graph, { getEdgeWeight: 'weight', resolution: 1 });
   const communityCount = new Set(Object.values(communities)).size;
   log(`communities: ${communityCount.toLocaleString()} in ${Date.now() - timings.communities} ms`);
 
-  // 5. layout
   mark('layout');
   const isolated = seedPositions(graph, communities);
   let startIteration = 0;
@@ -312,7 +262,6 @@ export const runBuild = async (driver, database, opts = {}) => {
   layout(graph, { iterations, startIteration, checkpointPath, checkpointEvery, onProgress, log });
   log(`layout: ${iterations - startIteration} iterations in ${Date.now() - timings.layout} ms (${isolated.toLocaleString()} isolated on ring)`);
 
-  // 6. positions
   mark('positions');
   const rows = graph.mapNodes((n, attrs) => ({
     name: n,
@@ -326,7 +275,6 @@ export const runBuild = async (driver, database, opts = {}) => {
   });
   log(`positions: wrote ${rows.length.toLocaleString()} in ${Date.now() - timings.positions} ms`);
 
-  // 7. meta
   const b = bounds(rows);
   const meta = {
     crates: rows.length,
@@ -347,9 +295,6 @@ export const runBuild = async (driver, database, opts = {}) => {
   return meta;
 };
 
-/**
- * Incremental update: position crates that have none. Returns the number placed.
- */
 export const runUpdate = async (driver, database, opts = {}) => {
   const { timeoutMs = 3_600_000, onProgress = () => {}, log = () => {} } = opts;
   const t0 = Date.now();
@@ -368,7 +313,6 @@ export const runUpdate = async (driver, database, opts = {}) => {
   if (!meta) throw new Error('no LOD build exists yet; run a full rebuild first');
   const pos = new Map(positions.map((p) => [p.name, p]));
 
-  // Crate-level edges touching the new crates, both directions, in batches of names.
   const triples = [];
   const batch = 500;
   for (let i = 0; i < fresh.length; i += batch) {
@@ -396,7 +340,7 @@ export const runUpdate = async (driver, database, opts = {}) => {
     for (const r of [...out, ...inn]) triples.push([r.a, r.b, r.n]);
     onProgress({ phase: 'update', done: Math.min(i + batch, fresh.length), total: fresh.length, message: 'collecting edges' });
   }
-  // Dedupe (a new crate depending on another new crate appears from both sides).
+  // A new crate depending on another new crate appears from both sides.
   const seen = new Map();
   for (const [a, b, n] of triples) seen.set(`${a}${SPLIT}${b}`, n);
   const unique = [...seen].map(([k, n]) => {
@@ -404,7 +348,7 @@ export const runUpdate = async (driver, database, opts = {}) => {
     return [k.slice(0, i), k.slice(i + 1), n];
   });
 
-  // Remove any LOD_DEP already touching these crates (idempotent re-runs), then create.
+  // Remove LOD_DEP already touching these crates so re-runs are idempotent.
   for (let i = 0; i < fresh.length; i += batch) {
     await driver
       .session({ database, defaultAccessMode: neo4j.session.WRITE })
@@ -419,8 +363,7 @@ export const runUpdate = async (driver, database, opts = {}) => {
     onProgress: (done) => onProgress({ phase: 'update', done, total: unique.length, message: 'writing LOD_DEP' }),
   });
 
-  // Place each new crate at the centroid of positioned neighbours; iterate a
-  // few times so new crates that only neighbour other new crates settle too.
+  // Iterate so new crates that only neighbour other new crates settle too.
   const neighbours = new Map();
   const addN = (a, b) => {
     if (!neighbours.has(a)) neighbours.set(a, []);
@@ -458,7 +401,6 @@ export const runUpdate = async (driver, database, opts = {}) => {
       });
     }
   }
-  // Anything still unplaced has no positioned neighbours: outer ring.
   let ringI = 0;
   for (const name of fresh) {
     if (placed.has(name)) continue;

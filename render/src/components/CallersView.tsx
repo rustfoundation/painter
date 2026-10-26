@@ -1,7 +1,3 @@
-// Callers view: pick a crate, optionally a version, and a function of it; get a
-// table of every crate version and function that calls it, directly or
-// through other functions (reverse walk over CALLS, see server/callers.mjs).
-
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError, type CallerRow, type CallersResult, type CrateVersion } from '../api';
 
@@ -23,16 +19,13 @@ const COLUMNS: { key: SortKey; label: string }[] = [
 const errorMessage = (err: unknown) =>
   err instanceof ApiError ? (err.code ? `${err.message} [${err.code}]` : err.message) : err instanceof Error ? err.message : String(err);
 
-/** Text input with a debounced suggestion list; Enter on a highlighted item or a click picks it. */
 function SuggestInput(props: {
   value: string;
   onChange: (v: string) => void;
-  /** `picked` is true when the value came from the list rather than typing. */
   onPick: (v: string, picked: boolean) => void;
   fetch: (q: string) => Promise<{ value: string; hint?: string }[]>;
   placeholder: string;
   className?: string;
-  /** Suggest on focus even when empty (function list of a crate). */
   suggestEmpty?: boolean;
 }) {
   const { value, onChange, onPick, fetch, placeholder, className, suggestEmpty } = props;
@@ -122,10 +115,8 @@ export function CallersView({ busy, onBusy, onError }: Props) {
   const [result, setResult] = useState<CallersResult | null>(null);
   const [filter, setFilter] = useState('');
   const [sort, setSort] = useState<{ key: SortKey; desc: boolean }>({ key: 'depth', desc: false });
-  /** Row key (`crate@version::function`) whose call chain is shown. */
   const [expanded, setExpanded] = useState<string | null>(null);
 
-  // Versions of the chosen crate, for the version pin.
   useEffect(() => {
     setVersions([]);
     setVersion('');

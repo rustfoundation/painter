@@ -4,21 +4,17 @@ import { api, isTableView, VIEWS, type CrateLoadOptions, type View } from '../ap
 interface Props {
   view: View;
   onViewChange: (v: View) => void;
-  /** Deps view: edge cap for the transitive chain. */
   depsLimit: number;
   depsMaxLimit: number;
   onDepsLimitChange: (n: number) => void;
-  /** Deps view: max hops from the roots, 0 = unlimited. */
   depsDepth: number;
   onDepsDepthChange: (n: number) => void;
-  /** Map view: max elements drawn per viewport. */
   mapBudget: number;
   onMapBudgetChange: (n: number) => void;
   options: CrateLoadOptions;
   onOptionsChange: (o: CrateLoadOptions) => void;
   /** `exact` is set when the user picked a suggestion, so a 3+ character name is not treated as a partial filter. */
   onLoad: (name: string, exact: boolean) => void;
-  /** Crate the last load resolved to; shown in the box when it differs from what was typed. */
   loadedName: string | null;
   onClear: () => void;
   onFit: () => void;
@@ -29,12 +25,10 @@ interface Props {
 
 export function Toolbar(props: Props) {
   const { view, onViewChange, depsLimit, depsMaxLimit, onDepsLimitChange, depsDepth, onDepsDepthChange, mapBudget, onMapBudgetChange } = props;
-  /** Deps view: partial matching (and suggestions) only from this many characters. */
   const MIN_PARTIAL = 3;
   const { options, onOptionsChange, onLoad, loadedName, onClear, onFit, layout, onLayoutChange, busy } = props;
   const [query, setQuery] = useState('');
 
-  // After a partial name loads, show the crate that was actually picked.
   useEffect(() => {
     if (loadedName) setQuery(loadedName);
   }, [loadedName]);

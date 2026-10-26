@@ -2,7 +2,6 @@
 use circular_buffer::CircularBuffer;
 use std::path::{Path, PathBuf};
 
-/// Top error type returned during any stage of analysis from compile to data import.
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("IO Error: {0}")]
@@ -27,12 +26,8 @@ pub struct CrateEntry {
     version: String,
 }
 impl CrateEntry {
-    /// Build an entry from a `<name>-<version>` string. Both crate names and versions may
-    /// contain `-` (e.g. `serde-1.0.172-alpha.0`), so the split is chosen as the right-most `-`
-    /// whose right-hand side parses as a semver version.
-    ///
     /// # Errors
-    /// Returns `Error::CrateNameError` if no such split exists.
+    /// If `full_name` does not split (see [`split_full_name`]).
     pub fn new(full_name: &str) -> Result<Self, Error> {
         let (name, version) = split_full_name(full_name)
             .ok_or_else(|| Error::CrateNameError(full_name.to_string()))?;
@@ -42,7 +37,6 @@ impl CrateEntry {
         })
     }
 
-    /// Build an entry from an already-separated name and version (e.g. from the index).
     #[must_use]
     pub fn from_parts(name: &str, version: &str) -> Self {
         Self {
@@ -71,10 +65,7 @@ impl CrateEntry {
         format!("{}.crate", self.full_name())
     }
 
-    /// Candidate locations of this crate's `.crate` file under `crates_dir`, most specific
-    /// first. Supports the crates.io-index style sharded layout
-    /// (`1/<n>`, `2/<n>`, `3/<c>/<n>`, `<ab>/<cd>/<n>`) with the crate name as the leaf
-    /// directory, the same layout without the name directory, and a flat directory.
+    /// Most specific first: index-style shard with name dir, shard only, flat.
     #[must_use]
     pub fn candidate_paths(&self, crates_dir: &Path) -> Vec<PathBuf> {
         let name = self.name().to_ascii_lowercase();
@@ -94,10 +85,8 @@ impl CrateEntry {
         ]
     }
 
-    /// Locate this crate's `.crate` file under `crates_dir`.
-    ///
     /// # Errors
-    /// Returns `Error::CrateFileNotFound` if none of the candidate layouts contain the file.
+    /// `Error::CrateFileNotFound` if no candidate exists.
     pub fn locate(&self, crates_dir: &Path) -> Result<PathBuf, Error> {
         self.candidate_paths(crates_dir)
             .into_iter()
@@ -105,7 +94,7 @@ impl CrateEntry {
             .ok_or(Error::CrateFileNotFound)
     }
 }
-/// Split `<name>-<version>` at the right-most `-` whose remainder is a valid (lenient) semver.
+/// Names and versions both contain `-`, so split at the right-most `-` whose remainder is semver.
 #[must_use]
 pub fn split_full_name(full_name: &str) -> Option<(&str, &str)> {
     full_name
@@ -135,13 +124,10 @@ pub struct CrateCache {
     no_delete: bool,
 }
 impl CrateCache {
-    /// Extract `entry` from `crates_dir` into `sources_dir`, or adopt an existing extraction
-    /// (which is then never deleted on drop).
+    /// An existing extraction is adopted and never deleted on drop.
     ///
     /// # Errors
-    /// Returns `Error::CrateFileNotFound` if the `.crate` is missing, `Error::IoError` if the
-    /// archive cannot be read or unpacked, or `Error::ExtractionFailed` if unpacking produced no
-    /// `<name>-<version>` directory.
+    /// If the `.crate` is missing or unreadable, or unpacking produced no `<name>-<version>` dir.
     pub fn new<P>(entry: &CrateEntry, crates_dir: P, sources_dir: P) -> Result<Self, Error>
     where
         P: AsRef<Path>,
@@ -167,8 +153,7 @@ impl CrateCache {
         let tar = flate2::read::GzDecoder::new(tar_gz);
         let mut archive = tar::Archive::new(tar);
         if let Err(e) = archive.unpack(sources_dir.as_ref()) {
-            // Do not leave a half-unpacked tree behind: a later open would adopt it as a
-            // pre-existing extraction.
+            // A later open would adopt a half-unpacked tree as complete.
             let _ = std::fs::remove_dir_all(&extracted_path);
             return Err(e.into());
         }
@@ -202,10 +187,8 @@ pub struct CrateFsConfig {
     pub extract_path: PathBuf,
 }
 impl CrateFsConfig {
-    /// Configure the `.crate` store and extraction directory.
-    ///
     /// # Panics
-    /// Panics if either directory does not exist.
+    /// If either directory does not exist.
     pub fn with_paths<P1, P2>(crates_path: P1, extract_path: P2) -> Self
     where
         P1: Into<PathBuf>,
@@ -214,7 +197,6 @@ impl CrateFsConfig {
         let crates_path = crates_path.into();
         let extract_path = extract_path.into();
 
-        // assert paths exist
         assert!(crates_path.exists());
         assert!(extract_path.exists());
 
@@ -230,10 +212,8 @@ pub struct CrateFs {
     config: CrateFsConfig,
 }
 impl CrateFs {
-    /// Create an empty cache over the configured crate and extraction directories.
-    ///
     /// # Errors
-    /// Currently infallible; returns `Result` so callers do not change when validation is added.
+    /// Currently infallible; `Result` leaves room for validation.
     pub fn new(config: CrateFsConfig) -> Result<Self, Error> {
         Ok(Self {
             cache: CircularBuffer::boxed(),
@@ -248,11 +228,10 @@ impl CrateFs {
             },
         )
     }
-    /// Evict `fullname` from the cache, deleting its extraction unless it pre-existed.
+    /// Deletes the extraction unless it pre-existed.
     ///
     /// # Errors
-    /// Returns `Error::CrateNameError` if `fullname` does not split, or `Error::CrateNotFound`
-    /// if it is not cached.
+    /// If `fullname` does not split or is not cached.
     pub fn close<S: AsRef<str>>(&mut self, fullname: S) -> Result<(), Error> {
         let entry = CrateEntry::new(fullname.as_ref())?;
 
@@ -262,12 +241,10 @@ impl CrateFs {
         Ok(())
     }
 
-    /// Evict `entry` from the cache if present and delete its extraction from the sources
-    /// directory, even one that existed before this `CrateFs` opened it (e.g. left behind by an
-    /// interrupted run).
+    /// Unlike `close`, also deletes a pre-existing extraction (left by an interrupted run).
     ///
     /// # Errors
-    /// Returns `Error::IoError` if the extraction exists but cannot be removed.
+    /// If the extraction cannot be removed.
     pub fn purge(&mut self, entry: &CrateEntry) -> Result<(), Error> {
         if let Some(index) = self.find_cache_index(entry) {
             // Dropping the cache entry deletes extractions it created itself.
@@ -280,30 +257,23 @@ impl CrateFs {
         Ok(())
     }
 
-    /// Open (extracting if needed) the crate named `<name>-<version>`.
-    ///
     /// # Errors
-    /// Returns `Error::CrateNameError` if `fullname` does not split, otherwise as
-    /// [`CrateFs::open_entry`].
+    /// If `fullname` does not split, or as [`CrateFs::open_entry`].
     pub fn open<S: AsRef<str>>(&mut self, fullname: S) -> Result<&CrateCache, Error> {
         let entry = CrateEntry::new(fullname.as_ref())?;
         self.open_entry(entry)
     }
 
-    /// Open (extracting if needed) the crate described by `entry`.
-    ///
     /// # Errors
-    /// Returns `Error::CrateFileNotFound` if the `.crate` file is missing, or an extraction
-    /// error.
+    /// If the `.crate` file is missing or extraction fails.
     pub fn open_entry(&mut self, entry: CrateEntry) -> Result<&CrateCache, Error> {
         if let Some(index) = self.find_cache_index(&entry) {
             Ok(&self.cache.get(index).ok_or(Error::CrateNotFound)?.1)
         } else {
-            // Check we have capcity, otherwise purge the front entry
-
             let cache_entry =
                 CrateCache::new(&entry, &self.config.crates_path, &self.config.extract_path)?;
 
+            // A full buffer evicts the oldest entry; its Drop deletes that extraction.
             self.cache.push_back((entry, cache_entry));
             Ok(&self.cache.back().ok_or(Error::CrateNotFound)?.1)
         }
@@ -335,8 +305,6 @@ mod tests {
         assert_eq!(split_full_name("-1.0.0"), None);
     }
 
-    /// Write a gzipped tarball `<name>-<version>.crate` containing `<name>-<version>/<files>`
-    /// at `dest`.
     fn write_crate_tarball(dest: &Path, entry: &CrateEntry, files: &[(&str, &str)]) {
         std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
         let gz = flate2::write::GzEncoder::new(
@@ -383,24 +351,21 @@ mod tests {
             Err(Error::CrateFileNotFound)
         ));
 
-        // Flat layout.
         let flat = tmp.path().join("serde-1.0.0.crate");
         std::fs::write(&flat, b"").unwrap();
         assert_eq!(e.locate(tmp.path()).unwrap(), flat);
 
-        // Shard-only layout wins over flat.
         let shard = tmp.path().join("se/rd/serde-1.0.0.crate");
         std::fs::create_dir_all(shard.parent().unwrap()).unwrap();
         std::fs::write(&shard, b"").unwrap();
         assert_eq!(e.locate(tmp.path()).unwrap(), shard);
 
-        // Name directory wins over both.
         let named = tmp.path().join("se/rd/serde/serde-1.0.0.crate");
         std::fs::create_dir_all(named.parent().unwrap()).unwrap();
         std::fs::write(&named, b"").unwrap();
         assert_eq!(e.locate(tmp.path()).unwrap(), named);
 
-        // Mixed-case names shard by their lowercase form.
+        // Sharded by lowercase name.
         let upper = CrateEntry::from_parts("Serde", "1.0.0");
         assert_eq!(
             upper.candidate_paths(tmp.path())[0],
@@ -435,15 +400,12 @@ mod tests {
         );
         assert!(extracted.join("src/lib.rs").is_file());
 
-        // Second open hits the cache (same path, no re-extraction needed).
         assert_eq!(fs.open_entry(entry.clone()).unwrap().path(), extracted);
 
-        // Closing evicts and deletes the extraction we created.
         fs.close("demo-0.1.0").unwrap();
         assert!(!extracted.exists());
         assert!(matches!(fs.close("demo-0.1.0"), Err(Error::CrateNotFound)));
 
-        // Missing archive.
         assert!(matches!(
             fs.open("absent-1.0.0"),
             Err(Error::CrateFileNotFound)
@@ -497,7 +459,6 @@ mod tests {
         );
         assert!(matches!(fs.close("demo-0.1.0"), Err(Error::CrateNotFound)));
 
-        // Purging something that was never opened or extracted is a no-op.
         fs.purge(&CrateEntry::from_parts("absent", "1.0.0"))
             .unwrap();
     }
@@ -509,7 +470,7 @@ mod tests {
         let sources = tmp.path().join("sources");
         std::fs::create_dir_all(&sources).unwrap();
 
-        // A truncated archive: the first file unpacks, then the gzip stream ends.
+        // Truncated: the first file unpacks, then the gzip stream ends.
         let entry = CrateEntry::from_parts("demo", "0.1.0");
         let path = entry.candidate_paths(&crates)[2].clone();
         let big = "x".repeat(1 << 20);
@@ -529,7 +490,6 @@ mod tests {
         std::fs::create_dir_all(&sources).unwrap();
 
         let entry = CrateEntry::from_parts("demo", "0.1.0");
-        // Archive is named for demo-0.1.0 but unpacks to other-9.9.9/.
         write_crate_tarball(
             &entry.candidate_paths(&crates)[2],
             &CrateEntry::from_parts("other", "9.9.9"),

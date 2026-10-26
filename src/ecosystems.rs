@@ -1,17 +1,12 @@
-//! Minimal client for the [ecosyste.ms packages API](https://packages.ecosyste.ms/docs),
-//! scoped to the crates.io registry. Only the endpoints the build rules need are wrapped.
+//! Minimal client for the ecosyste.ms packages API, crates.io registry only.
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::time::Duration;
 
-/// Default API root.
 pub const DEFAULT_BASE_URL: &str = "https://packages.ecosyste.ms/api/v1";
-/// Registry name as ecosyste.ms knows it.
 pub const REGISTRY: &str = "crates.io";
-/// Largest page the API serves.
 const MAX_PER_PAGE: usize = 1000;
-/// Retries on rate limiting or transient server errors.
 const MAX_RETRIES: u32 = 4;
 
 #[derive(thiserror::Error, Debug)]
@@ -25,12 +20,9 @@ pub enum Error {
     },
 }
 
-/// Package sort keys supported by the registry packages listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageSort {
-    /// Total downloads.
     Downloads,
-    /// Number of packages that depend on this one (reverse dependencies).
     DependentPackages,
 }
 
@@ -43,7 +35,6 @@ impl PackageSort {
     }
 }
 
-/// Subset of the ecosyste.ms package record we use.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Package {
     pub name: String,
@@ -53,11 +44,10 @@ pub struct Package {
     pub dependent_packages_count: Option<u64>,
 }
 
-/// Subset of the ecosyste.ms maintainer record we use.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Maintainer {
     pub uuid: String,
-    /// Some records have no login; use [`Maintainer::id`] to address the API.
+    /// Some records have no login; address the API via [`Maintainer::id`].
     #[serde(default)]
     pub login: Option<String>,
     #[serde(default)]
@@ -67,14 +57,13 @@ pub struct Maintainer {
 }
 
 impl Maintainer {
-    /// Login if known, else UUID. Both are accepted by the maintainer endpoints.
+    /// Login if known, else UUID; both are accepted.
     #[must_use]
     pub fn id(&self) -> &str {
         self.login.as_deref().unwrap_or(&self.uuid)
     }
 }
 
-/// Subset of the ecosyste.ms version record we use.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VersionInfo {
     pub number: String,
@@ -82,7 +71,6 @@ pub struct VersionInfo {
     pub published_at: Option<DateTime<Utc>>,
 }
 
-/// HTTP client for the packages API.
 #[derive(Debug, Clone)]
 pub struct EcosystemsClient {
     http: reqwest::Client,
@@ -96,11 +84,8 @@ impl Default for EcosystemsClient {
 }
 
 impl EcosystemsClient {
-    /// Create a client against `base_url` (see [`DEFAULT_BASE_URL`]).
-    ///
     /// # Panics
-    /// Panics if the underlying HTTP client cannot be constructed, which only happens when TLS
-    /// initialisation fails.
+    /// If TLS initialisation fails.
     #[must_use]
     pub fn new(base_url: &str) -> Self {
         let http = reqwest::Client::builder()
@@ -149,7 +134,6 @@ impl EcosystemsClient {
         }
     }
 
-    /// Fetch up to `limit` items from a paginated listing (`None` = all pages).
     async fn paged<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
@@ -178,8 +162,6 @@ impl EcosystemsClient {
         Ok(out)
     }
 
-    /// The top `n` crates.io packages by `sort`, most first.
-    ///
     /// # Errors
     /// Returns an HTTP or status error from the API.
     pub async fn top_packages(&self, sort: PackageSort, n: usize) -> Result<Vec<Package>, Error> {
@@ -194,10 +176,7 @@ impl EcosystemsClient {
         .await
     }
 
-    /// The top `n` crates.io maintainers by total downloads of the packages they maintain.
-    ///
-    /// The API cannot sort maintainers by downloads, so this scans every maintainer record
-    /// (about 73k, in pages of 1000) and ranks client-side.
+    /// The API cannot sort maintainers by downloads: scans all ~73k records and ranks client-side.
     ///
     /// # Errors
     /// Returns an HTTP or status error from the API.
@@ -232,8 +211,7 @@ impl EcosystemsClient {
         Ok(all)
     }
 
-    /// The top `n` crates.io maintainers by number of packages they maintain (the only ranking
-    /// the API sorts server-side).
+    /// The only maintainer ranking the API sorts server-side.
     ///
     /// # Errors
     /// Returns an HTTP or status error from the API.
@@ -249,8 +227,6 @@ impl EcosystemsClient {
         .await
     }
 
-    /// Every package maintained by `login`.
-    ///
     /// # Errors
     /// Returns an HTTP or status error from the API.
     pub async fn maintainer_packages(&self, login: &str) -> Result<Vec<Package>, Error> {
@@ -262,8 +238,6 @@ impl EcosystemsClient {
         .await
     }
 
-    /// Every published version of `name` with its publish timestamp.
-    ///
     /// # Errors
     /// Returns an HTTP or status error from the API.
     pub async fn package_versions(&self, name: &str) -> Result<Vec<VersionInfo>, Error> {
@@ -285,7 +259,6 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// A one-shot HTTP/1.1 server: `respond(path_and_query, hit_number) -> (status, body)`.
     async fn serve<F>(respond: F) -> (String, Arc<AtomicUsize>)
     where
         F: Fn(&str, usize) -> (u16, String) + Send + Sync + 'static,
@@ -350,7 +323,6 @@ mod tests {
             assert_eq!(query(target, "sort").as_deref(), Some("downloads"));
             let page: usize = query(target, "page").unwrap().parse().unwrap();
             let per_page: usize = query(target, "per_page").unwrap().parse().unwrap();
-            // 1000 then 500 requested; return a full first page and a short second one.
             let count = if page == 1 { per_page } else { 1 };
             let items: Vec<String> = (0..count)
                 .map(|i| format!(r#"{{"name":"p{page}-{i}","downloads":{i}}}"#))

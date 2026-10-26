@@ -1,14 +1,7 @@
-// Converts neo4j-driver results into a flat, JSON-safe {nodes, rels} payload.
-//
-// The frontend never sees driver types; integers are converted to JS numbers
-// (or strings when they do not fit), and nodes/relationships are deduplicated
-// by elementId so a query returning overlapping paths yields a clean graph.
-
 import neo4j from 'neo4j-driver';
 
 const { isInt, isNode, isRelationship, isPath, isPathSegment } = neo4j;
 
-/** Convert a single Neo4j value into plain JSON. */
 export const toPlain = (value) => {
   if (value === null || value === undefined) return null;
   if (isInt(value)) return value.inSafeRange() ? value.toNumber() : value.toString();
@@ -31,7 +24,6 @@ export const toPlain = (value) => {
     };
   }
   if (typeof value === 'object') {
-    // Temporal / spatial types and plain maps.
     if (typeof value.toString === 'function' && value.constructor && value.constructor.name !== 'Object') {
       return value.toString();
     }
@@ -56,11 +48,6 @@ export const relToPlain = (rel) => ({
   properties: propsToPlain(rel.properties),
 });
 
-/**
- * Walk every value in every record and collect all graph entities found,
- * deduplicated by elementId. Also returns the raw rows (JSON-safe) so tabular
- * results can be displayed.
- */
 export const collectGraph = (records) => {
   const nodes = new Map();
   const rels = new Map();
@@ -107,7 +94,7 @@ export const collectGraph = (records) => {
     rows.push(row);
   }
 
-  // Drop relationships whose endpoints were not returned; NVL cannot draw them.
+  // NVL cannot draw relationships whose endpoints were not returned.
   const relList = [...rels.values()].filter((r) => nodes.has(r.from) && nodes.has(r.to));
 
   return {

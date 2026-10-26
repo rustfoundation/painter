@@ -1,8 +1,3 @@
-// Publishers view: crates.io users and teams from the registry job. Without a login
-// selected it shows registry coverage and four leaderboards (most crates published,
-// most uploads, owners and publishers of the most-downloaded crates); a login opens the
-// publisher page: totals, an upload timeline, and every crate they published or own.
-
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, type PublisherCrate, type PublisherLeaderboards, type PublisherProfile, type RegistryStats, type UserHit } from '../api';
 import { NativeFlags } from './BuildView';
@@ -14,7 +9,6 @@ interface Props {
   onError: (message: string | null) => void;
   onOpenCrate: (name: string) => void;
   onOpenUser: (login: string) => void;
-  /** Login to open, set by other views (details panel, leaderboards). */
   target: { login: string; nonce: number } | null;
 }
 
@@ -76,7 +70,6 @@ const sortValue = (c: PublisherCrate, key: CrateSort): string | number => {
   }
 };
 
-/** Uploads per month (or year), gaps filled, as the shared history strip. */
 function Timeline({ timeline, byYear }: { timeline: PublisherProfile['timeline']; byYear: boolean }) {
   const bars = useMemo<HistoryBar[]>(() => {
     if (!timeline.length) return [];
@@ -268,7 +261,6 @@ export function PublishersView({ busy, onBusy, onError, onOpenCrate, onOpenUser,
   const { sort, desc, toggle } = useSort<CrateSort>('downloads', 'name');
   const debounce = useRef<number | undefined>(undefined);
 
-  // Coverage and leaderboards once (both cached server-side).
   useEffect(() => {
     let cancelled = false;
     api.registryStats().then((s) => !cancelled && setStats(s)).catch((err) => !cancelled && onError(errorMessage(err)));
@@ -278,7 +270,6 @@ export function PublishersView({ busy, onBusy, onError, onOpenCrate, onOpenUser,
     };
   }, [onError]);
 
-  // Login suggestions.
   useEffect(() => {
     window.clearTimeout(debounce.current);
     const q = query.trim();

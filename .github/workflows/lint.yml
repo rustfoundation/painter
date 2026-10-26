@@ -17,8 +17,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      # Formatting needs no LLVM or submodules; keep this job fast.
-      # No `--all`: that would also format the vendored llvm-ir submodules (path deps).
+      # No `--all`: it would also format the vendored llvm-ir submodules.
       - run: cargo fmt -- --check
 
   clippy:
@@ -31,6 +30,4 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           components: clippy
-      # painter sources already `#![deny(clippy::all, clippy::pedantic)]`; `-D warnings` also
-      # fails on rustc warnings in the lib, bin, and test targets.
       - run: cargo clippy --all-targets -- -D warnings

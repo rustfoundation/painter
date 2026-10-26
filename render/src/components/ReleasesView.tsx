@@ -1,5 +1,3 @@
-// Releases view: crates or versions published in a timeframe (registry job dates),
-// with a per-day / per-month timeline of the range, server-side paging, and filters.
 //   crates   · first release  = Crate.created_at
 //            · new publisher  = PUBLISHED->Crate .at (a user's first upload of the crate; flags
 //                               "joined" when the crate already existed)
@@ -55,7 +53,6 @@ const PRESETS: { label: string; days: number }[] = [
 function RangeHistogram({ hist, color, onPick }: { hist: ReleasesHistogram | null; color: string; onPick: (bucket: string, unit: 'day' | 'month') => void }) {
   const bars = useMemo<HistoryBar[]>(() => {
     if (!hist) return [];
-    // Fill gaps so the strip is a real time axis.
     const counts = new Map(hist.buckets.map((b) => [b.bucket, b.n]));
     const keys: string[] = [];
     const start = new Date(hist.from);

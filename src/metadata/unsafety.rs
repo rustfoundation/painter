@@ -1,46 +1,26 @@
-//! `unsafe` job: geiger's unsafe-code counters over every `.rs` file of a version.
-//!
-//! The counts are the ones `cargo-geiger` and the `count-unsafe` tool produce: each `.rs` file
-//! is parsed with `syn` and visited by [`geiger`], which tallies functions, expressions,
-//! `impl`s, traits, and methods as safe or unsafe (tests included). `count-unsafe` sums those
-//! over an unpacked directory; this sums them over the in-memory [`SourceTree`], with the same
-//! file selection (regular files whose extension is exactly `rs`), so the counters match it
-//! (verified on 72 crates). Besides the counters it records how much source was counted, how
-//! many files could not be (unparsable, not UTF-8, or over the load cap), and
-//! `#![forbid(unsafe_code)]` per file and on the crate root.
+//! Counts must match the old `count-unsafe` tool (same file selection; verified on 72 crates).
 use super::source::SourceTree;
 use cargo_geiger_serde::CounterBlock;
 use geiger::IncludeTests;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Scanner revision, stored as `Version.unsafe_scanner` (this job's done-marker). A later
-/// geiger may count differently; bump it with `geiger` in `Cargo.lock` to rescan everything.
+/// Done-marker (`Version.unsafe_scanner`); a newer geiger may count differently, so bump to rescan.
 pub const SCANNER: &str = "geiger 0.5.0";
 
-/// What the unsafe scan of one version found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UnsafeMetrics {
-    /// geiger's counters summed over every parsed `.rs` file.
     pub counters: CounterBlock,
-    /// `.rs` files that were parsed and counted.
     pub rs_files: u64,
-    /// `.rs` files skipped: not valid UTF-8, not parsable by `syn`, or not loaded (too large).
     pub rs_files_failed: u64,
-    /// Lines in the parsed files.
     pub rs_lines: u64,
-    /// Bytes in the parsed files.
     pub rs_bytes: u64,
-    /// Parsed files that carry `#![forbid(unsafe_code)]`.
     pub rs_forbid_files: u64,
-    /// Whether the crate root (`[lib] path`, else `src/lib.rs`, else `src/main.rs`) carries
-    /// `#![forbid(unsafe_code)]`, which forbids unsafe code in the whole crate. `None` when no
-    /// root file was parsed.
+    /// `None` when no root file was parsed.
     pub forbids_unsafe: Option<bool>,
 }
 
 impl UnsafeMetrics {
-    /// Every unsafe count summed, as stored in `unsafe_total`.
     #[must_use]
     pub fn total_unsafe(&self) -> u64 {
         let c = &self.counters;
@@ -52,22 +32,18 @@ impl UnsafeMetrics {
     }
 }
 
-/// Count unsafe code in one `.rs` source: geiger's scan, tests included, exactly as
-/// `count-unsafe` runs it.
-///
 /// # Errors
 /// Returns the `syn` error if the source does not parse.
 pub fn scan_source(src: &str) -> Result<geiger::RsFileMetrics, syn::Error> {
     geiger::find_unsafe_in_string(src, IncludeTests::Yes)
 }
 
-/// Run the unsafe scan over a version's files.
 #[must_use]
 pub fn scan(tree: &SourceTree) -> UnsafeMetrics {
     let mut metrics = UnsafeMetrics::default();
     let mut forbids: HashMap<&str, bool> = HashMap::new();
     for file in &tree.files {
-        // The same test `count-unsafe` applies while walking a directory (case-sensitive).
+        // count-unsafe parity: case-sensitive extension match.
         if Path::new(&file.path).extension().is_none_or(|e| e != "rs") {
             continue;
         }

@@ -1,25 +1,7 @@
-//! `generate-metadata`: per-version facts computed from the `.crate` tarballs and upserted on
-//! the `(Version)` nodes.
-//!
-//! The driver ([`generate_metadata`]) parallelizes across crates. For each crate it walks the
-//! versions in semver order, reads each needed tarball once into memory ([`SourceTree`]), and
-//! hands the tree to every pending job: [`unsafety`] (geiger's unsafe counters), [`build`]
-//! (build script), [`native`] (vendored C/C++), and [`diff`] (per-file line changes against the
-//! previous version, which the walk keeps in memory). Results stream to a writer that upserts
-//! them [`WRITE_BATCH`] versions per transaction and per job.
-//!
-//! Resumable and duplicate-free: every job writes a done-marker (its revision string) on the
-//! version in the same transaction as its data, and every property is `SET`, so a rewrite
-//! replaces rather than adds. On start the driver reads all markers ([`Db::metadata_work_list`])
-//! and only runs a job where its marker differs from the job's current revision, or, for
-//! `diff`, where the stored `diff_base` is no longer the version's predecessor (a newly
-//! published backport can slot in between). Stopping, killing, or pausing the run loses at most
-//! the in-flight batch, which the next run redoes. A version whose tarball cannot be read gets
-//! `meta_error` (and `unsafe_error`) and keeps its other jobs pending, so they are retried.
-//!
-//! The [`registry`] job is different: it reads no tarballs but a crates.io database dump
-//! ([`Options::cratesio_dump`]), and runs as its own phase before the tarball jobs. Without a
-//! dump it is skipped unless selected explicitly (`--job registry`), which is an error.
+//! Each job writes its done-marker in the same transaction as its data and every property is `SET`,
+//! so runs resume cleanly and a kill loses at most the in-flight batch. `diff` also re-runs when
+//! its `diff_base` is no longer the predecessor (a backport published later). Unreadable tarballs
+//! get `meta_error` and keep their other jobs pending. `registry` reads a dump, not tarballs.
 pub mod build;
 pub mod diff;
 pub mod native;
@@ -49,32 +31,25 @@ pub enum Error {
     Registry(#[from] registry::Error),
 }
 
-/// Versions written to Neo4j per transaction (per job).
 pub const WRITE_BATCH: usize = 1_000;
 
-/// Changed-file entries per `diff` write transaction; a batch is cut early when exceeded.
 const DIFF_ENTRIES_PER_TX: usize = 50_000;
 
-/// Stack size of the worker threads: `syn` recurses per nesting level, and generated code nests
-/// deeply.
+/// `syn` recurses per nesting level and generated code nests deeply.
 const WORKER_STACK_BYTES: usize = 128 << 20;
 
-/// Results buffered between the workers and the database writer.
 const CHANNEL_DEPTH: usize = 4_096;
 
-/// One metadata job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Job {
     Unsafe,
     Build,
     Native,
     Diff,
-    /// crates.io registry facts from a database dump (no tarball).
     Registry,
 }
 
 impl Job {
-    /// Every job, in run order.
     pub const ALL: [Job; 5] = [
         Job::Unsafe,
         Job::Build,
@@ -83,7 +58,6 @@ impl Job {
         Job::Registry,
     ];
 
-    /// The job's name on the command line.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -95,7 +69,6 @@ impl Job {
         }
     }
 
-    /// The revision string a version carries once this job has written it.
     #[must_use]
     pub fn revision(self) -> &'static str {
         match self {
@@ -118,7 +91,6 @@ impl std::str::FromStr for Job {
     }
 }
 
-/// Which jobs one version needs (one flag per job, not a state machine).
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Pending {
@@ -129,31 +101,23 @@ pub struct Pending {
 }
 
 impl Pending {
-    /// No job is pending.
     #[must_use]
     pub fn is_empty(self) -> bool {
         !(self.unsafe_ || self.build || self.native || self.diff)
     }
 }
 
-/// How [`generate_metadata`] selects versions and runs.
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// Worker threads. `None` uses a quarter of the CPUs (at least one), since the run usually
-    /// shares the machine with a compile sweep.
+    /// `None` = a quarter of the CPUs, since the run shares the machine with compile sweeps.
     pub threads: Option<usize>,
-    /// Jobs to run; empty means all of them.
     pub jobs: Vec<Job>,
-    /// Only these crates; empty means every crate.
     pub only: Vec<String>,
     /// Only versions flagged `latest` (a `diff` still reads their predecessors).
     pub latest_only: bool,
-    /// Rerun the selected jobs even where their markers are current.
     pub rescan: bool,
-    /// Files larger than this are listed but not loaded (unsafe counts them as failed, diff as
-    /// binary).
+    /// Larger files are listed but not loaded (unsafe counts them failed, diff as binary).
     pub max_file_bytes: u64,
-    /// Extracted crates.io database dump for the `registry` job.
     pub cratesio_dump: Option<PathBuf>,
 }
 
@@ -177,15 +141,13 @@ impl Options {
     }
 }
 
-/// A crate's versions in semver order, with their stored markers.
 #[derive(Debug, Clone)]
 pub struct CrateWork {
     pub name: String,
     pub versions: Vec<MetaState>,
 }
 
-/// Group a work list by crate and sort each crate's versions by semver (unparsable versions,
-/// which the import never creates, last and by string).
+/// Unparsable versions (the import never creates them) sort last, by string.
 #[must_use]
 pub fn group_by_crate(states: Vec<MetaState>) -> Vec<CrateWork> {
     let mut by_crate: HashMap<String, Vec<MetaState>> = HashMap::new();
@@ -206,7 +168,6 @@ pub fn group_by_crate(states: Vec<MetaState>) -> Vec<CrateWork> {
     out
 }
 
-/// What each of a crate's versions (in the given order) still needs.
 #[must_use]
 pub fn plan(work: &CrateWork, opts: &Options) -> Vec<Pending> {
     let stale = |marker: &Option<String>, job: Job| {
@@ -232,7 +193,6 @@ pub fn plan(work: &CrateWork, opts: &Options) -> Vec<Pending> {
         .collect()
 }
 
-/// Everything computed for one version; `None` fields were not pending (or not computable).
 #[derive(Debug, Clone, Default)]
 pub struct VersionMeta {
     pub name: String,
@@ -245,22 +205,17 @@ pub struct VersionMeta {
     pub error: Option<String>,
 }
 
-/// Totals of one run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Summary {
     pub crates: u64,
     pub versions: u64,
-    /// Versions with at least one pending job.
     pub pending: u64,
-    /// Versions written (any job).
     pub written: u64,
-    /// Versions whose tarball could not be read.
     pub errors: u64,
     pub unsafe_: u64,
     pub build: u64,
     pub native: u64,
     pub diff: u64,
-    /// The `registry` phase, if it ran.
     pub registry: Option<registry::Summary>,
 }
 
@@ -293,9 +248,6 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "unknown panic".to_string())
 }
 
-/// Run the pending jobs of one crate, version by version in order, and send each version's
-/// results. Only the tarballs a pending job needs are read: a version's own, and its
-/// predecessor's when its `diff` is pending.
 pub fn process_crate(
     work: &CrateWork,
     pending: &[Pending],
@@ -379,7 +331,6 @@ fn default_threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| (n.get() / 4).max(1))
 }
 
-/// Upsert one batch of results, job by job.
 async fn write_batch(db: &Db, batch: &[VersionMeta]) -> Result<(), Error> {
     let unsafe_: Vec<_> = batch
         .iter()
@@ -417,8 +368,6 @@ async fn write_batch(db: &Db, batch: &[VersionMeta]) -> Result<(), Error> {
     Ok(())
 }
 
-/// The `registry` job's phase of [`generate_metadata`]: load the dump and write the versions in
-/// `states` that need it.
 async fn registry_phase(
     db: &Db,
     opts: &Options,
@@ -452,9 +401,7 @@ async fn registry_phase(
     })
 }
 
-/// Run only the `registry` job from the crates.io dump at `dump` for `only` (empty: every
-/// crate in the database). `create-fresh-db` / `import-crates --cratesio-dump` use this to load
-/// registry facts along with the index.
+/// Used by `create-fresh-db` / `import-crates --cratesio-dump` to load registry facts.
 ///
 /// # Errors
 /// As [`generate_metadata`].
@@ -472,9 +419,6 @@ pub async fn import_registry(
     generate_metadata(PathBuf::new(), db, opts).await
 }
 
-/// Compute and store the selected metadata for every version that needs it (see the module
-/// docs). A database failure stops the run; everything stored before it stays.
-///
 /// # Errors
 /// Database and thread-pool errors. Per-version problems are stored instead.
 ///

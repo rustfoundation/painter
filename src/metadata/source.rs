@@ -1,29 +1,19 @@
-//! One crate version's `.crate` tarball, read fully into memory.
-//!
-//! [`SourceTree::from_tarball`] streams the gzipped tar once and keeps every regular file
-//! (path, size, and contents up to a size cap), so every metadata job reads the same in-memory
-//! tree and nothing is ever unpacked to disk: a hostile archive cannot place files anywhere.
+//! Held in memory, never unpacked, so a hostile archive cannot place files anywhere.
 use std::io::Read;
 
-/// One regular file of a crate version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceFile {
-    /// Path relative to the crate root (the archive's `<name>-<version>/` prefix removed).
     pub path: String,
-    /// Size in the archive.
     pub size: u64,
-    /// Contents, or `None` when the file is larger than the load cap.
     pub data: Option<Vec<u8>>,
 }
 
 impl SourceFile {
-    /// The contents as UTF-8 text, if loaded and valid UTF-8.
     #[must_use]
     pub fn text(&self) -> Option<&str> {
         std::str::from_utf8(self.data.as_deref()?).ok()
     }
 
-    /// Lowercased file extension, if any.
     #[must_use]
     pub fn extension(&self) -> Option<String> {
         std::path::Path::new(&self.path)
@@ -32,20 +22,15 @@ impl SourceFile {
     }
 }
 
-/// What the normalized `Cargo.toml` says about the crate's shape.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Manifest {
-    /// `package.build`: `Some(Some(path))` names a script, `Some(None)` is `build = false`,
-    /// `None` is not stated (then `build.rs` at the root decides).
+    /// `Some(None)` is `build = false`; `None` means unstated (default `build.rs` applies).
     pub build: Option<Option<String>>,
-    /// `[lib] path`, relative to the crate root, if stated.
     pub lib_path: Option<String>,
-    /// `package.links`: the native library the crate links, if stated.
     pub links: Option<String>,
 }
 
 impl Manifest {
-    /// Parse a `Cargo.toml`; anything unparsable yields the default (nothing stated).
     #[must_use]
     pub fn parse(text: &str) -> Self {
         let Ok(value) = toml::from_str::<toml::Value>(text) else {
@@ -75,7 +60,6 @@ impl Manifest {
     }
 }
 
-/// Every regular file of one crate version, sorted by path.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceTree {
     pub files: Vec<SourceFile>,
@@ -83,9 +67,6 @@ pub struct SourceTree {
 }
 
 impl SourceTree {
-    /// Read a gzipped `.crate` tarball from `gz`. Only regular files are kept; a file larger
-    /// than `max_file_bytes` is listed with its size but its contents are not read.
-    ///
     /// # Errors
     /// Returns the I/O error if the archive cannot be decompressed or walked.
     pub fn from_tarball<R: Read>(gz: R, max_file_bytes: u64) -> std::io::Result<Self> {
@@ -99,7 +80,7 @@ impl SourceTree {
             let path = {
                 let path = entry.path()?;
                 let mut components = path.components();
-                components.next(); // the `<name>-<version>` directory
+                components.next();
                 components.as_path().to_string_lossy().into_owned()
             };
             let size = entry.size();
@@ -113,7 +94,7 @@ impl SourceTree {
             files.push(SourceFile { path, size, data });
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));
-        // A tarball listing the same path twice keeps the last copy, like unpacking would.
+        // Duplicate paths keep the last copy, like unpacking would.
         files.dedup_by(|later, earlier| {
             if later.path == earlier.path {
                 std::mem::swap(later, earlier);
@@ -131,7 +112,6 @@ impl SourceTree {
         Ok(Self { files, manifest })
     }
 
-    /// The file at `path`, if present.
     #[must_use]
     pub fn get(&self, path: &str) -> Option<&SourceFile> {
         self.files
@@ -145,9 +125,6 @@ impl SourceTree {
 pub mod test_support {
     use std::io::Write;
 
-    /// Build a gzipped tarball of `<root>/<path>` entries in memory, plus an optional symlink
-    /// `(path, target)`.
-    ///
     /// # Panics
     /// Panics if writing the in-memory archive fails.
     #[must_use]
@@ -176,8 +153,6 @@ pub mod test_support {
         gz.finish().unwrap()
     }
 
-    /// A [`super::SourceTree`] of the given files, as if read from a tarball.
-    ///
     /// # Panics
     /// Panics if the archive cannot be built or read back.
     #[must_use]

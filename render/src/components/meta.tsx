@@ -1,7 +1,3 @@
-// Shared pieces of the metadata table views (Unsafe-style leaderboards over the
-// `painter generate-metadata` properties): number formatting, tiles, histograms,
-// sortable headers, the server-paged leaderboard hook, and the version-history strip.
-
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { ApiError, type UnsafeScope } from '../api';
 
@@ -15,14 +11,13 @@ export const fmtBytes = (n: number | null | undefined) => {
   if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 };
-/** ISO instant -> `YYYY-MM-DD`; the registry job stores crates.io timestamps as DateTimes, serialised as ISO strings. */
+/** Registry timestamps are DateTimes serialised as ISO strings. */
 export const fmtDate = (iso: string | null | undefined) => (iso ? iso.slice(0, 10) : '—');
 export const fmtDateTime = (iso: string | null | undefined) => {
   if (!iso) return '—';
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
 };
-/** Compact download counts: 1.2M, 34.5k. */
 export const fmtCompact = (n: number | null | undefined) => {
   if (n === null || n === undefined) return '—';
   if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
@@ -30,11 +25,9 @@ export const fmtCompact = (n: number | null | undefined) => {
   if (n >= 1e4) return `${(n / 1e3).toFixed(0)}k`;
   return n.toLocaleString();
 };
-/** Today and `days` ago as `YYYY-MM-DD`, for date pickers. */
 export const isoDay = (d: Date) => d.toISOString().slice(0, 10);
 export const daysAgo = (days: number) => isoDay(new Date(Date.now() - days * 86_400_000));
 
-/** A crates.io login that opens the Publishers view. */
 export function UserLink({ login, onOpen, name }: { login: string | null | undefined; onOpen?: (login: string) => void; name?: string | null }) {
   if (!login) return <span className="muted">—</span>;
   return (
@@ -54,7 +47,6 @@ export function UserLink({ login, onOpen, name }: { login: string | null | undef
 export const errorMessage = (err: unknown) =>
   err instanceof ApiError ? (err.code ? `${err.message} [${err.code}]` : err.message) : err instanceof Error ? err.message : String(err);
 
-/** Scope selector shared by every metadata view. */
 export function ScopeSelect({ scope, onChange }: { scope: UnsafeScope; onChange: (s: UnsafeScope) => void }) {
   return (
     <label className="opt">
@@ -95,7 +87,6 @@ export function RowsSelect({ value, onChange }: { value: number; onChange: (n: n
   );
 }
 
-/** Coverage tile: scanned out of all versions in scope, with a meter. */
 export function CoverageTile({ scope, scanned, versions, note, title }: { scope: UnsafeScope; scanned?: number; versions?: number; note?: ReactNode; title: string }) {
   return (
     <div className="tile wide" title={title}>
@@ -130,7 +121,6 @@ export function Tile({ label, value, note, title, color, onClick, active }: { la
   );
 }
 
-/** Log-scaled histogram tile. */
 export function HistTile({ label, labels, values, title }: { label: string; labels: string[]; values?: number[]; title: string }) {
   const vals = values ?? labels.map(() => 0);
   const max = Math.max(1, ...vals);
@@ -169,7 +159,6 @@ export function SortHeaders<S extends string>({ columns, sort, desc, onSort }: {
   );
 }
 
-/** Sort state: clicking the active column flips direction; a new column sorts descending unless it is the name. */
 export function useSort<S extends string>(initial: S, nameKey: S) {
   const [sort, setSort] = useState<S>(initial);
   const [desc, setDesc] = useState(true);
@@ -186,7 +175,6 @@ export function useSort<S extends string>(initial: S, nameKey: S) {
   return { sort, desc, toggle };
 }
 
-/** Debounce a text filter. */
 export function useDebounced(value: string, ms = 300) {
   const [debounced, setDebounced] = useState(value.trim());
   useEffect(() => {
@@ -196,7 +184,6 @@ export function useDebounced(value: string, ms = 300) {
   return debounced;
 }
 
-/** Fetch stats once per scope. */
 export function useStats<T>(fetch: (scope: UnsafeScope) => Promise<T>, scope: UnsafeScope, onError: (m: string | null) => void) {
   const [stats, setStats] = useState<T | null>(null);
   useEffect(() => {
@@ -211,10 +198,6 @@ export function useStats<T>(fetch: (scope: UnsafeScope) => Promise<T>, scope: Un
   return stats;
 }
 
-/**
- * Server-paged leaderboard: reloads from offset 0 whenever `query` changes,
- * `loadMore` appends the next page.
- */
 export function useLeaderboard<Row, Q extends object>(
   fetch: (q: Q & { offset: number }) => Promise<{ rows: Row[]; hasMore: boolean; meta: { elapsedMs: number } }>,
   query: Q,
@@ -251,7 +234,6 @@ export function useLeaderboard<Row, Q extends object>(
   return useMemo(() => ({ rows, hasMore, elapsed, loadMore, generation }), [rows, hasMore, elapsed, loadMore, generation]);
 }
 
-/** Cache of per-crate histories, loaded on demand. */
 export function useCrateHistory<Row>(fetch: (name: string) => Promise<Row[]>, onError: (m: string | null) => void) {
   const [history, setHistory] = useState<Record<string, Row[]>>({});
   const ensure = useCallback(
@@ -272,15 +254,12 @@ export function useCrateHistory<Row>(fetch: (name: string) => Promise<Row[]>, on
 export interface HistoryBar {
   version: string;
   latest: boolean;
-  /** 0..1 of the tallest bar; null draws a stub for an unscanned version. */
   height: number | null;
-  /** Stacked segments, bottom first: [colour, weight]. */
   segments: [string, number][];
   title: string;
   error?: boolean;
 }
 
-/** One bar per version, oldest left, latest outlined; the Unsafe view's history strip. */
 export function HistoryStrip({ bars, onPick, head }: { bars: HistoryBar[]; onPick?: (version: string) => void; head: ReactNode }) {
   return (
     <div className="unsafe-history">

@@ -1,18 +1,9 @@
-// Neo4j I/O for the level-of-detail (LOD) pipeline.
-//
-// Everything here is written to survive a database that is being imported
-// into concurrently: reads stream instead of buffering the whole result,
-// writes go in bounded UNWIND batches, and nothing holds a transaction open
-// for longer than one batch.
+// Written to survive concurrent imports: reads stream, writes go in bounded UNWIND batches, and no transaction outlives one batch.
 
 import neo4j from 'neo4j-driver';
 
 const toNum = (v) => (neo4j.isInt(v) ? v.toNumber() : v);
 
-/**
- * Stream a read query, calling `onRecord(record)` for each row without
- * buffering the result. Resolves with the number of rows seen.
- */
 export const streamRead = (driver, database, cypher, params, { timeoutMs, onRecord }) =>
   new Promise((resolve, reject) => {
     const session = driver.session({ database, defaultAccessMode: neo4j.session.READ });
@@ -29,7 +20,6 @@ export const streamRead = (driver, database, cypher, params, { timeoutMs, onReco
       });
   });
 
-/** Run a write query in its own auto-commit transaction; returns the summary counters. */
 export const write = async (driver, database, cypher, params = {}, { timeoutMs = 600_000 } = {}) => {
   const session = driver.session({ database, defaultAccessMode: neo4j.session.WRITE });
   try {
@@ -40,7 +30,6 @@ export const write = async (driver, database, cypher, params = {}, { timeoutMs =
   }
 };
 
-/** Run a read query and return plain rows (small results only). */
 export const readRows = async (driver, database, cypher, params = {}, { timeoutMs = 60_000 } = {}) => {
   const session = driver.session({ database, defaultAccessMode: neo4j.session.READ });
   try {
@@ -51,11 +40,7 @@ export const readRows = async (driver, database, cypher, params = {}, { timeoutM
   }
 };
 
-/**
- * Load the crate-level dependency edges `(a)-[:LOD_DEP {versions}]->(b)`
- * written by a previous build. Returns `{ names: string[], edges: [aIdx, bIdx, versions][] }`
- * over *all* crates (isolated ones included) so callers see new crates too.
- */
+// Covers all crates (isolated ones included) so callers see new crates too.
 export const loadLodGraph = async (driver, database, { timeoutMs }) => {
   const names = [];
   const index = new Map();
@@ -79,10 +64,6 @@ export const loadLodGraph = async (driver, database, { timeoutMs }) => {
   return { names, index, edges };
 };
 
-/**
- * Load the persisted layout: `{ name, x, y, community, degree }` for every
- * crate that has one, plus the LodMeta record.
- */
 export const loadLodPositions = async (driver, database, { timeoutMs }) => {
   const positions = [];
   await streamRead(
@@ -107,12 +88,7 @@ export const loadLodPositions = async (driver, database, { timeoutMs }) => {
   return { positions, meta: meta ? Object.fromEntries(Object.entries(meta).map(([k, v]) => [k, toNum(v)])) : null };
 };
 
-/**
- * Aggregate `(Version)-[:DEPENDS_ON]->(Crate)` into crate-level edges.
- * Streams the whole DEPENDS_ON relationship set once; on a full index this is
- * tens of millions of rows, so it gets the long LOD timeout.
- * Returns `Map<"a\u0000b", versions>`.
- */
+// Streams the whole DEPENDS_ON set once (tens of millions of rows on a full index), so it gets the long LOD timeout.
 export const aggregateDependsOn = async (driver, database, { timeoutMs, onProgress }) => {
   const edges = new Map();
   let rows = 0;
@@ -135,7 +111,6 @@ export const aggregateDependsOn = async (driver, database, { timeoutMs, onProgre
   return edges;
 };
 
-/** Delete every LOD_DEP relationship in bounded batches. Returns the number deleted. */
 export const deleteLodEdges = async (driver, database, { batch = 50_000, onProgress } = {}) => {
   let total = 0;
   for (;;) {
@@ -153,7 +128,6 @@ export const deleteLodEdges = async (driver, database, { batch = 50_000, onProgr
   return total;
 };
 
-/** Create LOD_DEP relationships from `[a, b, versions]` name triples, in batches. */
 export const createLodEdges = async (driver, database, triples, { batch = 10_000, onProgress } = {}) => {
   let done = 0;
   for (let i = 0; i < triples.length; i += batch) {
@@ -173,7 +147,6 @@ export const createLodEdges = async (driver, database, triples, { batch = 10_000
   return done;
 };
 
-/** Write `lod_x / lod_y / lod_community / lod_degree` for `{name, x, y, community, degree}` rows. */
 export const writeLodPositions = async (driver, database, rows, { batch = 10_000, onProgress } = {}) => {
   let done = 0;
   for (let i = 0; i < rows.length; i += batch) {

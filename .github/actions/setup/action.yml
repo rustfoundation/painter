@@ -27,7 +27,7 @@ runs:
         wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
         chmod +x /tmp/llvm.sh
         sudo /tmp/llvm.sh 22
-        # llvm-sys links LLVM statically: it needs the dev package, Polly, and LLVM's system libs.
+        # llvm-sys links LLVM statically: needs Polly and LLVM's system libs.
         sudo apt-get install -y --no-install-recommends \
           llvm-22-dev libpolly-22-dev zlib1g-dev libzstd-dev libtinfo-dev libxml2-dev
         echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"

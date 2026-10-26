@@ -1,6 +1,3 @@
-// Mapping from the painter graph schema to NVL nodes/relationships, plus the
-// in-memory graph store the UI mutates (merge, remove, clear).
-
 import type { Node as NvlNode, Relationship as NvlRel } from '@neo4j-nvl/base';
 import type { GraphNode, GraphPayload, GraphRel } from './api';
 
@@ -21,15 +18,13 @@ export const COLORS = {
   unknownRel: '#666666',
 } as const;
 
-/** Stable, distinguishable colour for a Louvain community id. */
 export const communityColor = (id: number): string => {
   if (id < 0) return '#6b7280';
   const golden = 0.618033988749895;
   const h = ((id * golden) % 1) * 360;
   const s = (62 + (id % 3) * 8) / 100;
   const l = (52 + ((id >> 2) % 3) * 6) / 100;
-  // HSL -> hex. NVL parses colours with `color-string`, which does not accept
-  // the space-separated hsl() syntax, so emit hex.
+  // NVL parses colours with `color-string`, which rejects space-separated hsl(); emit hex.
   const c = (1 - Math.abs(2 * l - 1)) * s;
   const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
   const m = l - c / 2;
@@ -45,13 +40,11 @@ export const communityColor = (id: number): string => {
 export interface GraphStore {
   nodes: Map<string, GraphNode>;
   rels: Map<string, GraphRel>;
-  /** Crate names that were explicitly loaded through the search box. */
   roots: Set<string>;
 }
 
 export const emptyStore = (): GraphStore => ({ nodes: new Map(), rels: new Map(), roots: new Set() });
 
-/** Return a new store with `payload` merged in (immutable update for React). */
 export const mergePayload = (store: GraphStore, payload: GraphPayload, root?: string): GraphStore => {
   const nodes = new Map(store.nodes);
   const rels = new Map(store.rels);
@@ -71,7 +64,6 @@ export const removeNode = (store: GraphStore, id: string): GraphStore => {
   return { nodes, rels, roots: store.roots };
 };
 
-/** Remove every node not connected to anything (after removals / filters). */
 export const pruneIsolated = (store: GraphStore): GraphStore => {
   const connected = new Set<string>();
   for (const r of store.rels.values()) {
@@ -91,18 +83,10 @@ export const nodeTitle = (n: GraphNode): string => {
   const p = n.properties;
   if (isVersion(n)) return `${p.name}@${p.version}`;
   if (isCrate(n)) return String(p.name ?? n.id);
-  // Registry users and teams: the crates.io login (`github:org:team` for teams).
   if (isUser(n) || isTeam(n)) return String(p.login ?? p.name ?? n.id);
   return String(p.name ?? p.title ?? n.id);
 };
 
-/**
- * Canvas caption: the title plus the generate-metadata badges of a scanned version:
- * `⊘` yanked (registry job), `☢N` unsafe items, `⚙` build script (`⚙→lib` when it
- * declares `links`), `C` native code (`C!` vendored, `C+bin` prebuilt binaries),
- * `Δ+a/−r` lines changed since the previous version. Absent properties (job not run
- * yet) add nothing.
- */
 export const nodeCaption = (n: GraphNode): string => {
   const title = nodeTitle(n);
   if (!isVersion(n)) return title;
@@ -140,13 +124,11 @@ export interface ViewOptions {
   hiddenRelTypes: Set<string>;
 }
 
-/** Convert the store into NVL element arrays. */
 export const toNvl = (
   store: GraphStore,
   selectedId: string | null,
   view: ViewOptions,
 ): { nodes: NvlNode[]; rels: NvlRel[] } => {
-  // Degree is used to scale node size a bit so hubs stand out.
   const degree = new Map<string, number>();
   for (const r of store.rels.values()) {
     if (view.hiddenRelTypes.has(r.type)) continue;

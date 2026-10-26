@@ -1,33 +1,16 @@
-// Build scripts, Native code, and Diffs views: leaderboards, coverage tiles, and
-// per-crate histories over the `painter generate-metadata` properties stored on
-// Version nodes:
-//   build:  has_build_script, build_script, build_script_lines, links, marker meta_build
-//   native: has_native_code, vendored_native, native_* counts, native_langs, native_dirs,
-//           native_prebuilt_files, marker meta_native
-//   diff:   diff_base, diff_files_{added,removed,modified,total}, diff_lines_{added,removed},
-//           diff_approximate, per-file diff_paths / diff_status / diff_added / diff_removed /
-//           diff_binary, marker meta_diff
-// plus meta_error (unreadable tarball). Every function takes `read(cypher, params)`
-// resolving to plain row objects, and `scope` is 'latest' (idx_is_latest) or 'all'
-// (every version: a label scan, seconds on millions of versions). A run of
-// generate-metadata may be in progress, so every property can be null and the
-// markers are what "scanned" means.
+// `scope` is 'latest' (idx_is_latest) or 'all' (a label scan, seconds on millions of versions). A generate-metadata
+// run may be in progress, so any property can be null; the meta_* markers are what "scanned" means.
 import neo4j from 'neo4j-driver';
 
 const scopeClause = (scope) => (scope === 'all' ? 'true' : 'v.latest = true');
 const tri = (expr, value) => `($${value} = 'any' OR ($${value} = 'yes' AND ${expr}) OR ($${value} = 'no' AND NOT ${expr}))`;
 
-/** Semver order of a crate's versions, oldest first (pre-releases before their release). */
 const SEMVER_ORDER = `ORDER BY v.semver_major, v.semver_minor, v.semver_patch, coalesce(v.semver_pre, '') = '', v.version`;
 
 const page = (rows, limit) => {
   const hasMore = rows.length > limit;
   return { rows: hasMore ? rows.slice(0, limit) : rows, hasMore };
 };
-
-// ---------------------------------------------------------------------------
-// Build scripts
-// ---------------------------------------------------------------------------
 
 export const BUILD_SORTS = {
   lines: 'v.build_script_lines',
@@ -45,11 +28,8 @@ const BUILD_ROW = `
          v.rs_lines AS rsLines, v.unsafe_total AS unsafeTotal,
          coalesce(v.has_native_code, false) AS hasNativeCode, coalesce(v.vendored_native, false) AS vendoredNative`;
 
-/**
- * Coverage and totals for build scripts. `known` counts versions where has_build_script
- * is set at all (the unsafe scanner also stored it before the build job existed);
- * `scanned` is the build job's own marker. Aggregates every version in scope: cache it.
- */
+// `known` counts versions where has_build_script is set at all (the unsafe scanner stored it before the build job
+// existed); `scanned` is the build job's own marker.
 export const buildStats = async (read, scope) => {
   const [rows, top] = await Promise.all([
     read(
@@ -75,10 +55,7 @@ export const buildStats = async (read, scope) => {
   return { scope, ...rows[0], topLinks: top };
 };
 
-/**
- * `links` leaderboard: which native libraries the build scripts in scope claim,
- * by distinct crate. idx_version_links makes `links IS NOT NULL` an index scan.
- */
+// idx_version_links makes `links IS NOT NULL` an index scan.
 export const buildLinks = async (read, scope, limit) =>
   read(
     `MATCH (v:Version) WHERE v.links IS NOT NULL AND ${scopeClause(scope)}
@@ -88,11 +65,6 @@ export const buildLinks = async (read, scope, limit) =>
     { limit: neo4j.int(limit) },
   );
 
-/**
- * Leaderboard of versions with a build script, scanned by the build job (so the path and
- * size are known). `links` / `custom` are 'any' | 'yes' | 'no'; `custom` = script is not
- * the default `build.rs`.
- */
 export const buildTop = async (read, { scope, sort, desc, q, links, link, custom, minLines, limit, offset }) => {
   const order = BUILD_SORTS[sort] ?? BUILD_SORTS.lines;
   // An exact `link` name is served by idx_version_links; otherwise idx_has_build_script.
@@ -112,13 +84,8 @@ export const buildTop = async (read, { scope, sort, desc, q, links, link, custom
   return page(rows, limit);
 };
 
-/** Every version of one crate with its build-script facts, oldest first. */
 export const buildCrate = async (read, name) =>
   read(`MATCH (:Crate {name: $name})-[:VERSION_OF]->(v:Version) WITH v ${SEMVER_ORDER} ${BUILD_ROW}`, { name });
-
-// ---------------------------------------------------------------------------
-// Native code
-// ---------------------------------------------------------------------------
 
 export const NATIVE_SORTS = {
   lines: 'v.native_lines',
@@ -141,11 +108,7 @@ const NATIVE_ROW = `
          v.native_prebuilt_files AS prebuilt, v.meta_native AS revision, v.meta_error AS error,
          coalesce(v.has_build_script, false) AS hasBuildScript, v.links AS links`;
 
-/**
- * Coverage, totals, language and directory breakdowns, and a native_lines histogram.
- * Only the coverage counts scan every version in scope; the totals are over
- * has_native_code = true (idx_has_native_code), a few hundred to few thousand nodes.
- */
+// Only the coverage counts scan every version; the totals use idx_has_native_code (a few hundred to few thousand nodes).
 export const nativeStats = async (read, scope) => {
   const [coverage, rows, langs, dirs] = await Promise.all([
     read(
@@ -168,8 +131,6 @@ export const nativeStats = async (read, scope) => {
                count(CASE WHEN v.native_lines > 10000 AND v.native_lines <= 100000 THEN 1 END),
                count(CASE WHEN v.native_lines > 100000 THEN 1 END)] AS histogram`,
     ),
-    // has_native_code = true is index-backed (idx_has_native_code), so these two only
-    // touch the few hundred to few thousand versions that have native files.
     read(
       `MATCH (v:Version) WHERE v.has_native_code = true AND ${scopeClause(scope)}
        UNWIND v.native_langs AS lang
@@ -186,10 +147,6 @@ export const nativeStats = async (read, scope) => {
   return { scope, ...coverage[0], ...rows[0], langs, dirs };
 };
 
-/**
- * Leaderboard of versions with native code. `vendored` / `prebuilt` are 'any' | 'yes' |
- * 'no', `lang` is '' or one of c, c++, objc, asm.
- */
 export const nativeTop = async (read, { scope, sort, desc, q, vendored, prebuilt, lang, minLines, limit, offset }) => {
   const order = NATIVE_SORTS[sort] ?? NATIVE_SORTS.lines;
   const rows = await read(
@@ -208,13 +165,8 @@ export const nativeTop = async (read, { scope, sort, desc, q, vendored, prebuilt
   return page(rows, limit);
 };
 
-/** Every version of one crate with its native-code facts, oldest first. */
 export const nativeCrate = async (read, name) =>
   read(`MATCH (:Crate {name: $name})-[:VERSION_OF]->(v:Version) WITH v ${SEMVER_ORDER} ${NATIVE_ROW}`, { name });
-
-// ---------------------------------------------------------------------------
-// Diffs
-// ---------------------------------------------------------------------------
 
 export const DIFF_SORTS = {
   churn: 'churn',
@@ -228,7 +180,6 @@ export const DIFF_SORTS = {
   name: 'v.name',
 };
 
-/** Lines and files changed, summed. */
 const DIFF_DERIVED = `
   WITH v,
        coalesce(v.diff_lines_added, 0) + coalesce(v.diff_lines_removed, 0) AS churn,
@@ -242,7 +193,6 @@ const DIFF_ROW = `
          v.diff_approximate AS approximate, v.meta_diff AS revision, v.meta_error AS error,
          churn, filesChanged, v.rs_lines AS rsLines`;
 
-/** Coverage and totals of version-to-version changes, with a churn histogram. */
 export const diffStats = async (read, scope) => {
   const rows = await read(
     `MATCH (v:Version) WHERE ${scopeClause(scope)}
@@ -268,12 +218,7 @@ export const diffStats = async (read, scope) => {
   return { scope, ...rows[0] };
 };
 
-/**
- * Leaderboard of version-to-version diffs. `firsts` is 'exclude' (default: only versions
- * with a predecessor), 'include', or 'only'; `approximate` is 'any' | 'yes' | 'no'.
- * Sorting by `added` is index-backed (idx_diff_lines_added); the computed sorts walk
- * every scanned version in scope.
- */
+// Sorting by `added` is index-backed (idx_diff_lines_added); the computed sorts walk every scanned version in scope.
 export const diffTop = async (read, { scope, sort, desc, q, firsts, approximate, minChurn, limit, offset }) => {
   const order = DIFF_SORTS[sort] ?? DIFF_SORTS.churn;
   const firstsClause = firsts === 'include' ? 'true' : firsts === 'only' ? 'v.diff_base IS NULL' : 'v.diff_base IS NOT NULL';
@@ -295,16 +240,10 @@ export const diffTop = async (read, { scope, sort, desc, q, firsts, approximate,
   return page(rows, limit);
 };
 
-/** Every version of one crate with its diff totals, oldest first: the change history. */
 export const diffCrate = async (read, name) =>
   read(`MATCH (:Crate {name: $name})-[:VERSION_OF]->(v:Version) ${DIFF_DERIVED} ${SEMVER_ORDER} ${DIFF_ROW}`, { name });
 
-/**
- * The changed files of one version against its predecessor: the parallel diff_* lists
- * zipped into `{path, status, added, removed, binary}` rows, biggest change first.
- * Null when the version does not exist; `files` is null when the diff job has not
- * run on it yet.
- */
+// `files` is null when the diff job has not run on the version yet.
 export const diffVersion = async (read, { crate, version }) => {
   const [row] = await read(
     `MATCH (:Crate {name: $crate})-[:VERSION_OF]->(v:Version {version: $version})

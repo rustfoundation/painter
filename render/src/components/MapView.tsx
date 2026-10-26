@@ -1,12 +1,5 @@
-// Map view: the whole ecosystem on the precomputed layout, rendered at a level
-// of detail that keeps the element count under a budget. Zooming and panning
-// re-query the server for the current viewport; clusters ("N crates") resolve
-// into individual crates as you zoom in.
-//
-// NVL is used with its 'free' layout so positions are exactly what the server
-// returns (scaled into NVL pixel space). Screen <-> layout mapping is
-// calibrated from NVL's own on-screen node positions, so it does not depend on
-// NVL's internal pan convention.
+// NVL free layout: positions are exactly the server's. Screen <-> layout mapping is
+// calibrated from NVL zoom/pan, not node client positions (they lag a frame behind pans).
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type NVL from '@neo4j-nvl/base';
@@ -15,17 +8,14 @@ import { InteractiveNvlWrapper, type MouseEventCallbacks } from '@neo4j-nvl/reac
 import { api, ApiError, type GraphNode, type LodStatus, type LodViewport } from '../api';
 import { communityColor } from '../graph';
 
-/** Layout bounds are scaled so the whole map spans this many NVL pixels. */
 const MAP_PX = 6000;
 const FETCH_DEBOUNCE_MS = 180;
 /** Fetch a bbox this much larger than the screen so small pans do not refetch. */
 const VIEW_MARGIN = 0.35;
 /** NVL draws a node roughly this many screen px per unit of `size` at zoom 1 (measured). */
 const NVL_SIZE_PX = 2.75;
-/** Minimum on-screen spacing between cluster nodes; sets the finest grid level used. */
 const MIN_CELL_PX = 44;
 
-/** 1234 -> "1.2k", 1234567 -> "1.2M". */
 const compact = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n));
 
 interface Props {
@@ -63,7 +53,6 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
   /** False until the first whole-map payload has been centred; polling waits for it. */
   const centeredRef = useRef(false);
 
-  // ---- coordinate mapping -------------------------------------------------
   const toPx = useCallback((x: number, y: number) => {
     const b = boundsRef.current!;
     const span = Math.max(b.maxX - b.minX, b.maxY - b.minY);
@@ -75,12 +64,7 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
     return { x: b.minX + (px / MAP_PX) * span, y: b.minY + (py / MAP_PX) * span };
   }, []);
 
-  /**
-   * Refresh scale/offset from NVL's zoom and pan. NVL draws a node at
-   * client = x * zoom + w/2 - panX * zoom (pan is the layout point at the
-   * screen centre), so the offset follows directly without touching node
-   * client positions, which lag a frame behind programmatic pan changes.
-   */
+  // NVL draws a node at client = x * zoom + w/2 - panX * zoom (pan = layout point at screen centre).
   const calibrate = useCallback(() => {
     const nvl = nvlRef.current;
     const el = containerRef.current;
@@ -100,7 +84,6 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
     return calib.current;
   }, []);
 
-  /** Current screen viewport in layout coordinates, with margin. */
   const screenBbox = useCallback(() => {
     const c = calibrate();
     const el = containerRef.current;
@@ -114,7 +97,6 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
     return { x0: p0.x, y0: p0.y, x1: p1.x, y1: p1.y };
   }, [calibrate, fromPx]);
 
-  // ---- data ----------------------------------------------------------------
   const fetchStatus = useCallback(async () => {
     try {
       const s = await api.lodStatus();
@@ -137,7 +119,6 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
       inflight.current = ctrl;
       onBusy(true);
       try {
-        // Smallest cell (layout units) that is still MIN_CELL_PX wide on screen at the current zoom.
         const scaleNow = calib.current?.scale ?? 1;
         const b = boundsRef.current;
         const span = b ? Math.max(b.maxX - b.minX, b.maxY - b.minY) : 0;
@@ -148,8 +129,7 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
         setViewScale(calib.current?.scale ?? 1);
         setPayload(p);
         if (!centeredRef.current && bbox === null) {
-          // First whole-map payload: centre once NVL has the nodes, then let
-          // the poll take over (it will refetch for the real screen bbox).
+          // First whole-map payload: centre once, then the poll refetches for the real bbox.
           window.setTimeout(() => {
             showWholeMapRef.current();
             setViewScale(calib.current?.scale ?? 1);
@@ -184,7 +164,6 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
   }, [screenBbox, fetchViewport]);
 
   const showWholeMapRef = useRef<() => void>(() => {});
-  /** Zoom/pan so the whole map (MAP_PX square) fits the container. */
   const showWholeMap = useCallback(() => {
     const nvl = nvlRef.current;
     const el = containerRef.current;
@@ -195,7 +174,6 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
   }, [calibrate]);
   showWholeMapRef.current = showWholeMap;
 
-  // Initial load: status, then the whole map.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -209,7 +187,6 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Poll status while a job runs; reload the map when it finishes.
   useEffect(() => {
     if (!status?.running && !status?.indexLoading) return;
     const id = window.setInterval(async () => {
@@ -223,7 +200,6 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
     return () => window.clearInterval(id);
   }, [status?.running, status?.indexLoading, fetchStatus, fetchViewport]);
 
-  // Jump to a crate.
   useEffect(() => {
     if (!target) return;
     (async () => {
@@ -233,7 +209,6 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
         const el = containerRef.current;
         if (!nvl || !el) return;
         const { px, py } = toPx(hit.x, hit.y);
-        // Zoom so roughly a 600px-wide slice of the map fills the screen, centred on the crate.
         const scale = Math.max(1, el.clientWidth / 600);
         // NVL pan = layout coordinate shown at the screen centre.
         nvl.setZoomAndPan(scale, px, py);
@@ -250,8 +225,7 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
 
 
 
-  // Zoom/pan change detection independent of NVL's callbacks: poll the
-  // viewport state and refetch when it settles on a new value.
+  // Poll zoom/pan instead of relying on NVL callbacks; refetch when it settles.
   useEffect(() => {
     let last = '';
     const id = window.setInterval(() => {
@@ -267,19 +241,15 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
     return () => window.clearInterval(id);
   }, [scheduleViewportFetch]);
 
-  // Budget change: refetch.
   useEffect(() => {
     lastBbox.current = '';
     if (boundsRef.current) scheduleViewportFetch();
   }, [budget, scheduleViewportFetch]);
 
-  // ---- NVL elements --------------------------------------------------------
   const { nodes, rels } = useMemo(() => {
     if (!payload || !boundsRef.current) return { nodes: [] as NvlNode[], rels: [] as NvlRel[] };
-    // NVL sizes are layout units multiplied by the zoom; divide by the zoom at
-    // fetch time so clusters and crates keep a constant on-screen size.
+    // NVL sizes scale with zoom; divide by the zoom at fetch time for constant on-screen size.
     const k = 1 / (Math.max(viewScale, 1e-6) * NVL_SIZE_PX);
-    // On-screen spacing of the grid cells at this level; clusters must not exceed it.
     const cellPx = (MAP_PX / 2 ** payload.level) * viewScale;
     const nodes: NvlNode[] = payload.nodes.map((n) => {
       const p = n.properties as Record<string, number | string | string[]>;
@@ -293,7 +263,6 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
           x: px,
           y: py,
           pinned: true,
-          // target on-screen diameter 30..72 px, never wider than the cell spacing
           size: Math.min(30 + Math.log2(count + 1) * 3.5, 72, cellPx * 1.05) * k,
           color: communityColor(community),
           captions: [{ value: `${compact(count)} crates`, styles: ['bold'] }, ...(top.length ? [{ value: top[0] }] : [])],
@@ -350,7 +319,6 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
       const scale = Math.min(el.clientWidth / w, el.clientHeight / h) * 0.75;
       const cx = (a.px + b.px) / 2;
       const cy = (a.py + b.py) / 2;
-      // NVL pan = layout coordinate shown at the screen centre.
       nvl.setZoomAndPan(scale, cx, cy);
       calibrate();
       scheduleViewportFetch();
@@ -380,7 +348,6 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
     [byId, zoomToCluster, scheduleViewportFetch],
   );
 
-  // ---- job controls --------------------------------------------------------
   const startJob = async (kind: 'build' | 'update') => {
     onError(null);
     try {
