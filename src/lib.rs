@@ -7,6 +7,7 @@
 //! - [`db`]: the Neo4j connection wrapper and all Cypher
 //! - [`check`]: reconcile index, bytecode root, and database (`compile-check`)
 //! - [`migrate`]: rebuild a database from the old `INVOKES` schema (`export-for-import`)
+//! - [`unsafety`]: unsafe-code counts from the `.crate` tarballs (`count-unsafe`)
 #![deny(clippy::all, clippy::pedantic)]
 #![allow(clippy::enum_variant_names)]
 
@@ -20,6 +21,7 @@ pub mod error;
 pub mod index;
 pub mod migrate;
 pub mod rules;
+pub mod unsafety;
 
 use std::path::PathBuf;
 

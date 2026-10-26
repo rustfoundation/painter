@@ -228,7 +228,49 @@ Each row is one chain, nearest caller first; `null` = chain ends.
 
 # Unsafe
 
-Needs `painter count-unsafe`.
+Needs `painter count-unsafe`, which stores on each `Version`:
+
+- `unsafe_total`, `unsafe_{functions,exprs,impls,traits,methods}`, `safe_{...}`: geiger's
+  counters over every `.rs` file in the `.crate` (tests included), zero when none.
+- `rs_files` (parsed), `rs_files_failed` (not UTF-8, unparsable, or over 64 MB), `rs_lines`,
+  `rs_bytes`, `rs_forbid_files` (files with `#![forbid(unsafe_code)]`).
+- `forbids_unsafe`: the crate root (`[lib] path`, else `src/lib.rs`, else `src/main.rs`) forbids
+  unsafe; absent when no root file parsed. `has_build_script`.
+- `unsafe_scanner` (e.g. `geiger 0.5.0`), `unsafe_scanned_at`; `unsafe_error` instead of counts
+  when the tarball was missing or unreadable.
+
+### Scan coverage
+
+```cypher
+MATCH (v:Version)
+RETURN count(v) AS versions,
+       count(v.unsafe_scanner) AS scanned,
+       count(v.unsafe_error) AS unreadable,
+       count(CASE WHEN v.unsafe_total > 0 THEN 1 END) AS with_unsafe,
+       count(CASE WHEN v.forbids_unsafe THEN 1 END) AS forbid_unsafe
+```
+
+### Unsafe density of latest versions
+
+Unsafe expressions per thousand lines, crates over 10k lines.
+
+```cypher
+MATCH (v:Version)
+WHERE v.latest AND v.rs_lines > 10000
+RETURN v.name, v.version, v.rs_lines, v.unsafe_exprs,
+       round(1000.0 * v.unsafe_exprs / v.rs_lines, 2) AS unsafe_per_kloc
+ORDER BY unsafe_per_kloc DESC LIMIT 50
+```
+
+### Dependencies that claim `forbid(unsafe_code)` but have a build script
+
+```cypher
+MATCH (:Crate {name: 'rocket'})-[:VERSION_OF]->(v:Version)
+WHERE v.latest
+MATCH (v)-[:DEPENDS_ON]->(c:Crate)-[:VERSION_OF]->(dv:Version)
+WHERE dv.latest AND dv.forbids_unsafe AND dv.has_build_script
+RETURN c.name, dv.version
+```
 
 ### Most unsafe latest versions
 

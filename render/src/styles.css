@@ -598,3 +598,365 @@ hr.rule {
 .pad {
   padding: 8px 12px;
 }
+
+/* ---------- unsafe ---------- */
+.unsafe {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.unsafe-tiles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.tile {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-top: 3px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  min-width: 130px;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+.tile.wide {
+  min-width: 260px;
+}
+
+.tile.cat {
+  cursor: pointer;
+}
+
+.tile.cat:hover,
+.tile.cat.active {
+  background: var(--border);
+}
+
+.tile-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.tile-value {
+  font-size: 20px;
+  font-weight: 600;
+  margin: 2px 0;
+}
+
+.meter {
+  display: block;
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+  margin: 4px 0;
+}
+
+.meter > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+.meter.inline {
+  display: inline-block;
+  width: 80px;
+  vertical-align: middle;
+  margin: 0 0 0 8px;
+}
+
+.tile.hist {
+  min-width: 200px;
+}
+
+.hist-bars {
+  display: flex;
+  gap: 6px;
+  height: 46px;
+  align-items: stretch;
+  margin-top: 4px;
+}
+
+.hist-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  text-align: center;
+}
+
+.hist-bar {
+  background: var(--accent);
+  border-radius: 2px 2px 0 0;
+}
+
+.unsafe-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.unsafe-controls input.q {
+  min-width: 220px;
+}
+
+.unsafe-table {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.unsafe-table table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+}
+
+.unsafe-table th,
+.unsafe-table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.unsafe-table th {
+  position: sticky;
+  top: 0;
+  background: var(--panel-2);
+  cursor: pointer;
+  user-select: none;
+}
+
+.unsafe-table th.sorted {
+  color: var(--accent);
+}
+
+.unsafe-table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.unsafe-table td.total {
+  font-weight: 600;
+}
+
+.unsafe-table td.rank {
+  text-align: right;
+  width: 1%;
+}
+
+.unsafe-table td.crate .badge {
+  margin-left: 6px;
+}
+
+.unsafe-table tbody tr:not(.detail) {
+  cursor: pointer;
+}
+
+.unsafe-table tbody tr:not(.detail):hover,
+.unsafe-table tr.open {
+  background: var(--panel-2);
+}
+
+.unsafe-table tr.detail td {
+  background: var(--panel);
+  white-space: normal;
+  cursor: default;
+}
+
+.mix {
+  display: inline-flex;
+  height: 10px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--border);
+  vertical-align: middle;
+}
+
+.mix.empty {
+  opacity: 0.3;
+}
+
+.mix > span {
+  display: block;
+  min-width: 1px;
+}
+
+.flag {
+  display: inline-block;
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: 8px;
+  margin-right: 4px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.flag.forbid {
+  border-color: #2bb673;
+  color: #2bb673;
+}
+
+.flag.build {
+  border-color: #f5a623;
+  color: #f5a623;
+}
+
+.flag.failed {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.unsafe-detail {
+  padding: 8px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.unsafe-detail-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.unsafe-detail-grid {
+  display: flex;
+  gap: 24px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+table.unsafe-cats {
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+table.unsafe-cats th,
+table.unsafe-cats td {
+  padding: 2px 8px;
+  border: 0;
+  text-align: left;
+  white-space: nowrap;
+}
+
+table.unsafe-cats .swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  vertical-align: middle;
+  margin-right: 4px;
+}
+
+.unsafe-history {
+  flex: 1;
+  min-width: 320px;
+}
+
+.unsafe-history-head {
+  margin-bottom: 6px;
+}
+
+.unsafe-bars {
+  display: grid;
+  gap: 2px;
+  height: 90px;
+  align-items: end;
+  border-bottom: 1px solid var(--border);
+}
+
+.unsafe-bar {
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+  cursor: pointer;
+}
+
+.unsafe-bar .col {
+  width: 100%;
+  background: var(--border);
+  display: flex;
+  flex-direction: column-reverse;
+  overflow: hidden;
+  border-radius: 2px 2px 0 0;
+}
+
+.unsafe-bar .col > span {
+  display: block;
+  min-height: 1px;
+}
+
+.unsafe-bar.latest .col {
+  outline: 1px solid #fff;
+}
+
+.unsafe-bar.error .col {
+  background: var(--danger);
+}
+
+.unsafe-bars-axis {
+  display: flex;
+  justify-content: space-between;
+}
+
+.unsafe-deps a {
+  color: var(--accent);
+  cursor: pointer;
+}
+
+table.unsafe-deps-table {
+  border-collapse: collapse;
+  font-size: 12px;
+  margin-top: 6px;
+}
+
+table.unsafe-deps-table td {
+  padding: 2px 10px 2px 0;
+  border: 0;
+}
+
+.unsafe-total {
+  font-weight: 600;
+  margin-left: 6px;
+  color: var(--muted);
+}
+
+.unsafe-total.hot {
+  color: #f5a623;
+}
+
+.unsafe-flags {
+  margin: 4px 0 6px;
+}
+
+.small {
+  font-size: 11px;
+}
+
+/* The side panel is narrow: let the unsafe breakdown wrap instead of overflowing. */
+.details table.unsafe-cats th,
+.details table.unsafe-cats td {
+  white-space: normal;
+  word-break: break-word;
+}
+
+.details .meter.inline {
+  width: 50px;
+}

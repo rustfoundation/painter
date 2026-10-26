@@ -252,7 +252,9 @@ impl Db {
                     .user(username.as_ref())
                     .password(password.as_ref())
                     .db("neo4j")
-                    .fetch_size(10)
+                    // Rows per PULL. Small results are unaffected; `unsafe_work_list` streams
+                    // millions of rows and would take one round trip per 10 of them otherwise.
+                    .fetch_size(1_000)
                     .max_connections(64)
                     .build()
                     .unwrap(),
@@ -800,59 +802,176 @@ impl Db {
             .is_some())
     }
 
+    /// Versions to scan for unsafe code: every `(Version)` reachable from its `(Crate)`,
+    /// restricted to `only` (crate names) when non-empty and to `latest` versions when
+    /// `latest_only`. Unless `rescan`, versions that already carry results are skipped, except
+    /// those whose last scan failed (`unsafe_error`), so a rerun resumes and retries failures.
     ///
     /// # Panics
+    /// Panics if the server returns a row without the requested columns.
+    /// # Errors
+    /// This function will return an `painter::db::Error` in the event of a database error.
+    pub async fn unsafe_work_list(
+        &self,
+        only: &[String],
+        latest_only: bool,
+        rescan: bool,
+    ) -> Result<Vec<(String, String)>, Error> {
+        // The crate seek uses the name constraint index; a bare `(v:Version)` scan does not.
+        let start = if only.is_empty() {
+            "MATCH (c:Crate)-[:VERSION_OF]->(v:Version)"
+        } else {
+            "UNWIND $only AS only MATCH (c:Crate { name: only })-[:VERSION_OF]->(v:Version)"
+        };
+        let mut stream = self
+            .conn
+            .execute(
+                query(&format!(
+                    "{start}
+                     WHERE (NOT $latest_only OR v.latest = true)
+                       AND ($rescan OR v.unsafe_scanner IS NULL OR v.unsafe_error IS NOT NULL)
+                     RETURN c.name AS name, v.version AS version"
+                ))
+                .param("only", only.to_vec())
+                .param("latest_only", latest_only)
+                .param("rescan", rescan),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = stream.next().await? {
+            out.push((
+                row.get::<String>("name").unwrap(),
+                row.get::<String>("version").unwrap(),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Store unsafe-code scan results on their `(Version)` nodes, all of `outcomes` in one
+    /// transaction per kind. A scanned version gets, from [`crate::unsafety::UnsafeMetrics`]:
+    ///
+    /// - `unsafe_total` and `unsafe_{functions,exprs,impls,traits,methods}` /
+    ///   `safe_{functions,exprs,impls,traits,methods}`: geiger's counters (zero is stored too)
+    /// - `rs_files`, `rs_files_failed`, `rs_lines`, `rs_bytes`, `rs_forbid_files`
+    /// - `forbids_unsafe` (absent when no crate root file was parsed), `has_build_script`
+    /// - `unsafe_scanner` ([`crate::unsafety::SCANNER`]) and `unsafe_scanned_at`
+    ///
+    /// and loses any earlier `unsafe_error`. A version that could not be scanned gets
+    /// `unsafe_error`, `unsafe_scanner`, and `unsafe_scanned_at`, and loses any earlier counts.
     ///
     /// # Errors
-    ///
-    pub async fn set_unsafe<S1, S2>(
+    /// This function will return an `painter::db::Error` in the event of a database error.
+    #[allow(clippy::too_many_lines)]
+    pub async fn set_unsafe_batch(
         &self,
-        name: S1,
-        version: S2,
-        unsafe_result: &crate::analysis::CountUnsafeResult,
-    ) -> Result<(), Error>
-    where
-        S1: AsRef<str>,
-        S2: AsRef<str>,
-    {
-        if self
-            .write_first_row(
-                query(
-                    "MATCH (v:Version {name:  $name, version: $version}) SET \
-                v.unsafe_total = $unsafe_total, \
-                v.unsafe_functions = $unsafe_functions, \
-                v.unsafe_exprs = $unsafe_exprs, \
-                v.unsafe_impls = $unsafe_impls, \
-                v.unsafe_traits = $unsafe_traits, \
-                v.unsafe_methods = $unsafe_methods, \
-                v.safe_functions = $safe_functions, \
-                v.safe_exprs = $safe_exprs, \
-                v.safe_impls = $safe_impls, \
-                v.safe_traits = $safe_traits, \
-                v.safe_methods = $safe_methods \
-                RETURN v",
-                )
-                .param("name", name.as_ref())
-                .param("version", version.as_ref())
-                .param("unsafe_total", unsafe_result.total_unsafe())
-                .param("unsafe_functions", unsafe_result.functions.unsafe_)
-                .param("unsafe_exprs", unsafe_result.exprs.unsafe_)
-                .param("unsafe_impls", unsafe_result.item_impls.unsafe_)
-                .param("unsafe_traits", unsafe_result.item_traits.unsafe_)
-                .param("unsafe_methods", unsafe_result.methods.unsafe_)
-                .param("safe_functions", unsafe_result.functions.safe)
-                .param("safe_exprs", unsafe_result.exprs.safe)
-                .param("safe_impls", unsafe_result.item_impls.safe)
-                .param("safe_traits", unsafe_result.item_traits.safe)
-                .param("safe_methods", unsafe_result.methods.safe),
-            )
-            .await?
-            .is_none()
-        {
-            Err(Error::CrateNotFound(name.as_ref().to_string()))
-        } else {
-            Ok(())
+        outcomes: &[crate::unsafety::ScanOutcome],
+    ) -> Result<(), Error> {
+        use crate::unsafety::SCANNER;
+        fn n(v: u64) -> i64 {
+            i64::try_from(v).unwrap_or(i64::MAX)
         }
+
+        let ok: Vec<(&str, &str, &crate::unsafety::UnsafeMetrics)> = outcomes
+            .iter()
+            .filter_map(|o| Some((o.name.as_str(), o.version.as_str(), o.result.as_ref().ok()?)))
+            .collect();
+        if !ok.is_empty() {
+            let col = |f: &dyn Fn(&crate::unsafety::UnsafeMetrics) -> i64| -> Vec<i64> {
+                ok.iter().map(|(_, _, m)| f(m)).collect()
+            };
+            self.write(
+                query(
+                    "UNWIND range(0, size($names) - 1) AS i
+                     MATCH (v:Version { name: $names[i], version: $versions[i] })
+                     SET v.unsafe_total = $unsafe_total[i],
+                         v.unsafe_functions = $unsafe_functions[i],
+                         v.unsafe_exprs = $unsafe_exprs[i],
+                         v.unsafe_impls = $unsafe_impls[i],
+                         v.unsafe_traits = $unsafe_traits[i],
+                         v.unsafe_methods = $unsafe_methods[i],
+                         v.safe_functions = $safe_functions[i],
+                         v.safe_exprs = $safe_exprs[i],
+                         v.safe_impls = $safe_impls[i],
+                         v.safe_traits = $safe_traits[i],
+                         v.safe_methods = $safe_methods[i],
+                         v.rs_files = $rs_files[i],
+                         v.rs_files_failed = $rs_files_failed[i],
+                         v.rs_lines = $rs_lines[i],
+                         v.rs_bytes = $rs_bytes[i],
+                         v.rs_forbid_files = $rs_forbid_files[i],
+                         v.forbids_unsafe = CASE $forbids[i] WHEN 1 THEN true WHEN 0 THEN false ELSE null END,
+                         v.has_build_script = $has_build_script[i],
+                         v.unsafe_scanner = $scanner,
+                         v.unsafe_scanned_at = datetime()
+                     REMOVE v.unsafe_error",
+                )
+                .param("names", ok.iter().map(|o| o.0).collect::<Vec<_>>())
+                .param("versions", ok.iter().map(|o| o.1).collect::<Vec<_>>())
+                .param("unsafe_total", col(&|m| n(m.total_unsafe())))
+                .param("unsafe_functions", col(&|m| n(m.counters.functions.unsafe_)))
+                .param("unsafe_exprs", col(&|m| n(m.counters.exprs.unsafe_)))
+                .param("unsafe_impls", col(&|m| n(m.counters.item_impls.unsafe_)))
+                .param("unsafe_traits", col(&|m| n(m.counters.item_traits.unsafe_)))
+                .param("unsafe_methods", col(&|m| n(m.counters.methods.unsafe_)))
+                .param("safe_functions", col(&|m| n(m.counters.functions.safe)))
+                .param("safe_exprs", col(&|m| n(m.counters.exprs.safe)))
+                .param("safe_impls", col(&|m| n(m.counters.item_impls.safe)))
+                .param("safe_traits", col(&|m| n(m.counters.item_traits.safe)))
+                .param("safe_methods", col(&|m| n(m.counters.methods.safe)))
+                .param("rs_files", col(&|m| n(m.rs_files)))
+                .param("rs_files_failed", col(&|m| n(m.rs_files_failed)))
+                .param("rs_lines", col(&|m| n(m.rs_lines)))
+                .param("rs_bytes", col(&|m| n(m.rs_bytes)))
+                .param("rs_forbid_files", col(&|m| n(m.rs_forbid_files)))
+                .param(
+                    "forbids",
+                    col(&|m| match m.forbids_unsafe {
+                        Some(true) => 1,
+                        Some(false) => 0,
+                        None => -1,
+                    }),
+                )
+                .param(
+                    "has_build_script",
+                    ok.iter().map(|o| o.2.has_build_script).collect::<Vec<bool>>(),
+                )
+                .param("scanner", SCANNER),
+            )
+            .await?;
+        }
+
+        let failed: Vec<(&str, &str, &str)> = outcomes
+            .iter()
+            .filter_map(|o| {
+                Some((
+                    o.name.as_str(),
+                    o.version.as_str(),
+                    o.result.as_ref().err()?.as_str(),
+                ))
+            })
+            .collect();
+        if !failed.is_empty() {
+            self.write(
+                query(
+                    "UNWIND range(0, size($names) - 1) AS i
+                     MATCH (v:Version { name: $names[i], version: $versions[i] })
+                     SET v.unsafe_error = $errors[i],
+                         v.unsafe_scanner = $scanner,
+                         v.unsafe_scanned_at = datetime()
+                     REMOVE v.unsafe_total, v.unsafe_functions, v.unsafe_exprs, v.unsafe_impls,
+                            v.unsafe_traits, v.unsafe_methods, v.safe_functions, v.safe_exprs,
+                            v.safe_impls, v.safe_traits, v.safe_methods, v.rs_files,
+                            v.rs_files_failed, v.rs_lines, v.rs_bytes, v.rs_forbid_files,
+                            v.forbids_unsafe, v.has_build_script",
+                )
+                .param("names", failed.iter().map(|o| o.0).collect::<Vec<_>>())
+                .param("versions", failed.iter().map(|o| o.1).collect::<Vec<_>>())
+                .param("errors", failed.iter().map(|o| o.2).collect::<Vec<_>>())
+                .param("scanner", SCANNER),
+            )
+            .await?;
+        }
+        Ok(())
     }
 }
 

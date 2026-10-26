@@ -172,6 +172,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
 
 [[package]]
+name = "cargo-geiger-serde"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "909d85d196ca06373c86a51404b5a1f85683a92555431514ea000acd6e5944e6"
+dependencies = [
+ "semver",
+ "serde",
+ "url",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -536,6 +547,17 @@ dependencies = [
  "pin-project-lite",
  "pin-utils",
  "slab",
+]
+
+[[package]]
+name = "geiger"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76d93a217ccb345db61716809f9fb01d7724a03a85364cc60a1f37caa7ce96e1"
+dependencies = [
+ "cargo-geiger-serde",
+ "proc-macro2",
+ "syn 2.0.101",
 ]
 
 [[package]]
@@ -1234,6 +1256,7 @@ name = "painter"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "cargo-geiger-serde",
  "chrono",
  "circular-buffer",
  "clap",
@@ -1241,6 +1264,7 @@ dependencies = [
  "env_logger",
  "flate2",
  "futures",
+ "geiger",
  "lenient_semver",
  "llvm-ir-analysis",
  "log",
@@ -1251,6 +1275,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "syn 2.0.101",
  "tar",
  "tempfile",
  "thiserror 1.0.69",
@@ -1705,6 +1730,9 @@ name = "semver"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56e6fa9c48d24d85fb3de5ad847117517440f6beceb7798af16b4a87d616b8d0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "serde"
@@ -2164,6 +2192,7 @@ dependencies = [
  "form_urlencoded",
  "idna",
  "percent-encoding",
+ "serde",
 ]
 
 [[package]]

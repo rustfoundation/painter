@@ -1,4 +1,4 @@
-use crate::{check, compile, crate_fs, db, index, migrate, rules};
+use crate::{check, compile, crate_fs, db, index, migrate, rules, unsafety};
 
 /// Top error type returned during any stage of analysis from compile to data import.
 #[derive(thiserror::Error, Debug)]
@@ -35,6 +35,9 @@ pub enum Error {
     /// `export-for-import` failure.
     #[error("Migration export error: {0}")]
     MigrateError(#[from] migrate::Error),
+    /// `count-unsafe` failure.
+    #[error("Unsafe count error: {0}")]
+    UnsafeError(#[from] unsafety::Error),
     /// `-b` was required but not given.
     #[error("MissingBytecodesPath")]
     MissingBytecodesPath,

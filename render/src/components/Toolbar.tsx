@@ -87,7 +87,7 @@ export function Toolbar(props: Props) {
           </button>
         ))}
       </div>
-      {view !== 'callers' && (
+      {view !== 'callers' && view !== 'unsafe' && (
       <>
       <div className="search">
         <input
@@ -220,7 +220,7 @@ export function Toolbar(props: Props) {
 
       <span className="spacer" />
 
-      {view !== 'callers' && (
+      {view !== 'callers' && view !== 'unsafe' && (
       <>
       <label className="opt">
         layout

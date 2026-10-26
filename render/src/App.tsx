@@ -21,6 +21,7 @@ import { CypherPanel } from './components/CypherPanel';
 import { StatusBar } from './components/StatusBar';
 import { MapView } from './components/MapView';
 import { CallersView } from './components/CallersView';
+import { UnsafeView } from './components/UnsafeView';
 
 const DEFAULT_OPTIONS: CrateLoadOptions = { versions: 'latest', deps: true, invokes: true, dependents: false, limit: 200 };
 const DEFAULT_DEPS_LIMIT = 5000;
@@ -210,6 +211,18 @@ export function App() {
     [loadChain],
   );
 
+  /** From the Unsafe view: switch to Default and load one crate. */
+  const openInGraph = useCallback(
+    (name: string) => {
+      setView('default');
+      setStore(emptyStore());
+      setSelectedId(null);
+      setError(null);
+      void loadCrate(name);
+    },
+    [loadCrate],
+  );
+
   const expand = useCallback(async (id: string, direction: 'in' | 'out' | 'both', types: ExpandType[]) => {
     setBusy(true);
     setError(null);
@@ -329,6 +342,8 @@ export function App() {
       <div className="main">
         {view === 'callers' ? (
           <CallersView busy={busy} onBusy={setBusy} onError={setError} />
+        ) : view === 'unsafe' ? (
+          <UnsafeView busy={busy} onBusy={setBusy} onError={setError} onOpenCrate={openInGraph} />
         ) : view === 'map' ? (
           <MapView
             target={mapTarget}

@@ -40,8 +40,6 @@ RUN set -eux; \
 
 ENV LLVM_SYS_221_PREFIX=/usr/lib/llvm-${LLVM_VERSION}
 
-RUN cargo install --locked --root /out count-unsafe
-
 WORKDIR /src
 # Cargo.lock is gitignored; the glob copies it when present and builds unlocked otherwise.
 COPY Cargo.toml Cargo.lock* ./
@@ -51,7 +49,7 @@ COPY src src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --bin painter \
-    && cp target/release/painter /out/bin/painter
+    && install -D target/release/painter /out/bin/painter
 
 FROM debian:${DEBIAN_CODENAME}-slim
 ARG PAINTER_TOOLCHAINS="1.67 1.96.1"
@@ -92,7 +90,7 @@ RUN set -eux; \
     rm -rf /tmp/sccache.tar.gz "/tmp/$f"; \
     sccache --version
 
-COPY --from=builder /out/bin/painter /out/bin/count-unsafe /usr/local/bin/
+COPY --from=builder /out/bin/painter /usr/local/bin/
 
 # The index is a bind-mounted git clone owned by the host user; let libgit2 open it as root.
 RUN git config --system --add safe.directory '*'

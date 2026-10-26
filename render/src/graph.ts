@@ -88,6 +88,13 @@ export const nodeTitle = (n: GraphNode): string => {
   return String(p.name ?? p.title ?? n.id);
 };
 
+/** Canvas caption: the title, plus the unsafe count of a scanned version that has any. */
+export const nodeCaption = (n: GraphNode): string => {
+  const title = nodeTitle(n);
+  const unsafe = n.properties.unsafe_total;
+  return isVersion(n) && typeof unsafe === 'number' && unsafe > 0 ? `${title} ☢${unsafe.toLocaleString()}` : title;
+};
+
 export const relTitle = (r: GraphRel): string => {
   if (r.type === 'INVOKES' && typeof r.properties.count === 'number') return `INVOKES ×${r.properties.count}`;
   if (r.type === 'DEPENDS_ON' && r.properties.aggregated === true) {
@@ -135,7 +142,7 @@ export const toNvl = (
     }
     nodes.push({
       id: n.id,
-      caption: nodeTitle(n),
+      caption: nodeCaption(n),
       color,
       size,
       selected: n.id === selectedId,

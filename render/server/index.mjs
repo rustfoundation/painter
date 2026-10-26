@@ -14,6 +14,7 @@ import { existsSync } from 'node:fs';
 import { config, describeConfig } from './config.mjs';
 import { collectGraph } from './graph.mjs';
 import { findCallers, normCrate } from './callers.mjs';
+import { SORTS as UNSAFE_SORTS, unsafeCrate, unsafeDeps, unsafeStats, unsafeTop } from './unsafe.mjs';
 import { createLodJobs } from './lod/jobs.mjs';
 import { LodIndex } from './lod/index.mjs';
 
@@ -735,6 +736,89 @@ const lodJobs = createLodJobs({
 });
 
 /** Resolve the index or send a 503 describing why it is not available. Returns null after responding. */
+// ---------------------------------------------------------------------------
+// Unsafe view: count-unsafe metrics on Version nodes (see unsafe.mjs)
+// ---------------------------------------------------------------------------
+
+const readRows = (cypher, params) => readGraph(cypher, params).then((g) => g.rows);
+const unsafeScope = (v) => (v === 'all' ? 'all' : 'latest');
+const unsafeTri = (v) => (v === 'yes' || v === 'no' ? v : 'any');
+const nonNegInt = (v, fallback = 0) => {
+  const n = Number.parseInt(v ?? '', 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+
+/** Stats aggregate every version in scope (seconds for `all`); cache them briefly. */
+const unsafeStatsCache = new Map();
+const UNSAFE_STATS_TTL_MS = 60_000;
+
+/** `?scope=latest|all`: coverage, totals per category, and an unsafe_total histogram. */
+api.get(
+  '/unsafe/stats',
+  wrap(async (req, res) => {
+    const scope = unsafeScope(req.query.scope);
+    const hit = unsafeStatsCache.get(scope);
+    if (hit && Date.now() - hit.at < UNSAFE_STATS_TTL_MS) return res.json({ ...hit.value, cached: true });
+    const started = Date.now();
+    const value = { ...(await unsafeStats(readRows, scope)), elapsedMs: Date.now() - started };
+    unsafeStatsCache.set(scope, { at: Date.now(), value });
+    res.json({ ...value, cached: false });
+  }),
+);
+
+/**
+ * `?scope&sort&dir&q&forbids&build&minLines&minUnsafe&limit&offset`: the leaderboard,
+ * ordered and filtered server-side. `sort` is one of unsafe.mjs SORTS.
+ */
+api.get(
+  '/unsafe/top',
+  wrap(async (req, res) => {
+    const started = Date.now();
+    const sort = Object.hasOwn(UNSAFE_SORTS, String(req.query.sort)) ? String(req.query.sort) : 'total';
+    const scope = unsafeScope(req.query.scope);
+    const result = await unsafeTop(readRows, {
+      scope,
+      sort,
+      desc: req.query.dir !== 'asc',
+      q: String(req.query.q ?? '').trim(),
+      forbids: unsafeTri(req.query.forbids),
+      build: unsafeTri(req.query.build),
+      minLines: nonNegInt(req.query.minLines),
+      minUnsafe: nonNegInt(req.query.minUnsafe),
+      limit: clampLimit(req.query.limit, 100),
+      offset: nonNegInt(req.query.offset),
+    });
+    res.json({ ...result, meta: { elapsedMs: Date.now() - started, sort, scope } });
+  }),
+);
+
+/** Every version of a crate with its metrics, oldest first. */
+api.get(
+  '/unsafe/crate/:name',
+  wrap(async (req, res) => {
+    const name = String(req.params.name);
+    res.json({ name, versions: await unsafeCrate(readRows, name) });
+  }),
+);
+
+/** `?crate&version&depth&limit`: unsafe in a version's dependency closure (version defaults to latest). */
+api.get(
+  '/unsafe/deps',
+  wrap(async (req, res) => {
+    const crate = String(req.query.crate ?? '').trim();
+    if (!crate) return res.status(400).json({ error: 'crate is required' });
+    const started = Date.now();
+    const result = await unsafeDeps(readRows, {
+      crate,
+      version: String(req.query.version ?? '').trim() || null,
+      depth: nonNegInt(req.query.depth, 2) || 1,
+      limit: clampLimit(req.query.limit, 50),
+    });
+    if (!result) return res.status(404).json({ error: `no ${req.query.version ? `version ${req.query.version}` : 'latest version'} of crate '${crate}'` });
+    res.json({ ...result, meta: { elapsedMs: Date.now() - started } });
+  }),
+);
+
 const requireLod = async (res) => {
   if (lodIndex) return lodIndex;
   if (!lodLoading) loadLodIndex().catch(() => undefined);

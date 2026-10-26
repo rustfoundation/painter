@@ -7,6 +7,7 @@ use libpainter::{
     ecosystems::EcosystemsClient,
     index, migrate,
     rules::{BuildEverything, BuildRules, EcosystemsRules, NamedCrates},
+    unsafety,
 };
 use rayon::prelude::*;
 use std::{
@@ -232,12 +233,27 @@ enum Command {
         #[command(flatten)]
         db: DbArgs,
     },
-    /// Run `count-unsafe` over every crate source and store the totals.
+    /// Count unsafe code in every crate version straight from its `.crate` tarball (geiger's
+    /// counters, as `count-unsafe` reports them) and store the results on the `Version` nodes.
+    /// Resumes: versions already scanned are skipped unless `--rescan`.
     CountUnsafe {
-        #[command(flatten)]
-        roots: RootsArgs,
+        /// Root directory containing the compressed `.crate` files.
+        #[arg(short = 'c', value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
+        compressed_root: PathBuf,
         #[command(flatten)]
         db: DbArgs,
+        /// Scan threads (default: a quarter of the CPUs).
+        #[arg(short = 'j', long)]
+        jobs: Option<usize>,
+        /// Only these crates (repeatable).
+        #[arg(long, value_name = "CRATE")]
+        only: Vec<String>,
+        /// Only versions flagged `latest`.
+        #[arg(long)]
+        latest_only: bool,
+        /// Scan versions that already have results too.
+        #[arg(long)]
+        rescan: bool,
     },
 }
 
@@ -322,8 +338,22 @@ async fn main() -> Result<(), Error> {
                 println!("{name}-{version}");
             }
         }
-        Command::CountUnsafe { roots, db } => {
-            analysis::count_unsafe(&Roots::from(roots), db.connect().await?).await?;
+        Command::CountUnsafe {
+            compressed_root,
+            db,
+            jobs,
+            only,
+            latest_only,
+            rescan,
+        } => {
+            let opts = unsafety::ScanOptions {
+                jobs,
+                only,
+                latest_only,
+                rescan,
+                ..unsafety::ScanOptions::default()
+            };
+            unsafety::count_unsafe(compressed_root, db.connect().await?, opts).await?;
         }
         Command::ExportForImport {
             db,

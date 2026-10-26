@@ -39,7 +39,7 @@ export function StatusBar(props: Props) {
         {fmtInt(stats?.invokes)} CALLS
       </span>
       <span className="sep" />
-      {view !== 'callers' && (
+      {view !== 'callers' && view !== 'unsafe' && (
         <span>
           view: {nodeCount} nodes · {relCount} rels
         </span>
@@ -64,7 +64,7 @@ export function StatusBar(props: Props) {
           </span>
         </>
       )}
-      {view !== 'callers' && (
+      {view !== 'callers' && view !== 'unsafe' && (
       <>
       <span className="sep" />
       {(view === 'map' ? [] : view === 'deps' ? ['DEPENDS_ON'] : ['VERSION_OF', 'DEPENDS_ON', 'INVOKES']).map((t) => (

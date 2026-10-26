@@ -59,7 +59,12 @@ We then determine the call graph of every crate by these steps:
 Nodes:
 - `(Crate { name })`
 - `(Version { name, version, semver_major, semver_minor, semver_patch, semver_build, semver_pre })`,
-  plus `latest` (from `set-latest-versions`) and `unsafe_*` / `safe_*` counts (from `count-unsafe`)
+  plus `latest` (from `set-latest-versions`) and, from `count-unsafe`: `unsafe_total`,
+  `unsafe_{functions,exprs,impls,traits,methods}` / `safe_{...}` (geiger's counters over every
+  `.rs` file, tests included), `rs_files`, `rs_files_failed`, `rs_lines`, `rs_bytes`,
+  `rs_forbid_files`, `forbids_unsafe` (crate root has `#![forbid(unsafe_code)]`),
+  `has_build_script`, `unsafe_scanner`, `unsafe_scanned_at`, and `unsafe_error` when the
+  tarball could not be read
 
 Relationships:
 - `(Crate)-[:VERSION_OF]->(Version)` (note the direction: from the crate to its version)
@@ -109,7 +114,6 @@ one edge per compiled pair; `painter export-for-import` converts them
   (`se/rd/serde/serde-1.0.0.crate`), for example a mirror made with
   [walterhpearce/crates-spider](https://github.com/walterhpearce/crates-spider.git).
 - Docker, for Neo4j and the graph UI.
-- [`count-unsafe`](https://crates.io/crates/count-unsafe) on `PATH`, only for the `count-unsafe` step.
 
 ## Build
 ```
@@ -173,8 +177,14 @@ bitcode to `-b` in the same layout. `-s`, `-b`, and `-c` are the same three root
 export PAINTER_INDEX_PATH=/path/to/crates.io-index
 cargo run --release -- compile-all --toolchain 1.96.1 -s sources -c crates -b bytecodes
 cargo run --release -- export-all-neo4j -s sources -c crates -b bytecodes -d bolt://127.0.0.1:7687 -u neo4j -p changeme123
-cargo run --release -- count-unsafe -s sources -c crates -d bolt://127.0.0.1:7687 -u neo4j -p changeme123
+cargo run --release -- count-unsafe -c crates -d bolt://127.0.0.1:7687 -u neo4j -p changeme123
 ```
+- `count-unsafe` reads every `.crate` in `-c` for every `Version` node in the database and stores
+  unsafe-code metrics on it without unpacking anything: the same counts the
+  [`count-unsafe`](https://crates.io/crates/count-unsafe) tool gives (geiger over every `.rs`
+  file, tests included), plus source size, `#![forbid(unsafe_code)]`, and build-script facts. It
+  resumes (`--rescan` to redo), takes `-j N`, `--only CRATE`, and `--latest-only`, and runs fine
+  next to `compile-all`.
 - `compile-all` builds the highest version of every crate in the index by default. Narrow or widen
   it with `--only <CRATE>` (repeatable), `--all-versions`, `--top-downloads N`, `--top-reverse-deps N`,
   `--top-maintainers N`, and `--newer-than YYYY-MM-DD` (the `--top-*` and `--newer-than` rules query

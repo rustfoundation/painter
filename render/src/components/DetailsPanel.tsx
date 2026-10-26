@@ -22,6 +22,98 @@ const fmt = (v: unknown): string => {
   return String(v);
 };
 
+const UNSAFE_CATEGORIES: { key: string; label: string; color: string }[] = [
+  { key: 'functions', label: 'unsafe fns', color: '#E5484D' },
+  { key: 'exprs', label: 'unsafe exprs', color: '#F5A623' },
+  { key: 'impls', label: 'unsafe impls', color: '#B88BFF' },
+  { key: 'traits', label: 'unsafe traits', color: '#4C8DFF' },
+  { key: 'methods', label: 'unsafe methods', color: '#2BB673' },
+];
+
+/** `count-unsafe` metrics of a Version, when painter has scanned it. */
+function UnsafeSummary({ p }: { p: Record<string, unknown> }) {
+  const num = (k: string) => (typeof p[k] === 'number' ? (p[k] as number) : null);
+  if (!p.unsafe_scanner) {
+    return (
+      <>
+        <h3>Unsafe</h3>
+        <p className="muted">Not scanned yet (run painter count-unsafe).</p>
+      </>
+    );
+  }
+  if (p.unsafe_error) {
+    return (
+      <>
+        <h3>Unsafe</h3>
+        <p className="muted">Could not scan: {String(p.unsafe_error)}</p>
+      </>
+    );
+  }
+  const total = num('unsafe_total') ?? 0;
+  const lines = num('rs_lines') ?? 0;
+  const exprs = num('unsafe_exprs') ?? 0;
+  return (
+    <>
+      <h3>
+        Unsafe <span className={`unsafe-total ${total ? 'hot' : ''}`}>{total.toLocaleString()}</span>
+      </h3>
+      <div className="unsafe-flags">
+        {p.forbids_unsafe === true && (
+          <span className="flag forbid" title="Crate root has #![forbid(unsafe_code)]">
+            forbid(unsafe_code)
+          </span>
+        )}
+        {p.has_build_script === true && (
+          <span className="flag build" title="Has a build script">
+            build.rs
+          </span>
+        )}
+        {num('rs_files_failed') ? (
+          <span className="flag failed" title="Files that could not be parsed and are not counted">
+            {num('rs_files_failed')} unparsed
+          </span>
+        ) : null}
+      </div>
+      <table className="props unsafe-cats">
+        <tbody>
+          {UNSAFE_CATEGORIES.map((c) => {
+            const u = num(`unsafe_${c.key}`) ?? 0;
+            const s = num(`safe_${c.key}`) ?? 0;
+            return (
+              <tr key={c.key}>
+                <th>
+                  <span className="swatch" style={{ background: c.color }} /> {c.label}
+                </th>
+                <td>
+                  <b className={u ? '' : 'muted'}>{u.toLocaleString()}</b>
+                  <span className="muted"> / {(u + s).toLocaleString()}</span>
+                  <span className="meter inline">
+                    <span style={{ width: u + s ? `${(100 * u) / (u + s)}%` : 0, background: c.color }} />
+                  </span>
+                </td>
+              </tr>
+            );
+          })}
+          <tr>
+            <th>source</th>
+            <td>
+              {(num('rs_files') ?? 0).toLocaleString()} files · {lines.toLocaleString()} lines
+              {lines ? ` · ${((1000 * exprs) / lines).toFixed(1)} unsafe exprs / kloc` : ''}
+            </td>
+          </tr>
+          <tr>
+            <th>scanned</th>
+            <td className="muted">
+              {String(p.unsafe_scanner)}
+              {p.unsafe_scanned_at ? `, ${new Date(String(p.unsafe_scanned_at)).toLocaleString()}` : ''}
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </>
+  );
+}
+
 function Properties({ props }: { props: Record<string, unknown> }) {
   const entries = Object.entries(props).sort(([a], [b]) => a.localeCompare(b));
   if (!entries.length) return <p className="muted">no properties</p>;
@@ -198,6 +290,7 @@ export function DetailsPanel({ view, onExpandDeps, selected, nodeById, onExpand,
         </button>
       </div>
 
+      {isVersion(node) && <UnsafeSummary p={node.properties} />}
       <h3>Properties</h3>
       <Properties props={node.properties} />
       <p className="muted small">elementId {node.id}</p>

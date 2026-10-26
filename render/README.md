@@ -242,6 +242,28 @@ Element sizes are divided by the zoom so they stay constant on screen.
 `window.__painterNvl` and `window.__painterMap` expose the NVL instance and
 calibration for headless checks.
 
+### Unsafe
+
+A leaderboard of crate versions by the unsafe-code metrics `painter count-unsafe`
+stores on `Version` nodes (geiger's counters per category, source size,
+`#![forbid(unsafe_code)]` on the crate root, build scripts). Tiles at the top give
+scan coverage, the share of versions with any unsafe, the totals per category
+(click one to sort by it), and a histogram of unsafe totals. Scope is latest
+versions (fast, index-backed) or all versions (a full scan, seconds). Filters:
+crate name, forbid(unsafe_code) yes/no, build script yes/no, minimum lines,
+minimum unsafe. Every column header sorts server-side; `/kloc` is unsafe
+expressions per thousand lines and `share` their fraction of all expressions.
+The `mix` bar shows the category breakdown of each row.
+
+Clicking a row opens the crate's history (one bar per version, latest
+highlighted; click a bar to filter to that crate), the safe/unsafe split per
+category, "Open in graph", and "Unsafe in dependencies": the unsafe carried in
+by every dependency reachable from that version in N hops (dev-dependencies
+skipped, each dependency at its latest version), most unsafe first.
+
+In the graph views a scanned version's caption shows `☢N` when it has unsafe
+code, and the side panel has an Unsafe section with the same breakdown.
+
 ## API
 
 JSON throughout. Graph payloads are
@@ -267,6 +289,10 @@ JSON throughout. Graph payloads are
 | `GET /api/crates/:name/versions` | a crate's versions, newest first, with `latest` and `exported` (has a call graph) |
 | `GET /api/functions/search?crate&q&limit` | called functions of a crate containing `q`, most-called first |
 | `GET /api/callers?crate&fn&match&version&depth&limit` | Callers view: `rows` of `{depth, crate, version, function, calls, verified, path}`; `match=exact` or `contains` |
+| `GET /api/unsafe/stats?scope` | Unsafe view tiles: coverage, per-category totals, unsafe_total histogram (`scope=latest\|all`, cached 60 s) |
+| `GET /api/unsafe/top?scope&sort&dir&q&forbids&build&minLines&minUnsafe&limit&offset` | Unsafe leaderboard rows, sorted and filtered server-side; `hasMore` for paging |
+| `GET /api/unsafe/crate/:name` | every version of a crate with its unsafe metrics, oldest first |
+| `GET /api/unsafe/deps?crate&version&depth&limit` | unsafe in a version's dependency closure (`depth` hops, dev-deps skipped, latest version of each dependency) |
 | `GET /api/node/:id` | one node by `elementId` |
 | `POST /api/cypher` | `{query, params}`, read-only, row-capped; 403 when disabled |
 

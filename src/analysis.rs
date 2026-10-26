@@ -1,9 +1,8 @@
-use crate::{Error, Roots, db::Db};
+use crate::{Error, db::Db};
 use llvm_ir_analysis::{ModuleAnalysis, llvm_ir::Module};
 use rayon::prelude::*;
 use rustc_demangle::demangle;
 
-use crates_index::Crate;
 use std::{io::Write, path::Path, sync::Arc};
 
 /// Callee crates that are never recorded as invocations: the standard library family and
@@ -242,152 +241,6 @@ pub async fn export_all_db<P: AsRef<Path>>(bc_root: P, db: Arc<Db>) -> Result<()
     Ok(())
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct CountUnsafeEntry {
-    pub safe: u32,
-    pub unsafe_: u32,
-}
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct CountUnsafeResult {
-    pub functions: CountUnsafeEntry,
-    pub exprs: CountUnsafeEntry,
-    pub item_impls: CountUnsafeEntry,
-    pub item_traits: CountUnsafeEntry,
-    pub methods: CountUnsafeEntry,
-}
-impl CountUnsafeResult {
-    #[must_use]
-    pub fn has_unsafe(&self) -> bool {
-        self.functions.unsafe_ > 0
-            || self.exprs.unsafe_ > 0
-            || self.item_impls.unsafe_ > 0
-            || self.item_traits.unsafe_ > 0
-            || self.methods.unsafe_ > 0
-    }
-
-    #[must_use]
-    pub fn total_unsafe(&self) -> u32 {
-        self.functions.unsafe_
-            + self.exprs.unsafe_
-            + self.item_impls.unsafe_
-            + self.item_traits.unsafe_
-            + self.methods.unsafe_
-    }
-}
-
-/// Extract every version of `c` from the compressed root into the sources root, run
-/// `count-unsafe` over it, and store the totals on the `Version` node.
-///
-/// # Panics
-/// Panics if a `.crate` file cannot be opened, `count-unsafe` cannot be spawned, or its output
-/// is not the expected JSON.
-///
-/// # Errors
-/// Currently infallible; database failures are logged per version.
-pub async fn count_unsafe_crate_extract(c: Crate, roots: Roots, db: Arc<Db>) -> Result<(), Error> {
-    let compressed_root = &roots.compressed_root;
-    let sources_root = &roots.sources_root;
-
-    for v in c.versions() {
-        let crate_fullname = format!("{}-{}", v.name(), v.version());
-        let crate_path = compressed_root.join(format!("{crate_fullname}.crate"));
-
-        // Lets work off the tgz for now, since we cant extract
-        // TODO: this needs to be unified to a file driver
-        if std::fs::metadata(&crate_path).is_ok() {
-            let extracted_path = sources_root.join(&crate_fullname);
-            let tar_gz = std::fs::File::open(&crate_path).unwrap();
-            let tar = flate2::read::GzDecoder::new(tar_gz);
-            let mut archive = tar::Archive::new(tar);
-            if archive.unpack(sources_root).is_ok() {
-                log::trace!("Extracted {crate_fullname}");
-
-                // Run our count
-                let output = std::process::Command::new("count-unsafe")
-                    .args([&extracted_path])
-                    .output()
-                    .unwrap();
-                if output.status.success() {
-                    let raw_json = std::str::from_utf8(&output.stdout).unwrap();
-                    log::trace!("{raw_json}");
-
-                    let unsafe_result: CountUnsafeResult = serde_json::from_str(raw_json).unwrap();
-                    if unsafe_result.has_unsafe() {
-                        log::debug!("{crate_fullname} unsafe");
-                        if let Err(e) = db.set_unsafe(v.name(), v.version(), &unsafe_result).await {
-                            log::error!("set_unsafe failed for {crate_fullname}: {e}");
-                        }
-                    }
-
-                    // Finally delete
-                    //std::fs::remove_dir_all(extracted_path).unwrap();
-                    log::trace!("Deleted {crate_fullname}");
-                }
-            }
-        }
-    }
-    Ok(())
-}
-/// Run `count-unsafe` over every already-extracted version of `c` in the sources root and store
-/// the totals on the `Version` node. Versions without an extracted directory are skipped.
-///
-/// # Panics
-/// Panics if `count-unsafe` cannot be spawned or its output is not the expected JSON.
-///
-/// # Errors
-/// Currently infallible; database failures are logged per version.
-pub async fn count_unsafe_crate(c: Crate, roots: Roots, db: Arc<Db>) -> Result<(), Error> {
-    let sources_root = &roots.sources_root;
-
-    for v in c.versions() {
-        let crate_fullname = format!("{}-{}", v.name(), v.version());
-        let crate_path = sources_root.join(&crate_fullname);
-
-        // Lets work off the tgz for now, since we cant extract
-        // TODO: this needs to be unified to a file driver
-        if std::fs::metadata(&crate_path).is_ok() {
-            // Run our count
-            let output = std::process::Command::new("count-unsafe")
-                .args([&crate_path])
-                .output()
-                .unwrap();
-            if output.status.success() {
-                let raw_json = std::str::from_utf8(&output.stdout).unwrap();
-                log::trace!("{raw_json}");
-
-                let unsafe_result: CountUnsafeResult = serde_json::from_str(raw_json).unwrap();
-                if unsafe_result.has_unsafe() {
-                    log::debug!("{crate_fullname} unsafe");
-                    if let Err(e) = db.set_unsafe(v.name(), v.version(), &unsafe_result).await {
-                        log::error!("set_unsafe failed for {crate_fullname}: {e}");
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Run [`count_unsafe_crate`] over every crate in the index, 128 crates at a time.
-///
-/// # Errors
-/// Returns `Error::IndexError` if the index cannot be opened.
-pub async fn count_unsafe(roots: &Roots, db: Arc<Db>) -> Result<(), Error> {
-    let index = crate::index::open_index().map_err(crate::index::Error::from)?;
-
-    let iter = crate::chunked(index.crates(), 128);
-    for chunk in iter {
-        let tasks: Vec<_> = chunk
-            .into_iter()
-            .map(|c| count_unsafe_crate(c, roots.clone(), db.clone()))
-            .collect();
-
-        futures::future::join_all(tasks).await;
-    }
-
-    Ok(())
-}
-
 #[allow(dead_code)]
 fn export_crate_csv<P: AsRef<Path>>(crate_bc_dir: P) -> Result<(), Error> {
     let calls = extract_calls(&crate_bc_dir)?;
@@ -500,29 +353,6 @@ mod tests {
             extract_calls(tmp.path()).unwrap(),
             Vec::<(String, String)>::new()
         );
-    }
-
-    #[test]
-    fn count_unsafe_result_parses_tool_output_and_sums() {
-        let json = r#"{
-            "functions": {"safe": 10, "unsafe_": 1},
-            "exprs": {"safe": 100, "unsafe_": 2},
-            "item_impls": {"safe": 5, "unsafe_": 0},
-            "item_traits": {"safe": 1, "unsafe_": 0},
-            "methods": {"safe": 20, "unsafe_": 3}
-        }"#;
-        let r: CountUnsafeResult = serde_json::from_str(json).unwrap();
-        assert!(r.has_unsafe());
-        assert_eq!(r.total_unsafe(), 6);
-
-        let safe: CountUnsafeResult = serde_json::from_str(
-            r#"{"functions":{"safe":1,"unsafe_":0},"exprs":{"safe":1,"unsafe_":0},
-                "item_impls":{"safe":0,"unsafe_":0},"item_traits":{"safe":0,"unsafe_":0},
-                "methods":{"safe":0,"unsafe_":0}}"#,
-        )
-        .unwrap();
-        assert!(!safe.has_unsafe());
-        assert_eq!(safe.total_unsafe(), 0);
     }
 
     #[test]

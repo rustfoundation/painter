@@ -52,13 +52,14 @@ export interface Health {
 }
 
 /** Which graph the UI shows. */
-export type View = 'default' | 'deps' | 'map' | 'callers';
+export type View = 'default' | 'deps' | 'map' | 'callers' | 'unsafe';
 
 export const VIEWS: { id: View; label: string; title: string }[] = [
   { id: 'default', label: 'Default', title: 'Crates, versions, and their DEPENDS_ON / INVOKES edges' },
   { id: 'deps', label: 'Deps', title: 'Transitive crate-level dependency chain of every crate matching the filter' },
   { id: 'map', label: 'Map', title: 'Whole ecosystem on a precomputed layout; zoom in to resolve clusters into crates' },
   { id: 'callers', label: 'Callers', title: 'Table of every crate version and function that calls a function, directly or through other functions' },
+  { id: 'unsafe', label: 'Unsafe', title: 'Leaderboard of crate versions by unsafe code: per-category counts, density, forbid(unsafe_code), build scripts, and the unsafe in their dependencies' },
 ];
 
 /** Callers view: one function that reaches the searched function. */
@@ -148,6 +149,125 @@ export interface LodStatus {
   indexLoading: boolean;
   indexError: string | null;
   config: { iterations: number; budget: number; maxLevel: number };
+}
+
+// ---------------------------------------------------------------------------
+// Unsafe view (painter count-unsafe metrics on Version nodes)
+// ---------------------------------------------------------------------------
+
+export type UnsafeScope = 'latest' | 'all';
+export type UnsafeTri = 'any' | 'yes' | 'no';
+export type UnsafeCategory = 'functions' | 'exprs' | 'impls' | 'traits' | 'methods';
+export type UnsafeSort = UnsafeCategory | 'total' | 'density' | 'share' | 'lines' | 'files' | 'forbidFiles' | 'failed' | 'name';
+
+/** One crate version's unsafe metrics as the server returns them. */
+export interface UnsafeRow {
+  name: string;
+  version: string;
+  latest: boolean;
+  /** Null for versions never scanned (crate history rows). */
+  total: number | null;
+  functions: number | null;
+  exprs: number | null;
+  impls: number | null;
+  traits: number | null;
+  methods: number | null;
+  safeFunctions: number | null;
+  safeExprs: number | null;
+  safeImpls: number | null;
+  safeTraits: number | null;
+  safeMethods: number | null;
+  files: number | null;
+  filesFailed: number | null;
+  lines: number | null;
+  bytes: number | null;
+  forbidFiles: number | null;
+  /** Crate root has `#![forbid(unsafe_code)]`; null when no root file was parsed. */
+  forbidsUnsafe: boolean | null;
+  hasBuildScript: boolean;
+  scanner: string | null;
+  scannedAt: string | null;
+  error: string | null;
+  /** Unsafe expressions per thousand lines. */
+  density: number;
+  /** Unsafe expressions / all expressions. */
+  share: number;
+}
+
+export interface UnsafeStats {
+  scope: UnsafeScope;
+  versions: number;
+  scanned: number;
+  unreadable: number;
+  withUnsafe: number;
+  forbids: number;
+  buildScripts: number;
+  functions: number;
+  exprs: number;
+  impls: number;
+  traits: number;
+  methods: number;
+  safeFunctions: number;
+  safeExprs: number;
+  safeImpls: number;
+  safeTraits: number;
+  safeMethods: number;
+  lines: number;
+  files: number;
+  filesFailed: number;
+  /** Scanned versions with unsafe_total 0, 1–10, 11–100, 101–1000, >1000. */
+  histogram: number[];
+  elapsedMs: number;
+  cached: boolean;
+}
+
+export interface UnsafeTopQuery {
+  scope: UnsafeScope;
+  sort: UnsafeSort;
+  desc: boolean;
+  q: string;
+  forbids: UnsafeTri;
+  build: UnsafeTri;
+  minLines: number;
+  minUnsafe: number;
+  limit: number;
+  offset: number;
+}
+
+export interface UnsafeTopResult {
+  rows: UnsafeRow[];
+  hasMore: boolean;
+  meta: { elapsedMs: number; sort: UnsafeSort; scope: UnsafeScope };
+}
+
+export interface UnsafeDepsResult {
+  crate: string;
+  version: string;
+  depth: number;
+  summary: {
+    crates: number;
+    scanned: number;
+    total: number;
+    functions: number;
+    exprs: number;
+    impls: number;
+    traits: number;
+    methods: number;
+    lines: number;
+    forbids: number;
+    buildScripts: number;
+  };
+  deps: {
+    name: string;
+    version: string | null;
+    total: number | null;
+    exprs: number | null;
+    lines: number | null;
+    forbidsUnsafe: boolean | null;
+    hasBuildScript: boolean;
+    scanned: boolean;
+  }[];
+  meta: { elapsedMs: number };
 }
 
 export interface Stats {
@@ -251,6 +371,28 @@ export const api = {
     const params = new URLSearchParams({ crate: q.crate, fn: q.fn, match: q.exact ? 'exact' : 'contains', depth: String(q.depth), limit: String(q.limit) });
     if (q.version) params.set('version', q.version);
     return request<CallersResult>(`/api/callers?${params}`);
+  },
+  unsafeStats: (scope: UnsafeScope) => request<UnsafeStats>(`/api/unsafe/stats?scope=${scope}`),
+  unsafeTop: (q: UnsafeTopQuery) =>
+    request<UnsafeTopResult>(
+      `/api/unsafe/top?${new URLSearchParams({
+        scope: q.scope,
+        sort: q.sort,
+        dir: q.desc ? 'desc' : 'asc',
+        q: q.q,
+        forbids: q.forbids,
+        build: q.build,
+        minLines: String(q.minLines),
+        minUnsafe: String(q.minUnsafe),
+        limit: String(q.limit),
+        offset: String(q.offset),
+      })}`,
+    ),
+  unsafeCrate: (name: string) => request<{ name: string; versions: UnsafeRow[] }>(`/api/unsafe/crate/${encodeURIComponent(name)}`).then((r) => r.versions),
+  unsafeDeps: (crate: string, version: string | null, depth: number, limit: number) => {
+    const params = new URLSearchParams({ crate, depth: String(depth), limit: String(limit) });
+    if (version) params.set('version', version);
+    return request<UnsafeDepsResult>(`/api/unsafe/deps?${params}`);
   },
   expand: (id: string, direction: 'in' | 'out' | 'both', types: ExpandType[], limit = 100) =>
     request<GraphPayload>('/api/graph/expand', json({ id, direction, types, limit })),
