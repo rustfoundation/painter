@@ -15,6 +15,7 @@ import {
   type View,
 } from './api';
 import { emptyStore, mergePayload, removeNode, toNvl, type GraphStore } from './graph';
+import { useTouchZoomPan } from './touch';
 import { Toolbar } from './components/Toolbar';
 import { DetailsPanel } from './components/DetailsPanel';
 import { CypherPanel } from './components/CypherPanel';
@@ -40,6 +41,8 @@ const errorMessage = (err: unknown): string => {
 
 export function App() {
   const nvlRef = useRef<NVL>(null);
+  const [canvasEl, setCanvasEl] = useState<HTMLDivElement | null>(null);
+  useTouchZoomPan(canvasEl, nvlRef);
   const [store, setStore] = useState<GraphStore>(emptyStore);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [options, setOptions] = useState<CrateLoadOptions>(DEFAULT_OPTIONS);
@@ -367,7 +370,7 @@ export function App() {
           />
         ) : (
         <>
-        <div className="canvas">
+        <div className="canvas" ref={setCanvasEl}>
           {nodes.length === 0 && view === 'deps' ? (
             <div className="empty">
               <h1>crate dependency chain</h1>
@@ -405,7 +408,12 @@ export function App() {
             style={{ width: '100%', height: '100%' }}
           />
         </div>
-        <aside className="sidebar">
+        <aside className={`sidebar${selected ? ' has-selection' : ''}`}>
+          {selected && (
+            <button type="button" className="sheet-close" aria-label="Close details" onClick={() => setSelectedId(null)}>
+              ×
+            </button>
+          )}
           <DetailsPanel
             view={view}
             onExpandDeps={(name, dir) => void loadDeps(name, dir)}

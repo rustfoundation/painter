@@ -7,6 +7,7 @@ import type { Node as NvlNode, Relationship as NvlRel, NvlOptions } from '@neo4j
 import { InteractiveNvlWrapper, type MouseEventCallbacks } from '@neo4j-nvl/react';
 import { api, ApiError, type GraphNode, type LodStatus, type LodViewport } from '../api';
 import { communityColor } from '../graph';
+import { useTouchZoomPan } from '../touch';
 
 const MAP_PX = 6000;
 const FETCH_DEBOUNCE_MS = 180;
@@ -37,6 +38,12 @@ interface Calibration {
 export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta }: Props) {
   const nvlRef = useRef<NVL>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const [canvasEl, setCanvasEl] = useState<HTMLDivElement | null>(null);
+  const canvasRef = useCallback((el: HTMLDivElement | null) => {
+    containerRef.current = el;
+    setCanvasEl(el);
+  }, []);
+  useTouchZoomPan(canvasEl, nvlRef);
   const [status, setStatus] = useState<LodStatus | null>(null);
   const [payload, setPayload] = useState<LodViewport | null>(null);
   const [selected, setSelected] = useState<GraphNode | null>(null);
@@ -363,7 +370,7 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
 
   return (
     <>
-      <div className="canvas" ref={containerRef}>
+      <div className="canvas" ref={canvasRef}>
         {!status?.index && (
           <div className="empty">
             <h1>ecosystem map</h1>
@@ -392,7 +399,12 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
           style={{ width: '100%', height: '100%' }}
         />
       </div>
-      <aside className="sidebar">
+      <aside className={`sidebar${selected ? ' has-selection' : ''}`}>
+        {selected && (
+          <button type="button" className="sheet-close" aria-label="Close details" onClick={() => setSelected(null)}>
+            ×
+          </button>
+        )}
         <div className="details">
           {selected ? (
             <>
