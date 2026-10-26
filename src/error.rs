@@ -1,4 +1,4 @@
-use crate::{check, compile, crate_fs, db, index, migrate, rules, unsafety};
+use crate::{check, compile, crate_fs, db, index, metadata, migrate, rules};
 
 /// Top error type returned during any stage of analysis from compile to data import.
 #[derive(thiserror::Error, Debug)]
@@ -35,9 +35,14 @@ pub enum Error {
     /// `export-for-import` failure.
     #[error("Migration export error: {0}")]
     MigrateError(#[from] migrate::Error),
-    /// `count-unsafe` failure.
-    #[error("Unsafe count error: {0}")]
-    UnsafeError(#[from] unsafety::Error),
+    /// `generate-metadata` failure.
+    #[error("Metadata error: {0}")]
+    MetadataError(#[from] metadata::Error),
+    /// A database command got neither `-p` nor `--password-file` (nor their env vars).
+    #[error(
+        "no Neo4j password: pass -p, --password-file, $NEO4J_PASSWORD, or $NEO4J_PASSWORD_FILE"
+    )]
+    MissingPassword,
     /// `-b` was required but not given.
     #[error("MissingBytecodesPath")]
     MissingBytecodesPath,

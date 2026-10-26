@@ -59,12 +59,11 @@ We then determine the call graph of every crate by these steps:
 Nodes:
 - `(Crate { name })`
 - `(Version { name, version, semver_major, semver_minor, semver_patch, semver_build, semver_pre })`,
-  plus `latest` (from `set-latest-versions`) and, from `count-unsafe`: `unsafe_total`,
-  `unsafe_{functions,exprs,impls,traits,methods}` / `safe_{...}` (geiger's counters over every
-  `.rs` file, tests included), `rs_files`, `rs_files_failed`, `rs_lines`, `rs_bytes`,
-  `rs_forbid_files`, `forbids_unsafe` (crate root has `#![forbid(unsafe_code)]`),
-  `has_build_script`, `unsafe_scanner`, `unsafe_scanned_at`, and `unsafe_error` when the
-  tarball could not be read
+  plus `latest` (from `set-latest-versions`) and the `generate-metadata` properties: unsafe
+  counts (`unsafe_*`, `safe_*`, `rs_*`, `forbids_unsafe`), build scripts (`has_build_script`,
+  `build_script`, `links`), vendored native code (`has_native_code`, `vendored_native`,
+  `native_*`), and the diff against the previous version (`diff_*`); see
+  [docker/queries.md](docker/queries.md) for every property
 
 Relationships:
 - `(Crate)-[:VERSION_OF]->(Version)` (note the direction: from the crate to its version)
@@ -177,14 +176,18 @@ bitcode to `-b` in the same layout. `-s`, `-b`, and `-c` are the same three root
 export PAINTER_INDEX_PATH=/path/to/crates.io-index
 cargo run --release -- compile-all --toolchain 1.96.1 -s sources -c crates -b bytecodes
 cargo run --release -- export-all-neo4j -s sources -c crates -b bytecodes -d bolt://127.0.0.1:7687 -u neo4j -p changeme123
-cargo run --release -- count-unsafe -c crates -d bolt://127.0.0.1:7687 -u neo4j -p changeme123
+cargo run --release -- generate-metadata -c crates -d bolt://127.0.0.1:7687 -u neo4j -p changeme123
 ```
-- `count-unsafe` reads every `.crate` in `-c` for every `Version` node in the database and stores
-  unsafe-code metrics on it without unpacking anything: the same counts the
-  [`count-unsafe`](https://crates.io/crates/count-unsafe) tool gives (geiger over every `.rs`
-  file, tests included), plus source size, `#![forbid(unsafe_code)]`, and build-script facts. It
-  resumes (`--rescan` to redo), takes `-j N`, `--only CRATE`, and `--latest-only`, and runs fine
-  next to `compile-all`.
+- `generate-metadata` reads the `.crate` of every `Version` node in the database into memory
+  (nothing is unpacked to disk) and upserts per-version metadata from four jobs: `unsafe` (the
+  counts the [`count-unsafe`](https://crates.io/crates/count-unsafe) tool gives: geiger over
+  every `.rs` file, tests included), `build` (build script and `links`), `native` (vendored C,
+  C++, Objective-C, or assembly, with small binding shims told apart from vendored libraries,
+  and prebuilt binaries), and `diff` (per-file lines added and removed since the previous
+  version in semver order). It parallelizes across crates and walks each crate's versions in
+  order. Every job marks the versions it wrote, so the command resumes after a stop, kill, or
+  pause and never duplicates data (`--rescan` redoes). Flags: `-j N` threads, `--job NAME`
+  (repeatable), `--only CRATE`, `--latest-only`. It runs fine next to `compile-all`.
 - `compile-all` builds the highest version of every crate in the index by default. Narrow or widen
   it with `--only <CRATE>` (repeatable), `--all-versions`, `--top-downloads N`, `--top-reverse-deps N`,
   `--top-maintainers N`, and `--newer-than YYYY-MM-DD` (the `--top-*` and `--newer-than` rules query
@@ -219,7 +222,7 @@ MATCH (:Symbol {name: 'bytes::bytes::Bytes::copy_from_slice'})<-[:CALLS]-(f:Fn)<
 MATCH (f)-[:IS]->(caller:Symbol)
 RETURN v.name, v.version, caller.name
 
-// Latest versions with the most unsafe code (after count-unsafe)
+// Latest versions with the most unsafe code (after generate-metadata)
 MATCH (v:Version) WHERE v.latest AND v.unsafe_total > 0
 RETURN v.name, v.version, v.unsafe_total ORDER BY v.unsafe_total DESC LIMIT 20
 ```

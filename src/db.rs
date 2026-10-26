@@ -72,6 +72,102 @@ pub struct CrateDbStatus {
     pub exported: std::collections::HashSet<String>,
 }
 
+/// A crate version with the done-markers `generate-metadata` jobs left on it, as returned by
+/// [`Db::metadata_work_list`]. A marker is the revision of the job that last wrote the version.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetaState {
+    pub name: String,
+    pub version: String,
+    pub latest: bool,
+    /// `unsafe_scanner`: the `unsafe` job's marker.
+    pub unsafe_scanner: Option<String>,
+    /// The last `unsafe` scan failed (`unsafe_error` is set).
+    pub unsafe_error: bool,
+    /// `meta_build`.
+    pub meta_build: Option<String>,
+    /// `meta_native`.
+    pub meta_native: Option<String>,
+    /// `meta_diff`.
+    pub meta_diff: Option<String>,
+    /// `diff_base`: the version the stored diff was computed against.
+    pub diff_base: Option<String>,
+    /// `meta_registry`: the `registry` job's marker (revision and dump timestamp).
+    pub meta_registry: Option<String>,
+}
+
+/// A crates.io user, as the `registry` job writes it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegistryUser {
+    pub id: u32,
+    pub login: String,
+    pub name: String,
+    /// GitHub user id; -1 if unknown.
+    pub gh_id: i64,
+    /// RFC 3339, or empty.
+    pub created_at: String,
+}
+
+/// A crates.io team (`github:org:team`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegistryTeam {
+    pub id: u32,
+    pub login: String,
+    pub name: String,
+    pub avatar: String,
+}
+
+/// A crates.io category.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegistryCategory {
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    pub path: String,
+    /// Crates in the category, per crates.io.
+    pub crates: i64,
+}
+
+/// Crate-level facts for [`Db::set_registry_crates`]. Dates are RFC 3339; empty strings are
+/// absent values.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegistryCrate {
+    pub name: String,
+    pub id: u32,
+    pub created_at: String,
+    pub updated_at: String,
+    pub description: String,
+    pub homepage: String,
+    pub documentation: String,
+    pub repository: String,
+    pub downloads: i64,
+    pub trustpub_only: bool,
+    pub default_version: String,
+    pub num_versions: i64,
+    /// `(user id, since, added by login)`.
+    pub user_owners: Vec<(u32, String, String)>,
+    /// `(team id, since, added by login)`.
+    pub team_owners: Vec<(u32, String, String)>,
+    /// `(user id, first upload, last upload, versions uploaded)`.
+    pub publishers: Vec<(u32, String, String, i64)>,
+    /// Category slugs.
+    pub categories: Vec<String>,
+    pub keywords: Vec<String>,
+}
+
+/// Version-level facts for [`Db::set_registry_versions`]; `record` is `None` when the dump
+/// does not know the version.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegistryVersion {
+    pub name: String,
+    pub version: String,
+    pub record: Option<crate::metadata::registry::VersionRecord>,
+}
+
+/// A count as a Neo4j integer, saturating.
+fn int(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
 /// Attempts made for one write before giving up on a transient error.
 const WRITE_RETRIES: u32 = 6;
 
@@ -252,7 +348,7 @@ impl Db {
                     .user(username.as_ref())
                     .password(password.as_ref())
                     .db("neo4j")
-                    // Rows per PULL. Small results are unaffected; `unsafe_work_list` streams
+                    // Rows per PULL. Small results are unaffected; `metadata_work_list` streams
                     // millions of rows and would take one round trip per 10 of them otherwise.
                     .fetch_size(1_000)
                     .max_connections(64)
@@ -802,22 +898,16 @@ impl Db {
             .is_some())
     }
 
-    /// Versions to scan for unsafe code: every `(Version)` reachable from its `(Crate)`,
-    /// restricted to `only` (crate names) when non-empty and to `latest` versions when
-    /// `latest_only`. Unless `rescan`, versions that already carry results are skipped, except
-    /// those whose last scan failed (`unsafe_error`), so a rerun resumes and retries failures.
+    /// Every crate version with the done-markers the `generate-metadata` jobs left on it, for
+    /// [`crate::metadata::generate_metadata`] to decide what is pending. Restricted to the crates
+    /// in `only` when non-empty. Versions are reached through their `(Crate)`: a bare
+    /// `(v:Version)` scan cannot use the name constraint index.
     ///
     /// # Panics
     /// Panics if the server returns a row without the requested columns.
     /// # Errors
     /// This function will return an `painter::db::Error` in the event of a database error.
-    pub async fn unsafe_work_list(
-        &self,
-        only: &[String],
-        latest_only: bool,
-        rescan: bool,
-    ) -> Result<Vec<(String, String)>, Error> {
-        // The crate seek uses the name constraint index; a bare `(v:Version)` scan does not.
+    pub async fn metadata_work_list(&self, only: &[String]) -> Result<Vec<MetaState>, Error> {
         let start = if only.is_empty() {
             "MATCH (c:Crate)-[:VERSION_OF]->(v:Version)"
         } else {
@@ -828,56 +918,65 @@ impl Db {
             .execute(
                 query(&format!(
                     "{start}
-                     WHERE (NOT $latest_only OR v.latest = true)
-                       AND ($rescan OR v.unsafe_scanner IS NULL OR v.unsafe_error IS NOT NULL)
-                     RETURN c.name AS name, v.version AS version"
+                     RETURN c.name AS name, v.version AS version, coalesce(v.latest, false) AS latest,
+                            coalesce(v.unsafe_scanner, '') AS unsafe_scanner,
+                            v.unsafe_error IS NOT NULL AS unsafe_error,
+                            coalesce(v.meta_build, '') AS meta_build,
+                            coalesce(v.meta_native, '') AS meta_native,
+                            coalesce(v.meta_diff, '') AS meta_diff,
+                            coalesce(v.diff_base, '') AS diff_base,
+                            coalesce(v.meta_registry, '') AS meta_registry"
                 ))
-                .param("only", only.to_vec())
-                .param("latest_only", latest_only)
-                .param("rescan", rescan),
+                .param("only", only.to_vec()),
             )
             .await?;
         let mut out = Vec::new();
+        let opt = |s: String| (!s.is_empty()).then_some(s);
         while let Some(row) = stream.next().await? {
-            out.push((
-                row.get::<String>("name").unwrap(),
-                row.get::<String>("version").unwrap(),
-            ));
+            out.push(MetaState {
+                name: row.get("name").unwrap(),
+                version: row.get("version").unwrap(),
+                latest: row.get("latest").unwrap(),
+                unsafe_scanner: opt(row.get("unsafe_scanner").unwrap()),
+                unsafe_error: row.get("unsafe_error").unwrap(),
+                meta_build: opt(row.get("meta_build").unwrap()),
+                meta_native: opt(row.get("meta_native").unwrap()),
+                meta_diff: opt(row.get("meta_diff").unwrap()),
+                diff_base: opt(row.get("diff_base").unwrap()),
+                meta_registry: opt(row.get("meta_registry").unwrap()),
+            });
         }
         Ok(out)
     }
 
-    /// Store unsafe-code scan results on their `(Version)` nodes, all of `outcomes` in one
-    /// transaction per kind. A scanned version gets, from [`crate::unsafety::UnsafeMetrics`]:
-    ///
-    /// - `unsafe_total` and `unsafe_{functions,exprs,impls,traits,methods}` /
-    ///   `safe_{functions,exprs,impls,traits,methods}`: geiger's counters (zero is stored too)
-    /// - `rs_files`, `rs_files_failed`, `rs_lines`, `rs_bytes`, `rs_forbid_files`
-    /// - `forbids_unsafe` (absent when no crate root file was parsed), `has_build_script`
-    /// - `unsafe_scanner` ([`crate::unsafety::SCANNER`]) and `unsafe_scanned_at`
-    ///
-    /// and loses any earlier `unsafe_error`. A version that could not be scanned gets
-    /// `unsafe_error`, `unsafe_scanner`, and `unsafe_scanned_at`, and loses any earlier counts.
+    /// Upsert `unsafe` job results (see [`crate::metadata::unsafety`]), all of `results` in one
+    /// transaction per kind. A scanned version gets `unsafe_total`,
+    /// `unsafe_{functions,exprs,impls,traits,methods}`, `safe_{...}`, `rs_files`,
+    /// `rs_files_failed`, `rs_lines`, `rs_bytes`, `rs_forbid_files`, `forbids_unsafe` (absent
+    /// when no crate root file parsed), and its done-marker `unsafe_scanner` plus
+    /// `unsafe_scanned_at`, and loses any `unsafe_error`. A version that could not be read gets
+    /// `unsafe_error` instead and loses its counts. Every property is `SET`, so rewriting a
+    /// version replaces it.
     ///
     /// # Errors
     /// This function will return an `painter::db::Error` in the event of a database error.
     #[allow(clippy::too_many_lines)]
     pub async fn set_unsafe_batch(
         &self,
-        outcomes: &[crate::unsafety::ScanOutcome],
+        results: &[(
+            &str,
+            &str,
+            &Result<crate::metadata::unsafety::UnsafeMetrics, String>,
+        )],
     ) -> Result<(), Error> {
-        use crate::unsafety::SCANNER;
-        fn n(v: u64) -> i64 {
-            i64::try_from(v).unwrap_or(i64::MAX)
-        }
-
-        let ok: Vec<(&str, &str, &crate::unsafety::UnsafeMetrics)> = outcomes
+        use crate::metadata::unsafety::{SCANNER, UnsafeMetrics};
+        let ok: Vec<(&str, &str, &UnsafeMetrics)> = results
             .iter()
-            .filter_map(|o| Some((o.name.as_str(), o.version.as_str(), o.result.as_ref().ok()?)))
+            .filter_map(|(n, v, r)| Some((*n, *v, r.as_ref().ok()?)))
             .collect();
         if !ok.is_empty() {
-            let col = |f: &dyn Fn(&crate::unsafety::UnsafeMetrics) -> i64| -> Vec<i64> {
-                ok.iter().map(|(_, _, m)| f(m)).collect()
+            let col = |f: &dyn Fn(&UnsafeMetrics) -> u64| -> Vec<i64> {
+                ok.iter().map(|(_, _, m)| int(f(m))).collect()
             };
             self.write(
                 query(
@@ -900,55 +999,46 @@ impl Db {
                          v.rs_bytes = $rs_bytes[i],
                          v.rs_forbid_files = $rs_forbid_files[i],
                          v.forbids_unsafe = CASE $forbids[i] WHEN 1 THEN true WHEN 0 THEN false ELSE null END,
-                         v.has_build_script = $has_build_script[i],
                          v.unsafe_scanner = $scanner,
                          v.unsafe_scanned_at = datetime()
                      REMOVE v.unsafe_error",
                 )
                 .param("names", ok.iter().map(|o| o.0).collect::<Vec<_>>())
                 .param("versions", ok.iter().map(|o| o.1).collect::<Vec<_>>())
-                .param("unsafe_total", col(&|m| n(m.total_unsafe())))
-                .param("unsafe_functions", col(&|m| n(m.counters.functions.unsafe_)))
-                .param("unsafe_exprs", col(&|m| n(m.counters.exprs.unsafe_)))
-                .param("unsafe_impls", col(&|m| n(m.counters.item_impls.unsafe_)))
-                .param("unsafe_traits", col(&|m| n(m.counters.item_traits.unsafe_)))
-                .param("unsafe_methods", col(&|m| n(m.counters.methods.unsafe_)))
-                .param("safe_functions", col(&|m| n(m.counters.functions.safe)))
-                .param("safe_exprs", col(&|m| n(m.counters.exprs.safe)))
-                .param("safe_impls", col(&|m| n(m.counters.item_impls.safe)))
-                .param("safe_traits", col(&|m| n(m.counters.item_traits.safe)))
-                .param("safe_methods", col(&|m| n(m.counters.methods.safe)))
-                .param("rs_files", col(&|m| n(m.rs_files)))
-                .param("rs_files_failed", col(&|m| n(m.rs_files_failed)))
-                .param("rs_lines", col(&|m| n(m.rs_lines)))
-                .param("rs_bytes", col(&|m| n(m.rs_bytes)))
-                .param("rs_forbid_files", col(&|m| n(m.rs_forbid_files)))
+                .param("unsafe_total", col(&UnsafeMetrics::total_unsafe))
+                .param("unsafe_functions", col(&|m| m.counters.functions.unsafe_))
+                .param("unsafe_exprs", col(&|m| m.counters.exprs.unsafe_))
+                .param("unsafe_impls", col(&|m| m.counters.item_impls.unsafe_))
+                .param("unsafe_traits", col(&|m| m.counters.item_traits.unsafe_))
+                .param("unsafe_methods", col(&|m| m.counters.methods.unsafe_))
+                .param("safe_functions", col(&|m| m.counters.functions.safe))
+                .param("safe_exprs", col(&|m| m.counters.exprs.safe))
+                .param("safe_impls", col(&|m| m.counters.item_impls.safe))
+                .param("safe_traits", col(&|m| m.counters.item_traits.safe))
+                .param("safe_methods", col(&|m| m.counters.methods.safe))
+                .param("rs_files", col(&|m| m.rs_files))
+                .param("rs_files_failed", col(&|m| m.rs_files_failed))
+                .param("rs_lines", col(&|m| m.rs_lines))
+                .param("rs_bytes", col(&|m| m.rs_bytes))
+                .param("rs_forbid_files", col(&|m| m.rs_forbid_files))
                 .param(
                     "forbids",
-                    col(&|m| match m.forbids_unsafe {
-                        Some(true) => 1,
-                        Some(false) => 0,
-                        None => -1,
-                    }),
-                )
-                .param(
-                    "has_build_script",
-                    ok.iter().map(|o| o.2.has_build_script).collect::<Vec<bool>>(),
+                    ok.iter()
+                        .map(|(_, _, m)| match m.forbids_unsafe {
+                            Some(true) => 1,
+                            Some(false) => 0,
+                            None => -1,
+                        })
+                        .collect::<Vec<i64>>(),
                 )
                 .param("scanner", SCANNER),
             )
             .await?;
         }
 
-        let failed: Vec<(&str, &str, &str)> = outcomes
+        let failed: Vec<(&str, &str, &str)> = results
             .iter()
-            .filter_map(|o| {
-                Some((
-                    o.name.as_str(),
-                    o.version.as_str(),
-                    o.result.as_ref().err()?.as_str(),
-                ))
-            })
+            .filter_map(|(n, v, r)| Some((*n, *v, r.as_ref().err()?.as_str())))
             .collect();
         if !failed.is_empty() {
             self.write(
@@ -962,7 +1052,7 @@ impl Db {
                             v.unsafe_traits, v.unsafe_methods, v.safe_functions, v.safe_exprs,
                             v.safe_impls, v.safe_traits, v.safe_methods, v.rs_files,
                             v.rs_files_failed, v.rs_lines, v.rs_bytes, v.rs_forbid_files,
-                            v.forbids_unsafe, v.has_build_script",
+                            v.forbids_unsafe",
                 )
                 .param("names", failed.iter().map(|o| o.0).collect::<Vec<_>>())
                 .param("versions", failed.iter().map(|o| o.1).collect::<Vec<_>>())
@@ -973,7 +1063,679 @@ impl Db {
         }
         Ok(())
     }
+
+    /// Upsert `build` job results ([`crate::metadata::build`]): `has_build_script`,
+    /// `build_script` (path), `build_script_lines`, `links`, and the done-marker `meta_build`.
+    /// Absent values are `SET` to null, which removes a stale property.
+    ///
+    /// # Errors
+    /// This function will return an `painter::db::Error` in the event of a database error.
+    pub async fn set_build_batch(
+        &self,
+        results: &[(&str, &str, &crate::metadata::build::BuildInfo)],
+    ) -> Result<(), Error> {
+        if results.is_empty() {
+            return Ok(());
+        }
+        self.write(
+            query(
+                "UNWIND range(0, size($names) - 1) AS i
+                 MATCH (v:Version { name: $names[i], version: $versions[i] })
+                 SET v.has_build_script = $has[i],
+                     v.build_script = nullIf($paths[i], ''),
+                     v.build_script_lines = CASE WHEN $lines[i] < 0 THEN null ELSE $lines[i] END,
+                     v.links = nullIf($links[i], ''),
+                     v.meta_build = $revision",
+            )
+            .param("names", results.iter().map(|r| r.0).collect::<Vec<_>>())
+            .param("versions", results.iter().map(|r| r.1).collect::<Vec<_>>())
+            .param(
+                "has",
+                results
+                    .iter()
+                    .map(|r| r.2.has_build_script)
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "paths",
+                results
+                    .iter()
+                    .map(|r| r.2.path.as_deref().unwrap_or(""))
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "lines",
+                results
+                    .iter()
+                    .map(|r| r.2.lines.map_or(-1, int))
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "links",
+                results
+                    .iter()
+                    .map(|r| r.2.links.as_deref().unwrap_or(""))
+                    .collect::<Vec<_>>(),
+            )
+            .param("revision", crate::metadata::build::REVISION),
+        )
+        .await
+    }
+
+    /// Upsert `native` job results ([`crate::metadata::native`]): `has_native_code`,
+    /// `vendored_native`, `native_source_files`, `native_header_files`, `native_source_lines`,
+    /// `native_lines`, `native_bytes`, `native_largest_bytes`, `native_vendor_dir_lines`,
+    /// `native_langs`, `native_dirs`, `native_prebuilt_files`, and the done-marker
+    /// `meta_native`.
+    ///
+    /// # Errors
+    /// This function will return an `painter::db::Error` in the event of a database error.
+    pub async fn set_native_batch(
+        &self,
+        results: &[(&str, &str, &crate::metadata::native::NativeInfo)],
+    ) -> Result<(), Error> {
+        use crate::metadata::native::NativeInfo;
+        if results.is_empty() {
+            return Ok(());
+        }
+        let col = |f: &dyn Fn(&NativeInfo) -> u64| -> Vec<i64> {
+            results.iter().map(|r| int(f(r.2))).collect()
+        };
+        self.write(
+            query(
+                "UNWIND range(0, size($names) - 1) AS i
+                 MATCH (v:Version { name: $names[i], version: $versions[i] })
+                 SET v.has_native_code = $has[i],
+                     v.vendored_native = $vendored[i],
+                     v.native_source_files = $source_files[i],
+                     v.native_header_files = $header_files[i],
+                     v.native_source_lines = $source_lines[i],
+                     v.native_lines = $total_lines[i],
+                     v.native_bytes = $bytes[i],
+                     v.native_largest_bytes = $largest[i],
+                     v.native_vendor_dir_lines = $vendor_lines[i],
+                     v.native_langs = $langs[i],
+                     v.native_dirs = $dirs[i],
+                     v.native_prebuilt_files = $prebuilt[i],
+                     v.meta_native = $revision",
+            )
+            .param("names", results.iter().map(|r| r.0).collect::<Vec<_>>())
+            .param("versions", results.iter().map(|r| r.1).collect::<Vec<_>>())
+            .param(
+                "has",
+                results
+                    .iter()
+                    .map(|r| r.2.has_native_code())
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "vendored",
+                results.iter().map(|r| r.2.vendored).collect::<Vec<_>>(),
+            )
+            .param("source_files", col(&|n| n.source_files))
+            .param("header_files", col(&|n| n.header_files))
+            .param("source_lines", col(&|n| n.source_lines))
+            .param("total_lines", col(&|n| n.total_lines))
+            .param("bytes", col(&|n| n.bytes))
+            .param("largest", col(&|n| n.largest_bytes))
+            .param("vendor_lines", col(&|n| n.vendor_dir_lines))
+            .param("prebuilt", col(&|n| n.prebuilt_files))
+            .param(
+                "langs",
+                results
+                    .iter()
+                    .map(|r| r.2.langs.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "dirs",
+                results.iter().map(|r| r.2.dirs.clone()).collect::<Vec<_>>(),
+            )
+            .param("revision", crate::metadata::native::REVISION),
+        )
+        .await
+    }
+
+    /// Upsert `diff` job results ([`crate::metadata::diff`]): `diff_base` (null for the first
+    /// version), totals `diff_files_added` / `_removed` / `_modified`, `diff_lines_added` /
+    /// `_removed`, `diff_files_total`, `diff_approximate`, the per-file parallel lists
+    /// `diff_paths`, `diff_status`, `diff_added`, `diff_removed`, `diff_binary` (index `i` of
+    /// each describes one changed file), and the done-marker `meta_diff`. The lists are
+    /// replaced wholesale, so rewriting never duplicates entries.
+    ///
+    /// # Errors
+    /// This function will return an `painter::db::Error` in the event of a database error.
+    #[allow(clippy::too_many_lines)]
+    pub async fn set_diff_batch(
+        &self,
+        results: &[(&str, &str, &crate::metadata::diff::DiffInfo)],
+    ) -> Result<(), Error> {
+        if results.is_empty() {
+            return Ok(());
+        }
+        let list = |f: &dyn Fn(&crate::metadata::diff::FileChange) -> i64| -> Vec<Vec<i64>> {
+            results
+                .iter()
+                .map(|r| r.2.files.iter().map(f).collect())
+                .collect()
+        };
+        self.write(
+            query(
+                "UNWIND range(0, size($names) - 1) AS i
+                 MATCH (v:Version { name: $names[i], version: $versions[i] })
+                 SET v.diff_base = nullIf($bases[i], ''),
+                     v.diff_files_added = $files_added[i],
+                     v.diff_files_removed = $files_removed[i],
+                     v.diff_files_modified = $files_modified[i],
+                     v.diff_lines_added = $lines_added[i],
+                     v.diff_lines_removed = $lines_removed[i],
+                     v.diff_files_total = $files_total[i],
+                     v.diff_approximate = $approximate[i],
+                     v.diff_paths = $paths[i],
+                     v.diff_status = $status[i],
+                     v.diff_added = $added[i],
+                     v.diff_removed = $removed[i],
+                     v.diff_binary = $binary[i],
+                     v.meta_diff = $revision",
+            )
+            .param("names", results.iter().map(|r| r.0).collect::<Vec<_>>())
+            .param("versions", results.iter().map(|r| r.1).collect::<Vec<_>>())
+            .param(
+                "bases",
+                results
+                    .iter()
+                    .map(|r| r.2.base.as_deref().unwrap_or(""))
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "files_added",
+                results
+                    .iter()
+                    .map(|r| int(r.2.files_added()))
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "files_removed",
+                results
+                    .iter()
+                    .map(|r| int(r.2.files_removed()))
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "files_modified",
+                results
+                    .iter()
+                    .map(|r| int(r.2.files_modified()))
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "lines_added",
+                results
+                    .iter()
+                    .map(|r| int(r.2.lines_added()))
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "lines_removed",
+                results
+                    .iter()
+                    .map(|r| int(r.2.lines_removed()))
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "files_total",
+                results
+                    .iter()
+                    .map(|r| int(r.2.files_total))
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "approximate",
+                results.iter().map(|r| r.2.approximate).collect::<Vec<_>>(),
+            )
+            .param(
+                "paths",
+                results
+                    .iter()
+                    .map(|r| r.2.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "status",
+                results
+                    .iter()
+                    .map(|r| {
+                        r.2.files
+                            .iter()
+                            .map(|f| f.status.as_str())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .param("added", list(&|f| int(f.added)))
+            .param("removed", list(&|f| int(f.removed)))
+            .param(
+                "binary",
+                results
+                    .iter()
+                    .map(|r| r.2.files.iter().map(|f| f.binary).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+            )
+            .param("revision", crate::metadata::diff::REVISION),
+        )
+        .await
+    }
+
+    /// Record whether a version's tarball could be read by `generate-metadata`: a non-empty
+    /// entry sets `meta_error` (the version's pending jobs stay pending and are retried by the
+    /// next run), an empty one removes it.
+    ///
+    /// # Errors
+    /// This function will return an `painter::db::Error` in the event of a database error.
+    pub async fn set_meta_error_batch(&self, results: &[(&str, &str, &str)]) -> Result<(), Error> {
+        if results.is_empty() {
+            return Ok(());
+        }
+        self.write(
+            query(
+                "UNWIND range(0, size($names) - 1) AS i
+                 MATCH (v:Version { name: $names[i], version: $versions[i] })
+                 SET v.meta_error = nullIf($errors[i], '')",
+            )
+            .param("names", results.iter().map(|r| r.0).collect::<Vec<_>>())
+            .param("versions", results.iter().map(|r| r.1).collect::<Vec<_>>())
+            .param("errors", results.iter().map(|r| r.2).collect::<Vec<_>>()),
+        )
+        .await
+    }
+
+    /// Create the `registry` job's constraints and indexes if missing (see
+    /// `docker/queries.md`): unique `User.id`, `Team.id`, `Category.slug`, `Keyword.name`, and
+    /// range indexes on `User.login`, `PUBLISHED.at`, `OWNS.since`, `Version.published_at`,
+    /// `Crate.created_at`, and `Crate.downloads`. New indexes populate in the background.
+    ///
+    /// # Errors
+    /// This function will return an `painter::db::Error` in the event of a database error.
+    pub async fn ensure_registry_schema(&self) -> Result<(), Error> {
+        for q in REGISTRY_SCHEMA_CYPHER {
+            self.write(query(q)).await?;
+        }
+        Ok(())
+    }
+
+    /// Upsert `(User {id})` nodes with `login`, `name`, `gh_id`, `created_at`.
+    ///
+    /// # Errors
+    /// This function will return an `painter::db::Error` in the event of a database error.
+    pub async fn upsert_registry_users(&self, users: &[&RegistryUser]) -> Result<(), Error> {
+        if users.is_empty() {
+            return Ok(());
+        }
+        self.write(
+            query(
+                "UNWIND range(0, size($ids) - 1) AS i
+                 MERGE (u:User { id: $ids[i] })
+                 SET u.login = $logins[i],
+                     u.name = nullIf($names[i], ''),
+                     u.gh_id = CASE WHEN $gh[i] < 0 THEN null ELSE $gh[i] END,
+                     u.created_at = CASE WHEN $created[i] = '' THEN null ELSE datetime($created[i]) END",
+            )
+            .param("ids", users.iter().map(|u| i64::from(u.id)).collect::<Vec<_>>())
+            .param("logins", users.iter().map(|u| u.login.as_str()).collect::<Vec<_>>())
+            .param("names", users.iter().map(|u| u.name.as_str()).collect::<Vec<_>>())
+            .param("gh", users.iter().map(|u| u.gh_id).collect::<Vec<_>>())
+            .param(
+                "created",
+                users.iter().map(|u| u.created_at.as_str()).collect::<Vec<_>>(),
+            ),
+        )
+        .await
+    }
+
+    /// Upsert `(Team {id})` nodes with `login`, `name`, `avatar`.
+    ///
+    /// # Errors
+    /// This function will return an `painter::db::Error` in the event of a database error.
+    pub async fn upsert_registry_teams(&self, teams: &[&RegistryTeam]) -> Result<(), Error> {
+        if teams.is_empty() {
+            return Ok(());
+        }
+        self.write(
+            query(
+                "UNWIND range(0, size($ids) - 1) AS i
+                 MERGE (t:Team { id: $ids[i] })
+                 SET t.login = $logins[i], t.name = nullIf($names[i], ''),
+                     t.avatar = nullIf($avatars[i], '')",
+            )
+            .param(
+                "ids",
+                teams.iter().map(|t| i64::from(t.id)).collect::<Vec<_>>(),
+            )
+            .param(
+                "logins",
+                teams.iter().map(|t| t.login.as_str()).collect::<Vec<_>>(),
+            )
+            .param(
+                "names",
+                teams.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            )
+            .param(
+                "avatars",
+                teams.iter().map(|t| t.avatar.as_str()).collect::<Vec<_>>(),
+            ),
+        )
+        .await
+    }
+
+    /// Upsert `(Category {slug})` nodes with `name`, `description`, `path`, `crates`.
+    ///
+    /// # Errors
+    /// This function will return an `painter::db::Error` in the event of a database error.
+    pub async fn upsert_registry_categories(
+        &self,
+        categories: &[&RegistryCategory],
+    ) -> Result<(), Error> {
+        if categories.is_empty() {
+            return Ok(());
+        }
+        self.write(
+            query(
+                "UNWIND range(0, size($slugs) - 1) AS i
+                 MERGE (c:Category { slug: $slugs[i] })
+                 SET c.name = $names[i], c.description = nullIf($descriptions[i], ''),
+                     c.path = $paths[i], c.crates = $crates[i]",
+            )
+            .param(
+                "slugs",
+                categories
+                    .iter()
+                    .map(|c| c.slug.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "names",
+                categories
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "descriptions",
+                categories
+                    .iter()
+                    .map(|c| c.description.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "paths",
+                categories
+                    .iter()
+                    .map(|c| c.path.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "crates",
+                categories.iter().map(|c| c.crates).collect::<Vec<_>>(),
+            ),
+        )
+        .await
+    }
+
+    /// Write crate-level registry facts: `Crate` properties, and replace the crate's incoming
+    /// `OWNS` and `PUBLISHED` and outgoing `IN_CATEGORY` and `HAS_KEYWORD` edges. Users, teams,
+    /// and categories must exist ([`Db::upsert_registry_users`] etc.); keywords are merged.
+    /// Crates without a `(Crate)` node are skipped.
+    ///
+    /// # Errors
+    /// This function will return an `painter::db::Error` in the event of a database error.
+    #[allow(clippy::too_many_lines)]
+    pub async fn set_registry_crates(&self, crates: &[RegistryCrate]) -> Result<(), Error> {
+        if crates.is_empty() {
+            return Ok(());
+        }
+        let col = |f: fn(&RegistryCrate) -> &str| crates.iter().map(f).collect::<Vec<_>>();
+        self.write(
+            query(
+                "UNWIND range(0, size($names) - 1) AS i
+                 MATCH (c:Crate { name: $names[i] })
+                 SET c.registry_id = $ids[i],
+                     c.created_at = CASE WHEN $created[i] = '' THEN null ELSE datetime($created[i]) END,
+                     c.updated_at = CASE WHEN $updated[i] = '' THEN null ELSE datetime($updated[i]) END,
+                     c.description = nullIf($descriptions[i], ''),
+                     c.homepage = nullIf($homepages[i], ''),
+                     c.documentation = nullIf($docs[i], ''),
+                     c.repository = nullIf($repos[i], ''),
+                     c.downloads = $downloads[i],
+                     c.trustpub_only = $trustpub[i],
+                     c.default_version = nullIf($defaults[i], ''),
+                     c.num_versions = $num_versions[i]
+                 WITH c, i
+                 CALL { WITH c MATCH (c)<-[r:OWNS|PUBLISHED]-() DELETE r }
+                 CALL { WITH c MATCH (c)-[r:IN_CATEGORY|HAS_KEYWORD]->() DELETE r }
+                 CALL { WITH c, i
+                     UNWIND range(0, size($uo_ids[i]) - 1) AS j
+                     MATCH (u:User { id: $uo_ids[i][j] })
+                     CREATE (u)-[:OWNS { since: datetime($uo_since[i][j]),
+                                         added_by: nullIf($uo_by[i][j], '') }]->(c) }
+                 CALL { WITH c, i
+                     UNWIND range(0, size($to_ids[i]) - 1) AS j
+                     MATCH (t:Team { id: $to_ids[i][j] })
+                     CREATE (t)-[:OWNS { since: datetime($to_since[i][j]),
+                                         added_by: nullIf($to_by[i][j], '') }]->(c) }
+                 CALL { WITH c, i
+                     UNWIND range(0, size($pub_ids[i]) - 1) AS j
+                     MATCH (u:User { id: $pub_ids[i][j] })
+                     CREATE (u)-[:PUBLISHED { at: datetime($pub_first[i][j]),
+                                              last: datetime($pub_last[i][j]),
+                                              versions: $pub_counts[i][j] }]->(c) }
+                 CALL { WITH c, i
+                     UNWIND $categories[i] AS slug
+                     MATCH (cat:Category { slug: slug })
+                     CREATE (c)-[:IN_CATEGORY]->(cat) }
+                 CALL { WITH c, i
+                     UNWIND $keywords[i] AS kw
+                     MERGE (k:Keyword { name: kw })
+                     CREATE (c)-[:HAS_KEYWORD]->(k) }",
+            )
+            .param("names", col(|c| &c.name))
+            .param("ids", crates.iter().map(|c| i64::from(c.id)).collect::<Vec<_>>())
+            .param("created", col(|c| &c.created_at))
+            .param("updated", col(|c| &c.updated_at))
+            .param("descriptions", col(|c| &c.description))
+            .param("homepages", col(|c| &c.homepage))
+            .param("docs", col(|c| &c.documentation))
+            .param("repos", col(|c| &c.repository))
+            .param("downloads", crates.iter().map(|c| c.downloads).collect::<Vec<_>>())
+            .param("trustpub", crates.iter().map(|c| c.trustpub_only).collect::<Vec<_>>())
+            .param("defaults", col(|c| &c.default_version))
+            .param(
+                "num_versions",
+                crates.iter().map(|c| c.num_versions).collect::<Vec<_>>(),
+            )
+            .param("uo_ids", owner_col(crates, false, |o| i64::from(o.0)))
+            .param("uo_since", owner_col(crates, false, |o| o.1.clone()))
+            .param("uo_by", owner_col(crates, false, |o| o.2.clone()))
+            .param("to_ids", owner_col(crates, true, |o| i64::from(o.0)))
+            .param("to_since", owner_col(crates, true, |o| o.1.clone()))
+            .param("to_by", owner_col(crates, true, |o| o.2.clone()))
+            .param(
+                "pub_ids",
+                crates
+                    .iter()
+                    .map(|c| c.publishers.iter().map(|p| i64::from(p.0)).collect())
+                    .collect::<Vec<Vec<i64>>>(),
+            )
+            .param(
+                "pub_first",
+                crates
+                    .iter()
+                    .map(|c| c.publishers.iter().map(|p| p.1.clone()).collect())
+                    .collect::<Vec<Vec<String>>>(),
+            )
+            .param(
+                "pub_last",
+                crates
+                    .iter()
+                    .map(|c| c.publishers.iter().map(|p| p.2.clone()).collect())
+                    .collect::<Vec<Vec<String>>>(),
+            )
+            .param(
+                "pub_counts",
+                crates
+                    .iter()
+                    .map(|c| c.publishers.iter().map(|p| p.3).collect())
+                    .collect::<Vec<Vec<i64>>>(),
+            )
+            .param(
+                "categories",
+                crates.iter().map(|c| c.categories.clone()).collect::<Vec<_>>(),
+            )
+            .param(
+                "keywords",
+                crates.iter().map(|c| c.keywords.clone()).collect::<Vec<_>>(),
+            ),
+        )
+        .await
+    }
+
+    /// Write version-level registry facts and the done-marker `meta_registry = marker`. A
+    /// version with a dump record gets `published_at`, `yanked`, `license`, `crate_size`,
+    /// `downloads`, `edition`, `rust_version`, `has_lib`, `bin_names`, and its uploader's
+    /// `(User)-[:PUBLISHED {at}]->(Version)` (replacing any other uploader's); one without gets
+    /// those removed and `registry_missing = true`.
+    ///
+    /// # Errors
+    /// This function will return an `painter::db::Error` in the event of a database error.
+    pub async fn set_registry_versions(
+        &self,
+        rows: &[RegistryVersion],
+        marker: &str,
+    ) -> Result<(), Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let rec = |r: &RegistryVersion| r.record.clone().unwrap_or_default();
+        self.write(
+            query(
+                "UNWIND range(0, size($names) - 1) AS i
+                 MATCH (v:Version { name: $names[i], version: $versions[i] })
+                 SET v.meta_registry = $marker,
+                     v.registry_missing = CASE WHEN $found[i] THEN null ELSE true END,
+                     v.published_at = CASE WHEN $at[i] = '' THEN null ELSE datetime($at[i]) END,
+                     v.yanked = CASE WHEN $found[i] THEN $yanked[i] ELSE null END,
+                     v.license = nullIf($licenses[i], ''),
+                     v.crate_size = CASE WHEN $sizes[i] < 0 THEN null ELSE $sizes[i] END,
+                     v.downloads = CASE WHEN $found[i] THEN $downloads[i] ELSE null END,
+                     v.edition = nullIf($editions[i], ''),
+                     v.rust_version = nullIf($rust_versions[i], ''),
+                     v.has_lib = CASE $has_lib[i] WHEN 1 THEN true WHEN 0 THEN false ELSE null END,
+                     v.bin_names = CASE WHEN size($bins[i]) = 0 THEN null ELSE $bins[i] END
+                 WITH v, i
+                 CALL { WITH v, i
+                     MATCH (v)<-[r:PUBLISHED]-(u:User) WHERE u.id <> $publishers[i] DELETE r }
+                 CALL { WITH v, i
+                     WITH v, i WHERE $publishers[i] >= 0 AND $at[i] <> ''
+                     MATCH (u:User { id: $publishers[i] })
+                     MERGE (u)-[p:PUBLISHED]->(v)
+                     SET p.at = datetime($at[i]) }",
+            )
+            .param("marker", marker)
+            .param(
+                "names",
+                rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            )
+            .param(
+                "versions",
+                rows.iter().map(|r| r.version.as_str()).collect::<Vec<_>>(),
+            )
+            .param(
+                "found",
+                rows.iter().map(|r| r.record.is_some()).collect::<Vec<_>>(),
+            )
+            .param(
+                "at",
+                rows.iter().map(|r| rec(r).created_at).collect::<Vec<_>>(),
+            )
+            .param(
+                "yanked",
+                rows.iter().map(|r| rec(r).yanked).collect::<Vec<_>>(),
+            )
+            .param(
+                "licenses",
+                rows.iter().map(|r| rec(r).license).collect::<Vec<_>>(),
+            )
+            .param(
+                "sizes",
+                rows.iter()
+                    .map(|r| rec(r).crate_size.unwrap_or(-1))
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "downloads",
+                rows.iter().map(|r| rec(r).downloads).collect::<Vec<_>>(),
+            )
+            .param(
+                "editions",
+                rows.iter().map(|r| rec(r).edition).collect::<Vec<_>>(),
+            )
+            .param(
+                "rust_versions",
+                rows.iter().map(|r| rec(r).rust_version).collect::<Vec<_>>(),
+            )
+            .param(
+                "has_lib",
+                rows.iter()
+                    .map(|r| rec(r).has_lib.map_or(-1_i64, i64::from))
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "bins",
+                rows.iter().map(|r| rec(r).bin_names).collect::<Vec<_>>(),
+            )
+            .param(
+                "publishers",
+                rows.iter()
+                    .map(|r| rec(r).published_by.map_or(-1, i64::from))
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .await
+    }
 }
+
+/// One owner column of [`Db::set_registry_crates`]: per crate, the user (or team) owners
+/// mapped through `f`.
+fn owner_col<T>(
+    crates: &[RegistryCrate],
+    teams: bool,
+    f: impl Fn(&(u32, String, String)) -> T,
+) -> Vec<Vec<T>> {
+    crates
+        .iter()
+        .map(|c| {
+            let owners = if teams {
+                &c.team_owners
+            } else {
+                &c.user_owners
+            };
+            owners.iter().map(&f).collect()
+        })
+        .collect()
+}
+
+/// Constraints and indexes of the `registry` job, run by [`Db::ensure_registry_schema`].
+pub const REGISTRY_SCHEMA_CYPHER: [&str; 10] = [
+    "CREATE CONSTRAINT const_user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE",
+    "CREATE CONSTRAINT const_team_id IF NOT EXISTS FOR (t:Team) REQUIRE t.id IS UNIQUE",
+    "CREATE CONSTRAINT const_category_slug IF NOT EXISTS FOR (c:Category) REQUIRE c.slug IS UNIQUE",
+    "CREATE CONSTRAINT const_keyword_name IF NOT EXISTS FOR (k:Keyword) REQUIRE k.name IS UNIQUE",
+    "CREATE INDEX idx_user_login IF NOT EXISTS FOR (u:User) ON (u.login)",
+    "CREATE INDEX idx_published_at IF NOT EXISTS FOR ()-[p:PUBLISHED]-() ON (p.at)",
+    "CREATE INDEX idx_owns_since IF NOT EXISTS FOR ()-[o:OWNS]-() ON (o.since)",
+    "CREATE INDEX idx_version_published_at IF NOT EXISTS FOR (v:Version) ON (v.published_at)",
+    "CREATE INDEX idx_crate_created_at IF NOT EXISTS FOR (c:Crate) ON (c.created_at)",
+    "CREATE INDEX idx_crate_downloads IF NOT EXISTS FOR (c:Crate) ON (c.downloads)",
+];
 
 #[cfg(test)]
 mod tests {

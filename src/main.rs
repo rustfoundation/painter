@@ -1,13 +1,12 @@
 #![deny(clippy::all, clippy::pedantic)]
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, builder::TypedValueParser as _};
 use libpainter::{
     Error, Roots, analysis, check, compile,
     db::Db,
     ecosystems::EcosystemsClient,
-    index, migrate,
+    index, metadata, migrate,
     rules::{BuildEverything, BuildRules, EcosystemsRules, NamedCrates},
-    unsafety,
 };
 use rayon::prelude::*;
 use std::{
@@ -123,14 +122,36 @@ struct DbArgs {
     host: String,
     #[arg(short = 'u')]
     username: String,
-    #[arg(short = 'p')]
-    password: String,
+    /// Password (also `$NEO4J_PASSWORD`). Prefer `--password-file`, which keeps it out of the
+    /// process list and `docker inspect`.
+    #[arg(short = 'p', env = "NEO4J_PASSWORD", hide_env_values = true)]
+    password: Option<String>,
+    /// Read the password from this file (also `$NEO4J_PASSWORD_FILE`); a trailing newline is
+    /// ignored.
+    #[arg(
+        long,
+        value_name = "FILE",
+        env = "NEO4J_PASSWORD_FILE",
+        conflicts_with = "password"
+    )]
+    password_file: Option<PathBuf>,
 }
 
 impl DbArgs {
+    fn password(&self) -> Result<String, Error> {
+        match (&self.password, &self.password_file) {
+            (Some(p), _) => Ok(p.clone()),
+            (None, Some(f)) => Ok(std::fs::read_to_string(f)?
+                .trim_end_matches(['\r', '\n'])
+                .to_string()),
+            (None, None) => Err(Error::MissingPassword),
+        }
+    }
+
     async fn connect(self) -> Result<Arc<Db>, Error> {
+        let password = self.password()?;
         Ok(Arc::new(
-            Db::connect(self.host, self.username, self.password).await?,
+            Db::connect(self.host, self.username, password).await?,
         ))
     }
 }
@@ -191,6 +212,10 @@ enum Command {
         /// Crate names to import.
         #[arg(value_name = "CRATE", required = true)]
         names: Vec<String>,
+        /// Also load registry facts (publishers, owners, dates, downloads, ...) for these crates
+        /// from this extracted crates.io database dump (the `registry` metadata job).
+        #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
+        cratesio_dump: Option<PathBuf>,
     },
     /// Stream the whole database into `neo4j-admin database import` CSV files, converting the
     /// old `INVOKES` call edges to the `HAS_FN`/`CALLS`/`Symbol` schema. Only reads the database.
@@ -222,6 +247,10 @@ enum Command {
         /// Import only these crates (repeatable); default is the whole index.
         #[arg(long = "only", value_name = "CRATE")]
         only: Vec<String>,
+        /// Afterwards load registry facts (publishers, owners, dates, downloads, ...) from this
+        /// extracted crates.io database dump (the `registry` metadata job).
+        #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
+        cratesio_dump: Option<PathBuf>,
     },
     /// Report versions present in the index but missing from the database.
     UpdateDb {
@@ -233,27 +262,45 @@ enum Command {
         #[command(flatten)]
         db: DbArgs,
     },
-    /// Count unsafe code in every crate version straight from its `.crate` tarball (geiger's
-    /// counters, as `count-unsafe` reports them) and store the results on the `Version` nodes.
-    /// Resumes: versions already scanned are skipped unless `--rescan`.
-    CountUnsafe {
+    /// Compute per-version metadata straight from the `.crate` tarballs and upsert it on the
+    /// `Version` nodes: unsafe-code counts (`unsafe`), build scripts (`build`), vendored
+    /// C/C++ (`native`), and per-file line changes against the previous version (`diff`);
+    /// plus, from a crates.io database dump, publishers, owners, dates, and downloads
+    /// (`registry`, needs `--cratesio-dump`).
+    /// Resumes: each job skips versions it already wrote unless `--rescan`.
+    GenerateMetadata {
         /// Root directory containing the compressed `.crate` files.
         #[arg(short = 'c', value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
         compressed_root: PathBuf,
         #[command(flatten)]
         db: DbArgs,
-        /// Scan threads (default: a quarter of the CPUs).
+        /// Worker threads (default: a quarter of the CPUs).
         #[arg(short = 'j', long)]
-        jobs: Option<usize>,
+        threads: Option<usize>,
+        /// Run only these jobs (repeatable or comma-separated, e.g. `--job diff` to populate one
+        /// new job in isolation). Versions are only read when a selected job is pending for them.
+        /// Default: all.
+        #[arg(
+            long = "job",
+            value_name = "JOB",
+            value_delimiter = ',',
+            value_parser = clap::builder::PossibleValuesParser::new(metadata::Job::ALL.map(metadata::Job::name))
+                .map(|s| s.parse::<metadata::Job>().expect("listed as a possible value")),
+        )]
+        jobs: Vec<metadata::Job>,
         /// Only these crates (repeatable).
         #[arg(long, value_name = "CRATE")]
         only: Vec<String>,
         /// Only versions flagged `latest`.
         #[arg(long)]
         latest_only: bool,
-        /// Scan versions that already have results too.
+        /// Rerun the selected jobs where they are already current.
         #[arg(long)]
         rescan: bool,
+        /// Extracted crates.io database dump (`db-dump.tar.gz` from static.crates.io) for the
+        /// `registry` job; without it that job is skipped.
+        #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
+        cratesio_dump: Option<PathBuf>,
     },
 }
 
@@ -266,8 +313,16 @@ async fn main() -> Result<(), Error> {
     log::trace!("{args:?}");
 
     match args.command {
-        Command::CreateFreshDb { db, only } => {
-            index::create_fresh_db(db.connect().await?, &only).await?;
+        Command::CreateFreshDb {
+            db,
+            only,
+            cratesio_dump,
+        } => {
+            let db = db.connect().await?;
+            index::create_fresh_db(db.clone(), &only).await?;
+            if let Some(dump) = cratesio_dump {
+                metadata::import_registry(db, dump, only).await?;
+            }
         }
         Command::UpdateDb { db } => {
             index::update_missing_versions(db.connect().await?).await?;
@@ -275,8 +330,16 @@ async fn main() -> Result<(), Error> {
         Command::SetLatestVersions { db } => {
             index::set_latest_versions(db.connect().await?).await?;
         }
-        Command::ImportCrates { db, names } => {
-            index::import_crates(&names, db.connect().await?).await?;
+        Command::ImportCrates {
+            db,
+            names,
+            cratesio_dump,
+        } => {
+            let db = db.connect().await?;
+            index::import_crates(&names, db.clone()).await?;
+            if let Some(dump) = cratesio_dump {
+                metadata::import_registry(db, dump, names).await?;
+            }
         }
         Command::Compile {
             crate_fullname,
@@ -338,30 +401,35 @@ async fn main() -> Result<(), Error> {
                 println!("{name}-{version}");
             }
         }
-        Command::CountUnsafe {
+        Command::GenerateMetadata {
             compressed_root,
             db,
+            threads,
             jobs,
             only,
             latest_only,
             rescan,
+            cratesio_dump,
         } => {
-            let opts = unsafety::ScanOptions {
+            let opts = metadata::Options {
+                cratesio_dump,
+                threads,
                 jobs,
                 only,
                 latest_only,
                 rescan,
-                ..unsafety::ScanOptions::default()
+                ..metadata::Options::default()
             };
-            unsafety::count_unsafe(compressed_root, db.connect().await?, opts).await?;
+            metadata::generate_metadata(compressed_root, db.connect().await?, opts).await?;
         }
         Command::ExportForImport {
             db,
             out,
             import_dir,
         } => {
+            let password = db.password()?;
             let summary =
-                migrate::export_for_import(&db.host, &db.username, &db.password, &out).await?;
+                migrate::export_for_import(&db.host, &db.username, &password, &out).await?;
             println!("{summary:#?}");
             println!(
                 "\nneo4j-admin database import full neo4j --overwrite-destination \\\n    --multiline-fields=true --skip-bad-relationships=false \\\n    {}",
@@ -459,6 +527,73 @@ mod tests {
 
         let zero = [&["compile-all", "-j", "0"][..], &ROOTS].concat();
         assert!(Args::try_parse_from(std::iter::once("painter").chain(zero)).is_err());
+    }
+
+    #[test]
+    fn generate_metadata_job_flag() {
+        let jobs = |extra: &[&str]| {
+            let args = parse(&[&["generate-metadata", "-c", "/crates"][..], &DB, extra].concat());
+            let Command::GenerateMetadata { jobs, .. } = args.command else {
+                panic!("wrong command")
+            };
+            jobs
+        };
+        assert_eq!(jobs(&[]), vec![]);
+        assert_eq!(jobs(&["--job", "diff"]), vec![metadata::Job::Diff]);
+        assert_eq!(
+            jobs(&["--job", "build,native", "--job", "unsafe"]),
+            vec![
+                metadata::Job::Build,
+                metadata::Job::Native,
+                metadata::Job::Unsafe
+            ]
+        );
+        let bad = [
+            &["generate-metadata", "-c", "/crates", "--job", "nope"][..],
+            &DB,
+        ]
+        .concat();
+        let err = Args::try_parse_from(std::iter::once("painter").chain(bad)).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn db_password_from_flag_or_file() {
+        let args = parse(&[&["set-latest-versions"][..], &DB].concat());
+        let Command::SetLatestVersions { db } = args.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(db.password().unwrap(), "pw");
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "s3cret\n").unwrap();
+        let file = tmp.path().to_str().unwrap();
+        let args = parse(&[
+            "set-latest-versions",
+            "-d",
+            "bolt://x",
+            "-u",
+            "neo4j",
+            "--password-file",
+            file,
+        ]);
+        let Command::SetLatestVersions { db } = args.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(db.password().unwrap(), "s3cret", "trailing newline dropped");
+
+        let both = [
+            "set-latest-versions",
+            "-d",
+            "x",
+            "-u",
+            "u",
+            "-p",
+            "a",
+            "--password-file",
+            file,
+        ];
+        assert!(Args::try_parse_from(std::iter::once("painter").chain(both)).is_err());
     }
 
     #[test]

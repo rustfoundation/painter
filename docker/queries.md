@@ -10,12 +10,35 @@ CREATE TEXT INDEX idx_symbol_name_text IF NOT EXISTS FOR (n:Symbol) ON (n.name);
 CREATE INDEX idx_is_latest IF NOT EXISTS FOR (n:Version) ON (n.latest);
 CREATE INDEX idx_unsafe_total IF NOT EXISTS FOR (n:Version) ON (n.unsafe_total);
 CREATE TEXT INDEX idx_crate_name_text IF NOT EXISTS FOR (n:Crate) ON (n.name);
+CREATE INDEX idx_has_build_script IF NOT EXISTS FOR (n:Version) ON (n.has_build_script);
+CREATE INDEX idx_version_links IF NOT EXISTS FOR (n:Version) ON (n.links);
+CREATE INDEX idx_has_native_code IF NOT EXISTS FOR (n:Version) ON (n.has_native_code);
+CREATE INDEX idx_vendored_native IF NOT EXISTS FOR (n:Version) ON (n.vendored_native);
+CREATE INDEX idx_diff_lines_added IF NOT EXISTS FOR (n:Version) ON (n.diff_lines_added);
+CREATE CONSTRAINT const_user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE;
+CREATE CONSTRAINT const_team_id IF NOT EXISTS FOR (t:Team) REQUIRE t.id IS UNIQUE;
+CREATE CONSTRAINT const_category_slug IF NOT EXISTS FOR (c:Category) REQUIRE c.slug IS UNIQUE;
+CREATE CONSTRAINT const_keyword_name IF NOT EXISTS FOR (k:Keyword) REQUIRE k.name IS UNIQUE;
+CREATE INDEX idx_user_login IF NOT EXISTS FOR (u:User) ON (u.login);
+CREATE INDEX idx_published_at IF NOT EXISTS FOR ()-[p:PUBLISHED]-() ON (p.at);
+CREATE INDEX idx_owns_since IF NOT EXISTS FOR ()-[o:OWNS]-() ON (o.since);
+CREATE INDEX idx_version_published_at IF NOT EXISTS FOR (v:Version) ON (v.published_at);
+CREATE INDEX idx_crate_created_at IF NOT EXISTS FOR (c:Crate) ON (c.created_at);
+CREATE INDEX idx_crate_downloads IF NOT EXISTS FOR (c:Crate) ON (c.downloads);
 ```
 
 - `const_symbol_name`: required by painter's export (`MERGE` on `Symbol.name` under
   concurrency) and serves every function lookup below and the UI Callers view.
 - `idx_symbol_name_text`: `CONTAINS` / `ENDS WITH` searches on function names.
 - `idx_crate_name_text`: UI partial-name search.
+- `idx_has_build_script`, `idx_version_links`, `idx_has_native_code`, `idx_vendored_native`,
+  `idx_diff_lines_added`: the UI Build scripts / Native code / Diffs views (`generate-metadata`
+  properties): leaderboards seek `has_build_script = true`, `links = $x` / `links IS NOT NULL`,
+  `has_native_code = true`, and sort by `diff_lines_added` without scanning every version.
+  Each populated in seconds on 3.2M versions (2026-10-26).
+- `const_user_id` ... `idx_crate_downloads`: the `registry` metadata job (`db::REGISTRY_SCHEMA_CYPHER`,
+  which creates them itself). `idx_user_login` serves "crates published by user" and
+  `idx_published_at` (a relationship range index) "crates published in a timeframe".
 - Map build adds `crate_lod_x`, `crate_lod_community`, `Crate.lod_*`, `LOD_DEP` (see `render/README.md`).
 
 Enterprise only:
@@ -226,18 +249,114 @@ RETURN DISTINCT c1.name, c2.name, c3.name
 
 Each row is one chain, nearest caller first; `null` = chain ends.
 
-# Unsafe
+# Version metadata
 
-Needs `painter count-unsafe`, which stores on each `Version`:
+`painter generate-metadata` stores these on each `Version`. Each job also leaves a done-marker
+(its revision): `unsafe_scanner` (e.g. `geiger 0.5.0`), `meta_build`, `meta_native`,
+`meta_diff`. `meta_error` is set while a version's tarball cannot be read.
+
+**unsafe**
 
 - `unsafe_total`, `unsafe_{functions,exprs,impls,traits,methods}`, `safe_{...}`: geiger's
   counters over every `.rs` file in the `.crate` (tests included), zero when none.
 - `rs_files` (parsed), `rs_files_failed` (not UTF-8, unparsable, or over 64 MB), `rs_lines`,
   `rs_bytes`, `rs_forbid_files` (files with `#![forbid(unsafe_code)]`).
 - `forbids_unsafe`: the crate root (`[lib] path`, else `src/lib.rs`, else `src/main.rs`) forbids
-  unsafe; absent when no root file parsed. `has_build_script`.
-- `unsafe_scanner` (e.g. `geiger 0.5.0`), `unsafe_scanned_at`; `unsafe_error` instead of counts
-  when the tarball was missing or unreadable.
+  unsafe; absent when no root file parsed.
+- `unsafe_scanned_at`; `unsafe_error` instead of counts when the tarball was missing or
+  unreadable.
+
+**build**
+
+- `has_build_script`: Cargo would run a build script (`package.build`, else `build.rs` at the
+  root). `build_script` (its path), `build_script_lines`, `links` (`package.links`).
+
+**native**
+
+- `has_native_code`: any C, C++, Objective-C, or assembly source or header.
+- `vendored_native`: enough of it to be a vendored library rather than a binding shim: at least
+  1,000 non-blank lines in native sources, or 5,000 in sources and headers together, or 200
+  under a vendoring directory (`vendor/`, `third_party/`, `deps/`, `external/`, `contrib/`, ...).
+- `native_source_files`, `native_header_files`, `native_source_lines`, `native_lines` (sources
+  and headers, non-blank), `native_bytes`, `native_largest_bytes`, `native_vendor_dir_lines`,
+  `native_langs` (`c`, `c++`, `objc`, `asm`), `native_dirs` (top-level directories holding native
+  files), `native_prebuilt_files` (`.a`, `.lib`, `.so`, `.dll`, `.dylib`, `.o`, `.obj`).
+
+**diff** (against the previous version in semver order; the first version against nothing)
+
+- `diff_base` (that version; absent for the first), `diff_files_total`,
+  `diff_files_added` / `_removed` / `_modified`, `diff_lines_added` / `_removed`,
+  `diff_approximate` (a file's diff hit the 2 s bound and is approximate).
+- Per changed file, as parallel lists (index `i` of each is one file): `diff_paths`,
+  `diff_status` (`added`, `removed`, `modified`), `diff_added`, `diff_removed` (lines),
+  `diff_binary` (binary or over 64 MB: changed, no line counts).
+
+### Metadata coverage
+
+```cypher
+MATCH (v:Version)
+RETURN count(v) AS versions, count(v.unsafe_scanner) AS unsafe, count(v.meta_build) AS build,
+       count(v.meta_native) AS native, count(v.meta_diff) AS diff, count(v.meta_error) AS unreadable
+```
+
+### Latest versions that vendor native code
+
+```cypher
+MATCH (v:Version)
+WHERE v.latest AND v.vendored_native
+RETURN v.name, v.version, v.native_langs, v.native_source_lines, v.native_dirs, v.links
+ORDER BY v.native_source_lines DESC LIMIT 50
+```
+
+### What changed in one version
+
+```cypher
+MATCH (:Crate {name: 'serde'})-[:VERSION_OF]->(v:Version {version: '1.0.229'})
+UNWIND range(0, size(v.diff_paths) - 1) AS i
+RETURN v.diff_base, v.diff_paths[i] AS file, v.diff_status[i] AS status,
+       v.diff_added[i] AS added, v.diff_removed[i] AS removed
+ORDER BY added + removed DESC
+```
+
+### Most-linked native libraries (`package.links`)
+
+```cypher
+MATCH (v:Version) WHERE v.links IS NOT NULL AND v.latest
+RETURN v.links, count(DISTINCT v.name) AS crates, collect(DISTINCT v.name)[0..5] AS sample
+ORDER BY crates DESC LIMIT 25
+```
+
+### Biggest version-to-version changes
+
+Excludes first versions (everything counts as added there).
+
+```cypher
+MATCH (v:Version)
+WHERE v.latest AND v.diff_base IS NOT NULL
+RETURN v.name, v.version, v.diff_base, v.diff_lines_added, v.diff_lines_removed,
+       v.diff_files_added + v.diff_files_removed + v.diff_files_modified AS files_changed
+ORDER BY v.diff_lines_added + v.diff_lines_removed DESC LIMIT 50
+```
+
+### Change history of one crate
+
+```cypher
+MATCH (:Crate {name: 'serde'})-[:VERSION_OF]->(v:Version)
+RETURN v.version, v.diff_base, v.diff_lines_added, v.diff_lines_removed, v.diff_files_total
+ORDER BY v.semver_major, v.semver_minor, v.semver_patch, coalesce(v.semver_pre, '') = '', v.version
+```
+
+### Releases that newly add a build script
+
+```cypher
+MATCH (v:Version)
+WHERE v.latest AND v.has_build_script AND 'build.rs' IN v.diff_paths
+WITH v, [i IN range(0, size(v.diff_paths) - 1) WHERE v.diff_paths[i] = 'build.rs'][0] AS i
+WHERE v.diff_status[i] = 'added'
+RETURN v.name, v.version, v.diff_base
+```
+
+# Unsafe
 
 ### Scan coverage
 
@@ -300,6 +419,69 @@ MATCH (v)-[:DEPENDS_ON]->(:Crate)-[:VERSION_OF]->(dv:Version)
 WHERE dv.latest AND dv.unsafe_total > 0
 RETURN dv.name, dv.version, dv.unsafe_total
 ORDER BY dv.unsafe_total DESC
+```
+
+# Registry (publishers, owners, dates)
+
+`painter generate-metadata --job registry --cratesio-dump DIR` (or `create-fresh-db` /
+`import-crates --cratesio-dump DIR`) loads an extracted crates.io database dump
+(`https://static.crates.io/db-dump.tar.gz`):
+
+- `(User {id, login, name, gh_id, created_at})`, `(Team {id, login, name, avatar})`
+- `(User)-[:PUBLISHED {at}]->(Version)`: the uploader. crates.io only records it since
+  2019-02-22, and trusted-publishing uploads (since 2025-07, ~18% of uploads by 2026-09) have no
+  user, so `Version.published_at` is the complete date and per-user counts undercount CI publishing
+- `(User)-[:PUBLISHED {at, last, versions}]->(Crate)`: first and last upload, upload count
+- `(User|Team)-[:OWNS {since, added_by}]->(Crate)`: current owners; `added_by` is a login
+- `(Crate)-[:IN_CATEGORY]->(Category {slug, name, description, path, crates})`,
+  `(Crate)-[:HAS_KEYWORD]->(Keyword {name})`
+- `Version`: `published_at`, `yanked`, `license`, `crate_size`, `downloads`, `edition`,
+  `rust_version`, `has_lib`, `bin_names`, marker `meta_registry` (`registry-1@<dump timestamp>`),
+  `registry_missing` when the dump lacks the version
+- `Crate`: `created_at`, `updated_at`, `description`, `homepage`, `documentation`,
+  `repository`, `downloads`, `trustpub_only`, `default_version`, `num_versions`, `registry_id`
+
+Dates are `DateTime`s; compare against `datetime('2025-01-01')`.
+
+### Crates published by a user
+
+```cypher
+MATCH (u:User {login: 'dtolnay'})-[p:PUBLISHED]->(c:Crate)
+RETURN c.name, p.at AS first, p.last, p.versions ORDER BY p.versions DESC
+```
+
+### Crates first published in a timeframe
+
+```cypher
+MATCH (u:User)-[p:PUBLISHED]->(c:Crate)
+WHERE p.at >= datetime('2025-01-01') AND p.at < datetime('2025-02-01')
+RETURN c.name, u.login, p.at ORDER BY p.at
+```
+
+`p.at` is the user's first upload of the crate; for the crate's own first release use
+`c.created_at` (`idx_crate_created_at`).
+
+### Versions published in a timeframe
+
+```cypher
+MATCH (u:User)-[p:PUBLISHED]->(v:Version)
+WHERE p.at >= datetime('2026-09-01') AND p.at < datetime('2026-09-02')
+RETURN v.name, v.version, u.login, p.at ORDER BY p.at
+```
+
+### Who owns a crate
+
+```cypher
+MATCH (o)-[r:OWNS]->(:Crate {name: 'tokio'})
+RETURN labels(o)[0] AS kind, o.login, r.since, r.added_by
+```
+
+### Owners who never published the crate
+
+```cypher
+MATCH (u:User)-[:OWNS]->(c:Crate {name: 'tokio'})
+WHERE NOT (u)-[:PUBLISHED]->(c)
+RETURN u.login
 ```
 
 # Cleanup
