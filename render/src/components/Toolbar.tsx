@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, isTableView, VIEWS, type CrateLoadOptions, type View } from '../api';
+import { useIsMobile } from '../touch';
 
 interface Props {
   view: View;
@@ -28,6 +29,14 @@ export function Toolbar(props: Props) {
   const MIN_PARTIAL = 3;
   const { options, onOptionsChange, onLoad, loadedName, onClear, onFit, layout, onLayoutChange, busy } = props;
   const [query, setQuery] = useState('');
+  const isMobile = useIsMobile();
+  const [optsOpen, setOptsOpen] = useState(false);
+  const activeTab = useRef<HTMLButtonElement>(null);
+
+  // On a phone the view buttons are a scrolling strip; keep the current one visible.
+  useEffect(() => {
+    activeTab.current?.scrollIntoView({ block: 'nearest', inline: 'center' });
+  }, [view]);
 
   useEffect(() => {
     if (loadedName) setQuery(loadedName);
@@ -71,6 +80,7 @@ export function Toolbar(props: Props) {
         {VIEWS.map((v) => (
           <button
             key={v.id}
+            ref={v.id === view ? activeTab : undefined}
             type="button"
             className={v.id === view ? 'active' : ''}
             title={v.title}
@@ -115,7 +125,8 @@ export function Toolbar(props: Props) {
             }
           }}
           spellCheck={false}
-          autoFocus
+          // Focusing on load pops the on-screen keyboard over the page.
+          autoFocus={!isMobile}
         />
         {open && suggestions.length > 0 && (
           <ul className="suggestions">
@@ -138,6 +149,14 @@ export function Toolbar(props: Props) {
       </>
       )}
 
+      {!isTableView(view) && (
+        <button type="button" className={`opts-toggle${optsOpen ? ' active' : ''}`} aria-expanded={optsOpen} onClick={() => setOptsOpen((o) => !o)}>
+          Options
+        </button>
+      )}
+
+      {/* `display: contents` on desktop, a collapsible row on phones. */}
+      <div className={`toolbar-opts${optsOpen ? ' open' : ''}`}>
       {view === 'map' && (
         <label className="opt" title="Maximum clusters or crates drawn for one viewport">
           max visible
@@ -232,6 +251,7 @@ export function Toolbar(props: Props) {
       </button>
       </>
       )}
+      </div>
     </div>
   );
 }

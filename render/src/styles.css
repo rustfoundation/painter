@@ -35,6 +35,8 @@ body,
   display: flex;
   flex-direction: column;
   height: 100vh;
+  /* Mobile browser chrome shrinks the visible area below 100vh. */
+  height: 100dvh;
 }
 
 .toolbar {
@@ -193,6 +195,8 @@ label.opt {
   position: relative;
   flex: 1;
   min-width: 0;
+  /* Touch gestures go to useTouchZoomPan instead of scrolling or zooming the page. */
+  touch-action: none;
   background: radial-gradient(circle at 50% 50%, #151924 0%, var(--bg) 70%);
 }
 
@@ -1226,4 +1230,168 @@ table.diff-files-table td.path {
 
 .tile a:hover {
   text-decoration: underline;
+}
+
+.toolbar-opts {
+  display: contents;
+}
+
+.opts-toggle,
+.sheet-close {
+  display: none;
+}
+
+/* Phones. Keep the width in sync with MOBILE_QUERY in touch.ts. */
+@media (max-width: 768px) {
+  .toolbar {
+    gap: 6px;
+    padding: 6px 8px;
+  }
+
+  .toolbar > .views {
+    order: -1;
+    width: 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .toolbar > .views::-webkit-scrollbar {
+    display: none;
+  }
+
+  .views button {
+    flex: 0 0 auto;
+    padding: 8px 12px;
+  }
+
+  .search {
+    flex: 1;
+    min-width: 0;
+  }
+
+  /* iOS zooms the page when focusing an input below 16px. */
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+
+  .opts-toggle {
+    display: inline-block;
+  }
+
+  .opts-toggle.active {
+    background: var(--panel-2);
+    border-color: var(--accent);
+  }
+
+  .toolbar-opts {
+    display: none;
+  }
+
+  .toolbar-opts.open {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    width: 100%;
+  }
+
+  .toolbar-opts .spacer {
+    display: none;
+  }
+
+  .main {
+    position: relative;
+  }
+
+  .empty,
+  .callers-empty {
+    padding: 0 16px;
+  }
+
+  /* Details become a bottom sheet over the canvas, shown only for a selection. */
+  .sidebar {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 2;
+    width: auto;
+    max-height: 55%;
+    border-left: 0;
+    border-top: 1px solid var(--border);
+    border-radius: 10px 10px 0 0;
+    box-shadow: 0 -6px 20px rgb(0 0 0 / 45%);
+  }
+
+  .sidebar:not(.has-selection) {
+    display: none;
+  }
+
+  .sheet-close {
+    display: block;
+    position: sticky;
+    top: 6px;
+    float: right;
+    margin: 6px 8px 0 0;
+    padding: 2px 10px;
+    font-size: 18px;
+    line-height: 1.2;
+    z-index: 1;
+  }
+
+  .cypher {
+    display: none;
+  }
+
+  /* Only the connection dot and errors; the rest does not fit. */
+  .statusbar > :not(.dot):not(.error) {
+    display: none;
+  }
+
+  .statusbar .error {
+    max-width: none;
+    flex: 1;
+  }
+
+  /* Table views scroll as a whole page so wrapped tiles do not squeeze the table to nothing. */
+  .callers,
+  .unsafe {
+    overflow-y: auto;
+  }
+
+  .callers-table,
+  .unsafe-table {
+    flex: none;
+    min-height: auto;
+    overflow: visible;
+    overflow-x: auto;
+  }
+
+  .unsafe-tiles,
+  .unsafe-controls,
+  .callers-form,
+  .callers-summary {
+    padding: 8px;
+  }
+
+  .tile,
+  .tile.wide {
+    min-width: 0;
+    flex: 1 1 140px;
+  }
+
+  .callers-form .search.crate,
+  .callers-form .search.fn,
+  .unsafe-controls .search,
+  .unsafe-controls input.q {
+    min-width: 0;
+    flex: 1 1 100%;
+  }
+
+  .unsafe-history,
+  .diff-files {
+    min-width: 0;
+  }
 }
