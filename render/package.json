@@ -10,6 +10,7 @@
     "dev:web": "vite",
     "build": "tsc --noEmit && vite build",
     "start": "node server/index.mjs",
+    "start:jobs": "PORT=8081 node server/jobs/index.mjs",
     "typecheck": "tsc --noEmit",
     "lod:build": "node server/lod/cli.mjs build",
     "lod:update": "node server/lod/cli.mjs update",

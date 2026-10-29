@@ -19,6 +19,7 @@ COPY server ./server
 COPY --from=build /app/dist ./dist
 EXPOSE 8080
 USER node
+# Shell form so $PORT expands: the jobs service (CMD node server/jobs/index.mjs) answers the same path.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD wget -qO- http://127.0.0.1:8080/api/health > /dev/null || exit 1
+  CMD wget -qO- "http://127.0.0.1:${PORT}/api/health" > /dev/null || exit 1
 CMD ["node", "server/index.mjs"]

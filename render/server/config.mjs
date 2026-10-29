@@ -39,6 +39,17 @@ export const config = {
     // Positions every N iterations, so a crash can be resumed.
     checkpointPath: env('RENDER_LOD_CHECKPOINT', '/tmp/painter-lod-checkpoint.json'),
   },
+  // Base URL of the jobs service (server/jobs/index.mjs). When set, render never runs a LOD worker or a stats
+  // refresh itself: POST /api/lod/* and /api/stats/refresh are forwarded there, so the graph has one writer.
+  jobsUrl: env('RENDER_JOBS_URL', '').replace(/\/+$/, ''),
+  jobs: {
+    // Dashboard totals (Stats nodes) are recomputed this often; 0 disables the timer (manual refresh only).
+    statsIntervalMs: int('JOBS_STATS_INTERVAL_MS', 15 * 60_000),
+    // Per-payload limit: unsafe:all is ~95 s on a cold local database and slower under import load.
+    queryTimeoutMs: int('JOBS_QUERY_TIMEOUT_MS', 600_000),
+    // The cheap Map update (place crates imported since the last build); 0 = only on request.
+    lodUpdateIntervalMs: int('JOBS_LOD_UPDATE_INTERVAL_MS', 0),
+  },
 };
 
 export const describeConfig = () => ({
@@ -55,4 +66,6 @@ export const describeConfig = () => ({
   depsMaxEdges: config.depsMaxEdges,
   depsDefaultEdges: config.depsDefaultEdges,
   lod: { iterations: config.lod.iterations, budget: config.lod.budget, maxLevel: config.lod.maxLevel },
+  jobsUrl: config.jobsUrl || null,
+  jobs: config.jobs,
 });

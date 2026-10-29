@@ -23,6 +23,9 @@ pub enum Error {
     MissingColumn(&'static str),
 }
 
+/// Derived nodes the rebuild drops on purpose: the render jobs service recomputes them on its timer.
+const DROPPED_LABELS: &[&str] = &["Stats"];
+
 const NODE_PROPERTIES: &[(&str, &[&str])] = &[
     (
         "Crate",
@@ -171,6 +174,11 @@ async fn check_schema(graph: &Graph) -> Result<(), Error> {
     while let Some(row) = rows.next().await? {
         let labels = need_strs(&row, "nodeLabels")?;
         let prop = row.get::<String>("propertyName");
+        if let [label] = labels.as_slice()
+            && DROPPED_LABELS.contains(&label.as_str())
+        {
+            continue;
+        }
         let known = match labels.as_slice() {
             [label] => NODE_PROPERTIES
                 .iter()

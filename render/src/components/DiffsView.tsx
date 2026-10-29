@@ -234,6 +234,7 @@ export function DiffsView({ busy, onBusy, onError, onOpenCrate }: Props) {
       <div className="unsafe-tiles">
         <CoverageTile
           scope={scope}
+          stats={stats}
           scanned={stats?.scanned}
           versions={stats?.versions}
           title="Versions the diff job has compared with their predecessor (meta_diff), out of all versions in scope"

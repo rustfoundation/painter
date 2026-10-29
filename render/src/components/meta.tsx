@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { ApiError, type UnsafeScope } from '../api';
+import { ApiError, type StatsMeta, type UnsafeScope } from '../api';
 
 export const fmt = (n: number | null | undefined) => (n === null || n === undefined ? '—' : n.toLocaleString());
 export const pct = (part: number | null | undefined, whole: number | null | undefined) =>
@@ -18,6 +18,25 @@ export const fmtDateTime = (iso: string | null | undefined) => {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
 };
+export const fmtAgo = (iso: string) => {
+  const ms = Date.now() - Date.parse(iso);
+  if (!Number.isFinite(ms) || ms < 0) return fmtDateTime(iso);
+  const m = Math.round(ms / 60_000);
+  if (m < 1) return 'just now';
+  if (m < 90) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  if (h < 36) return `${h} h ago`;
+  return `${Math.round(h / 24)} d ago`;
+};
+
+/** "totals computed 5 min ago" for a precomputed payload, or that they were aggregated on request. */
+export const freshness = (s: StatsMeta | null | undefined) => {
+  if (!s) return null;
+  if (s.computedAt) return `totals computed ${fmtAgo(s.computedAt)}`;
+  if (s.source === 'live') return `totals computed live (no jobs service)${s.elapsedMs ? ` in ${s.elapsedMs.toLocaleString()} ms` : ''}`;
+  return null;
+};
+
 export const fmtCompact = (n: number | null | undefined) => {
   if (n === null || n === undefined) return '—';
   if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
@@ -87,9 +106,10 @@ export function RowsSelect({ value, onChange }: { value: number; onChange: (n: n
   );
 }
 
-export function CoverageTile({ scope, scanned, versions, note, title }: { scope: UnsafeScope; scanned?: number; versions?: number; note?: ReactNode; title: string }) {
+export function CoverageTile({ scope, scanned, versions, note, title, stats }: { scope: UnsafeScope; scanned?: number; versions?: number; note?: ReactNode; title: string; stats?: StatsMeta | null }) {
+  const fresh = freshness(stats);
   return (
-    <div className="tile wide" title={title}>
+    <div className="tile wide" title={fresh ? `${title}. ${fresh}` : title}>
       <div className="tile-label">scan coverage · {scope === 'latest' ? 'latest versions' : 'all versions'}</div>
       <div className="tile-value">
         {pct(scanned, versions)} <span className="muted small">{fmt(scanned)} of {fmt(versions)}</span>
@@ -98,6 +118,7 @@ export function CoverageTile({ scope, scanned, versions, note, title }: { scope:
         <span style={{ width: scanned !== undefined && versions ? `${(100 * scanned) / Math.max(1, versions)}%` : 0 }} />
       </div>
       {note && <div className="muted small">{note}</div>}
+      {fresh && <div className="muted small">{fresh}</div>}
     </div>
   );
 }

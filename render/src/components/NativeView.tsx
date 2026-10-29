@@ -148,6 +148,7 @@ export function NativeView({ busy, onBusy, onError, onOpenCrate }: Props) {
       <div className="unsafe-tiles">
         <CoverageTile
           scope={scope}
+          stats={stats}
           scanned={stats?.scanned}
           versions={stats?.versions}
           title="Versions the native job has scanned (meta_native), out of all versions in scope"

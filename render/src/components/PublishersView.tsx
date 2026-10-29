@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, type PublisherCrate, type PublisherLeaderboards, type PublisherProfile, type RegistryStats, type UserHit } from '../api';
 import { NativeFlags } from './BuildView';
-import { copyTsv, errorMessage, fmt, fmtCompact, fmtDate, HistoryStrip, pct, SortHeaders, Tile, UserLink, useSort, type Column, type HistoryBar } from './meta';
+import { copyTsv, errorMessage, fmt, fmtCompact, fmtDate, freshness, HistoryStrip, pct, SortHeaders, Tile, UserLink, useSort, type Column, type HistoryBar } from './meta';
 
 interface Props {
   busy: boolean;
@@ -440,6 +440,7 @@ export function PublishersView({ busy, onBusy, onError, onOpenCrate, onOpenUser,
               <div className="muted small">
                 {fmt(stats?.cratesInRegistry)} of {fmt(stats?.crates)} crates · {fmt(stats?.versionsMissing)} versions not in the dump · {fmt(stats?.versionUploads)} uploads with a recorded uploader
               </div>
+              {freshness(stats) && <div className="muted small">{freshness(stats)}</div>}
             </div>
             <Tile label="users" value={fmt(stats?.users)} note="referenced as owner or uploader" color={COLOR_USER} />
             <Tile label="teams" value={fmt(stats?.teams)} note="GitHub teams owning crates" color={COLOR_TEAM} />
