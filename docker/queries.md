@@ -35,6 +35,8 @@ CREATE INDEX idx_crate_downloads IF NOT EXISTS FOR (c:Crate) ON (c.downloads);
 - `const_user_id` ... `idx_crate_downloads`: created by the `registry` job itself
   (`db::REGISTRY_SCHEMA_CYPHER`). `idx_published_at` is a relationship range index.
 - The Map build adds its own `Crate.lod_*` indexes and `LOD_DEP` (see `render/README.md`).
+- The render jobs service creates `const_stats_id` on `(:Stats {id})`, the dashboard totals it
+  precomputes (JSON `payload`, `computed_at`); `MATCH (s:Stats) DETACH DELETE s` is always safe.
 
 Enterprise only:
 

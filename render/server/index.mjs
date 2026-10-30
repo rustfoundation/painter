@@ -42,17 +42,15 @@ import {
 } from './registry.mjs';
 import { createLodJobs } from './lod/jobs.mjs';
 import { LodIndex } from './lod/index.mjs';
+import { createDriver, waitForNeo4j } from './db.mjs';
+import { STATS_IDS, overviewStats, readStats, readStatsAges } from './stats.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const distDir = path.resolve(here, '..', 'dist');
 
 const log = (...args) => console.log(new Date().toISOString(), ...args);
 
-const driver = neo4j.driver(config.neo4j.uri, neo4j.auth.basic(config.neo4j.user, config.neo4j.password), {
-  maxConnectionPoolSize: 16,
-  connectionAcquisitionTimeout: 10_000,
-  disableLosslessIntegers: false,
-});
+const driver = createDriver(config);
 
 const clampLimit = (value, fallback) => {
   const n = Number.parseInt(value ?? '', 10);
@@ -79,25 +77,6 @@ const readGraph = async (cypher, params = {}, { timeoutMs = config.neo4j.queryTi
   }
 };
 
-const waitForNeo4j = async () => {
-  let attempt = 0;
-  for (;;) {
-    attempt += 1;
-    try {
-      const info = await driver.getServerInfo({ database: config.neo4j.database });
-      log(`connected to ${config.neo4j.uri} (${info.agent}, protocol ${info.protocolVersion})`);
-      return;
-    } catch (err) {
-      const retriesLeft = config.neo4j.connectRetries === 0 ? 'unlimited' : config.neo4j.connectRetries - attempt;
-      log(`neo4j not reachable at ${config.neo4j.uri} (attempt ${attempt}, retries left: ${retriesLeft}): ${err.message}`);
-      if (config.neo4j.connectRetries !== 0 && attempt >= config.neo4j.connectRetries) {
-        throw err;
-      }
-      await new Promise((r) => setTimeout(r, config.neo4j.connectRetryDelayMs));
-    }
-  }
-};
-
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '256kb' }));
@@ -121,19 +100,54 @@ api.get(
   }),
 );
 
+// Whole-graph totals live on `Stats` nodes written by the jobs service (server/jobs/index.mjs); a route only
+// runs the aggregate itself when no node exists yet (fresh database, jobs service not deployed).
+const readRowsPlain = (cypher, params) => readGraph(cypher, params).then((g) => g.rows);
+const precomputedStats = (id) => readStats(readRowsPlain, id).catch((err) => {
+  log(`stats ${id}: precomputed read failed, computing live: ${err.message}`);
+  return null;
+});
+
+// Forwards a control request to the jobs service; null when none is configured.
+const jobsRequest = async (method, pathname, body) => {
+  if (!config.jobsUrl) return null;
+  const response = await fetch(`${config.jobsUrl}${pathname}`, {
+    method,
+    headers: body ? { 'content-type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(15_000),
+  });
+  const payload = await response.json().catch(() => ({}));
+  return { status: response.status, payload };
+};
+
+const forwardToJobs = (method, pathname) =>
+  wrap(async (req, res) => {
+    const r = await jobsRequest(method, pathname, method === 'POST' ? req.body ?? {} : undefined);
+    if (!r) return res.status(503).json({ error: 'no jobs service configured (RENDER_JOBS_URL); run server/jobs/index.mjs or call it directly', ids: STATS_IDS });
+    res.status(r.status).json(r.payload);
+  });
+
 api.get(
   '/stats',
   wrap(async (_req, res) => {
-    const g = await readGraph(
-      `CALL { MATCH (c:Crate) RETURN count(c) AS crates }
-       CALL { MATCH (v:Version) RETURN count(v) AS versions }
-       CALL { MATCH ()-[r:DEPENDS_ON]->() RETURN count(r) AS dependsOn }
-       CALL { MATCH ()-[r:CALLS]->() RETURN count(r) AS invokes }
-       RETURN crates, versions, dependsOn, invokes`,
-    );
-    res.json(g.rows[0] ?? {});
+    const stored = await precomputedStats('overview');
+    if (stored) return res.json(stored);
+    const started = Date.now();
+    res.json({ ...(await overviewStats(readRowsPlain)), elapsedMs: Date.now() - started, computedAt: null, source: 'live' });
   }),
 );
+
+api.get(
+  '/stats/status',
+  wrap(async (_req, res) => {
+    const stored = await readStatsAges(readRowsPlain);
+    const jobs = await jobsRequest('GET', '/api/stats/status').catch((err) => ({ status: 503, payload: { error: err.message } }));
+    res.json({ ids: STATS_IDS, stored, jobsUrl: config.jobsUrl || null, jobs: jobs?.payload ?? null });
+  }),
+);
+
+api.post('/stats/refresh', forwardToJobs('POST', '/api/stats/refresh'));
 
 // A TEXT index on Crate.name (docker/queries.md) makes CONTAINS fast; without it this is a label scan.
 const searchCrates = async (q, limit) =>
@@ -642,7 +656,7 @@ const nonNegInt = (v, fallback = 0) => {
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 };
 
-/** Stats aggregate every version in scope (seconds for `all`), so cache them. */
+/** Live fallback when no `Stats` node exists: aggregates every version in scope (seconds for `all`), so cache it. */
 const unsafeStatsCache = new Map();
 const UNSAFE_STATS_TTL_MS = 60_000;
 
@@ -650,10 +664,12 @@ api.get(
   '/unsafe/stats',
   wrap(async (req, res) => {
     const scope = unsafeScope(req.query.scope);
+    const stored = await precomputedStats(`unsafe:${scope}`);
+    if (stored) return res.json({ ...stored, cached: true });
     const hit = unsafeStatsCache.get(scope);
     if (hit && Date.now() - hit.at < UNSAFE_STATS_TTL_MS) return res.json({ ...hit.value, cached: true });
     const started = Date.now();
-    const value = { ...(await unsafeStats(readRowsSlow, scope)), elapsedMs: Date.now() - started };
+    const value = { ...(await unsafeStats(readRowsSlow, scope)), elapsedMs: Date.now() - started, computedAt: null, source: 'live' };
     unsafeStatsCache.set(scope, { at: Date.now(), value });
     res.json({ ...value, cached: false });
   }),
@@ -713,10 +729,12 @@ const cachedStats = (key, fn) =>
   wrap(async (req, res) => {
     const scope = unsafeScope(req.query.scope);
     const cacheKey = `${key}:${scope}`;
+    const stored = await precomputedStats(cacheKey);
+    if (stored) return res.json({ ...stored, cached: true });
     const hit = metaStatsCache.get(cacheKey);
     if (hit && Date.now() - hit.at < META_STATS_TTL_MS) return res.json({ ...hit.value, cached: true });
     const started = Date.now();
-    const value = { ...(await fn(readRowsSlow, scope)), elapsedMs: Date.now() - started };
+    const value = { ...(await fn(readRowsSlow, scope)), elapsedMs: Date.now() - started, computedAt: null, source: 'live' };
     metaStatsCache.set(cacheKey, { at: Date.now(), value });
     res.json({ ...value, cached: false });
   });
@@ -848,11 +866,16 @@ api.get(
 const REGISTRY_CACHE_TTL_MS = 10 * 60_000;
 const registryCache = new Map();
 
-const cachedRegistry = async (key, fn) => {
+// `statsId` names the precomputed payload (stats.mjs) to prefer; the live path is the fallback.
+const cachedRegistry = async (key, fn, statsId = null) => {
+  if (statsId) {
+    const stored = await precomputedStats(statsId);
+    if (stored) return { ...stored, cached: true };
+  }
   const hit = registryCache.get(key);
   if (hit && Date.now() - hit.at < REGISTRY_CACHE_TTL_MS) return { ...hit.value, cached: true };
   const started = Date.now();
-  const value = { ...(await fn(readRowsSlow)), elapsedMs: Date.now() - started };
+  const value = { ...(await fn(readRowsSlow)), elapsedMs: Date.now() - started, computedAt: null, source: 'live' };
   registryCache.set(key, { at: Date.now(), value });
   return { ...value, cached: false };
 };
@@ -860,7 +883,7 @@ const cachedRegistry = async (key, fn) => {
 api.get(
   '/registry/stats',
   wrap(async (_req, res) => {
-    res.json(await cachedRegistry('stats', registryStats));
+    res.json(await cachedRegistry('stats', registryStats, 'registry'));
   }),
 );
 
@@ -887,7 +910,7 @@ api.get(
 api.get(
   '/publishers/leaderboards',
   wrap(async (_req, res) => {
-    res.json(await cachedRegistry('leaderboards', (read) => publisherLeaderboards(read, 100)));
+    res.json(await cachedRegistry('leaderboards', (read) => publisherLeaderboards(read, 100), 'leaderboards'));
   }),
 );
 
@@ -1046,12 +1069,17 @@ api.get(
     // A build run elsewhere (CLI, another instance) changes built_at.
     const dbBuiltAt = meta?.built_at ? String(meta.built_at) : null;
     const idxBuiltAt = lodIndex?.meta?.built_at ? String(lodIndex.meta.built_at) : null;
-    if (!lodLoading && !lodJobs.status().running && ((lodIndex && dbBuiltAt !== idxBuiltAt) || (!lodIndex && dbBuiltAt))) {
+    // With a jobs service the worker runs there; its status is what the UI's Rebuild/Update buttons reflect.
+    const remote = await jobsRequest('GET', '/api/lod/status').catch((err) => ({ status: 503, payload: { error: err.message } }));
+    const jobStatus = remote && remote.status === 200 ? remote.payload : lodJobs.status();
+    if (!lodLoading && !jobStatus.running && ((lodIndex && dbBuiltAt !== idxBuiltAt) || (!lodIndex && dbBuiltAt))) {
       log(`lod index: build changed (${idxBuiltAt} -> ${dbBuiltAt}), reloading`);
       loadLodIndex().catch(() => undefined);
     }
     res.json({
-      ...lodJobs.status(),
+      ...jobStatus,
+      jobsUrl: config.jobsUrl || null,
+      jobsError: remote && remote.status !== 200 ? remote.payload?.error ?? `jobs service returned ${remote.status}` : null,
       meta,
       unpositionedCrates: unpositioned,
       index: lodIndex ? lodIndex.status() : null,
@@ -1065,6 +1093,8 @@ api.get(
 api.post(
   '/lod/rebuild',
   wrap(async (req, res) => {
+    const remote = await jobsRequest('POST', '/api/lod/rebuild', req.body ?? {});
+    if (remote) return res.status(remote.status).json(remote.payload);
     const iterations = Number.parseInt(req.body?.iterations ?? '', 10);
     res.status(202).json(
       lodJobs.rebuild({
@@ -1078,7 +1108,9 @@ api.post(
 
 api.post(
   '/lod/update',
-  wrap(async (_req, res) => {
+  wrap(async (req, res) => {
+    const remote = await jobsRequest('POST', '/api/lod/update', req.body ?? {});
+    if (remote) return res.status(remote.status).json(remote.payload);
     res.status(202).json(lodJobs.update());
   }),
 );
@@ -1157,11 +1189,12 @@ const server = app.listen(config.port, config.host, () => {
 });
 
 // The compose stack may start the database slower than this container; /api/health reports the real state.
-waitForNeo4j()
+waitForNeo4j(driver, config, log)
   .then(() => {
+    if (config.jobsUrl) return log(`stats: served from Stats nodes, refreshes forwarded to ${config.jobsUrl}`);
     // Label scan of every version (tens of seconds under import load): warm the cache for the first Publishers visit.
-    cachedRegistry('stats', registryStats)
-      .then((s) => log(`registry stats warmed in ${s.elapsedMs} ms`))
+    cachedRegistry('stats', registryStats, 'registry')
+      .then((s) => log(`registry stats ${s.source === 'precomputed' ? 'precomputed at ' + s.computedAt : 'warmed in ' + s.elapsedMs + ' ms'}`))
       .catch((err) => log(`registry stats warm-up failed: ${err.message}`));
   })
   .catch((err) => {

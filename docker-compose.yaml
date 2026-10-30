@@ -44,6 +44,26 @@ services:
       - NEO4J_PASSWORD=changeme123
       - NEO4J_DATABASE=neo4j
       - RENDER_ALLOW_CYPHER=true
+      - RENDER_JOBS_URL=http://jobs:8080
+    depends_on:
+      - neo4j
+
+  # Background jobs (render/server/jobs/index.mjs, same image as render): refreshes the dashboard
+  # totals (Stats nodes) every JOBS_STATS_INTERVAL_MS and runs Map rebuilds, so render only reads.
+  # Control API on 127.0.0.1:8081 for scripts: POST /api/stats/refresh, /api/lod/rebuild, GET /api/status.
+  jobs:
+    build: ./render
+    command: ["node", "server/jobs/index.mjs"]
+    restart: unless-stopped
+    ports:
+      - 127.0.0.1:8081:8080
+    environment:
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=changeme123
+      - NEO4J_DATABASE=neo4j
+      - JOBS_STATS_INTERVAL_MS=900000
+      - JOBS_LOD_UPDATE_INTERVAL_MS=0
     depends_on:
       - neo4j
 

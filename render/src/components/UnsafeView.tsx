@@ -1,4 +1,5 @@
 import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
+import { freshness } from './meta';
 import {
   api,
   ApiError,
@@ -298,6 +299,7 @@ export function UnsafeView({ busy, onBusy, onError, onOpenCrate }: Props) {
           <div className="muted small">
             {fmt(stats?.unreadable)} unreadable · {fmt(stats?.files)} files · {fmt(stats?.lines)} lines
           </div>
+          {freshness(stats) && <div className="muted small">{freshness(stats)}</div>}
         </div>
         <div className="tile" title="Scanned versions with at least one unsafe item">
           <div className="tile-label">with any unsafe</div>

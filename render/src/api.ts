@@ -183,7 +183,15 @@ export interface UnsafeRow {
   share: number;
 }
 
-export interface UnsafeStats {
+/** Where a dashboard total came from: a `Stats` node the jobs service wrote (`computedAt`), or a live aggregate. */
+export interface StatsMeta {
+  computedAt?: string | null;
+  source?: 'precomputed' | 'live';
+  elapsedMs?: number;
+  cached?: boolean;
+}
+
+export interface UnsafeStats extends StatsMeta {
   scope: UnsafeScope;
   versions: number;
   scanned: number;
@@ -283,7 +291,7 @@ export interface LinksRow {
   sample: string[];
 }
 
-export interface BuildStats {
+export interface BuildStats extends StatsMeta {
   scope: UnsafeScope;
   versions: number;
   scanned: number;
@@ -341,7 +349,7 @@ export interface NativeRow {
 
 export type NativeSort = 'lines' | 'sourceLines' | 'files' | 'bytes' | 'largest' | 'vendorDirLines' | 'prebuilt' | 'name';
 
-export interface NativeStats {
+export interface NativeStats extends StatsMeta {
   scope: UnsafeScope;
   versions: number;
   scanned: number;
@@ -412,7 +420,7 @@ export interface DiffVersion extends DiffRow {
   files: DiffFile[] | null;
 }
 
-export interface DiffStats {
+export interface DiffStats extends StatsMeta {
   scope: UnsafeScope;
   versions: number;
   scanned: number;
@@ -443,7 +451,7 @@ export interface DiffTopQuery {
   offset: number;
 }
 
-export interface RegistryStats {
+export interface RegistryStats extends StatsMeta {
   users: number;
   teams: number;
   owns: number;
@@ -553,7 +561,7 @@ export interface TopPublisherRow {
   sample: string[];
 }
 
-export interface PublisherLeaderboards {
+export interface PublisherLeaderboards extends StatsMeta {
   byCrates: ProlificRow[];
   byUploads: ProlificRow[];
   owners: TopOwnerRow[];
@@ -709,7 +717,7 @@ export interface TopResult<Row, Sort> {
   meta: { elapsedMs: number; sort: Sort; scope: UnsafeScope };
 }
 
-export interface Stats {
+export interface Stats extends StatsMeta {
   crates: number;
   versions: number;
   dependsOn: number;
