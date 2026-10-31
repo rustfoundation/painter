@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, type PublisherCrate, type PublisherLeaderboards, type PublisherProfile, type RegistryStats, type UserHit } from '../api';
 import { NativeFlags } from './BuildView';
+import { NameFilter, type Hint } from './NameFilter';
+import { hasWildcard, nameTester } from '../match';
 import { copyTsv, errorMessage, fmt, fmtCompact, fmtDate, freshness, HistoryStrip, pct, SortHeaders, Tile, UserLink, useSort, type Column, type HistoryBar } from './meta';
 
 interface Props {
@@ -258,6 +260,8 @@ export function PublishersView({ busy, onBusy, onError, onOpenCrate, onOpenUser,
   const [byYear, setByYear] = useState(false);
   const [role, setRole] = useState<Role>('all');
   const [filter, setFilter] = useState('');
+  /** Every login matching a wildcard query, shown as a table instead of opening one profile. */
+  const [matches, setMatches] = useState<{ q: string; rows: UserHit[] } | null>(null);
   const { sort, desc, toggle } = useSort<CrateSort>('downloads', 'name');
   const debounce = useRef<number | undefined>(undefined);
 
@@ -285,10 +289,29 @@ export function PublishersView({ busy, onBusy, onError, onOpenCrate, onOpenUser,
 
   const load = useCallback(
     async (who: string) => {
-      const l = who.trim();
+      let l = who.trim();
       if (!l) return;
       setOpen(false);
       setQuery(l);
+      if (hasWildcard(l)) {
+        onBusy(true);
+        onError(null);
+        try {
+          const r = await api.searchUsers(l, 500);
+          setLogin(null);
+          setProfile(null);
+          setMatches({ q: l, rows: [...r.users, ...r.teams].sort((a, b) => b.crates + b.owns - (a.crates + a.owns)) });
+        } catch (err) {
+          onError(errorMessage(err));
+        } finally {
+          onBusy(false);
+        }
+        return;
+      }
+      // Logins are exact; accept another letter case when the hints know the right spelling.
+      const folded = hits && [...hits.users, ...hits.teams].find((h) => h.login.toLowerCase() === l.toLowerCase());
+      if (folded) l = folded.login;
+      setMatches(null);
       setLogin(l);
       onBusy(true);
       onError(null);
@@ -301,18 +324,31 @@ export function PublishersView({ busy, onBusy, onError, onOpenCrate, onOpenUser,
         onBusy(false);
       }
     },
-    [onBusy, onError],
+    [onBusy, onError, hits],
   );
 
   useEffect(() => {
     if (target) void load(target.login);
   }, [target, load]);
 
+  const crateHintsFromProfile = useCallback(
+    async (q: string): Promise<Hint[]> => {
+      if (!profile) return [];
+      const test = hasWildcard(q) ? nameTester(q) : (n: string) => n.toLowerCase().includes(q.toLowerCase());
+      return profile.crates
+        .filter((c) => test(c.name))
+        .sort((a, b) => (b.downloads ?? 0) - (a.downloads ?? 0))
+        .slice(0, 12)
+        .map((c) => ({ value: c.name, note: roleOf(c) }));
+    },
+    [profile],
+  );
+
   const crates = useMemo(() => {
     if (!profile) return [];
-    const f = filter.trim().toLowerCase();
+    const matches = nameTester(filter);
     const rows = profile.crates.filter((c) => {
-      if (f && !c.name.toLowerCase().includes(f)) return false;
+      if (!matches(c.name)) return false;
       switch (role) {
         case 'published':
           return Boolean(c.published);
@@ -366,7 +402,7 @@ export function PublishersView({ busy, onBusy, onError, onOpenCrate, onOpenUser,
         <div className="search">
           <input
             type="text"
-            placeholder="crates.io login… (e.g. dtolnay, github:tokio-rs:core)"
+            placeholder="crates.io login, exact or a pattern (e.g. dtolnay, github:tokio-rs:*)"
             value={query}
             onChange={(e) => {
               setQuery(e.target.value);
@@ -400,11 +436,12 @@ export function PublishersView({ busy, onBusy, onError, onOpenCrate, onOpenUser,
         <button className="primary" disabled={busy || !query.trim()} onClick={() => void load(query)}>
           {busy ? 'Loading…' : 'Open'}
         </button>
-        {login && (
+        {(login || matches) && (
           <button
             onClick={() => {
               setLogin(null);
               setProfile(null);
+              setMatches(null);
               setQuery('');
             }}
             title="Back to the leaderboards"
@@ -426,7 +463,41 @@ export function PublishersView({ busy, onBusy, onError, onOpenCrate, onOpenUser,
         )}
       </div>
 
-      {!login && (
+      {!login && matches && (
+        <div className="unsafe-table">
+          <table>
+            <thead>
+              <tr>
+                <th>login matching {matches.q}</th>
+                <th>name</th>
+                <th className="num">published</th>
+                <th className="num">owned</th>
+              </tr>
+            </thead>
+            <tbody>
+              {matches.rows.map((u) => (
+                <tr key={u.login}>
+                  <td>
+                    <UserLink login={u.login} onOpen={(l) => void load(l)} />
+                  </td>
+                  <td className="muted">{u.name ?? ''}</td>
+                  <td className="num">{fmt(u.crates)}</td>
+                  <td className="num">{fmt(u.owns)}</td>
+                </tr>
+              ))}
+              {!matches.rows.length && (
+                <tr>
+                  <td colSpan={4} className="muted">
+                    no login matches {matches.q}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {!login && !matches && (
         <>
           <div className="unsafe-tiles">
             <div className="tile wide" title="Crates and versions the registry job has matched against the crates.io dump">
@@ -513,7 +584,7 @@ export function PublishersView({ busy, onBusy, onError, onOpenCrate, onOpenUser,
             <Timeline timeline={profile.timeline} byYear={byYear} />
           </div>
           <div className="unsafe-controls">
-            <input type="text" placeholder="Crate name contains…" value={filter} onChange={(e) => setFilter(e.target.value)} spellCheck={false} className="q" />
+            <NameFilter value={filter} onChange={setFilter} hints={crateHintsFromProfile} />
             <label className="opt">
               role
               <select value={role} onChange={(e) => setRole(e.target.value as Role)}>

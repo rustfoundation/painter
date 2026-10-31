@@ -23,10 +23,11 @@ export const config = {
   },
   // Queries always run in a read transaction, but you may want this off on a shared deployment.
   allowCypher: env('RENDER_ALLOW_CYPHER', 'true') !== 'false',
-  depsMaxEdges: int('RENDER_DEPS_MAX_EDGES', 50_000),
-  depsDefaultEdges: int('RENDER_DEPS_DEFAULT_EDGES', 5_000),
+  // Deps view: crates drawn per tree by default, and the most a request may ask for.
+  depsDefaultNodes: int('RENDER_DEPS_DEFAULT_NODES', 300),
+  depsMaxNodes: int('RENDER_DEPS_MAX_NODES', 2_000),
   depsCacheMs: int('RENDER_DEPS_CACHE_MS', 600_000),
-  // Scans every DEPENDS_ON edge.
+  // Whole-relationship-type scans (unsafe:all live fallback, ecosystem-wide queries).
   depsTimeoutMs: int('RENDER_DEPS_TIMEOUT_MS', 180_000),
   lod: {
     iterations: int('RENDER_LOD_ITERATIONS', 300),
@@ -36,6 +37,9 @@ export const config = {
     workerHeapMb: int('RENDER_LOD_WORKER_HEAP_MB', 8192),
     budget: int('RENDER_LOD_BUDGET', 600),
     maxLevel: int('RENDER_LOD_MAX_LEVEL', 12),
+    // JSON snapshot of the loaded viewport index, keyed on LodMeta.built_at: a restart reads it in seconds
+    // instead of streaming every crate and LOD_DEP edge again (minutes). Empty disables it.
+    cachePath: env('RENDER_LOD_INDEX_CACHE', '/tmp/painter-lod-index.json'),
     // Positions every N iterations, so a crash can be resumed.
     checkpointPath: env('RENDER_LOD_CHECKPOINT', '/tmp/painter-lod-checkpoint.json'),
   },
@@ -63,8 +67,8 @@ export const describeConfig = () => ({
     queryTimeoutMs: config.neo4j.queryTimeoutMs,
   },
   allowCypher: config.allowCypher,
-  depsMaxEdges: config.depsMaxEdges,
-  depsDefaultEdges: config.depsDefaultEdges,
+  depsDefaultNodes: config.depsDefaultNodes,
+  depsMaxNodes: config.depsMaxNodes,
   lod: { iterations: config.lod.iterations, budget: config.lod.budget, maxLevel: config.lod.maxLevel },
   jobsUrl: config.jobsUrl || null,
   jobs: config.jobs,

@@ -23,6 +23,7 @@ import {
   type Column,
   type HistoryBar,
 } from './meta';
+import { NameFilter } from './NameFilter';
 
 interface Props {
   busy: boolean;
@@ -220,7 +221,7 @@ export function NativeView({ busy, onBusy, onError, onOpenCrate }: Props) {
 
       <div className="unsafe-controls">
         <ScopeSelect scope={scope} onChange={setScope} />
-        <input type="text" placeholder="Crate name contains…" value={q} onChange={(e) => setQ(e.target.value)} spellCheck={false} className="q" />
+        <NameFilter value={q} onChange={setQ} />
         <TriSelect label="vendored" value={vendored} onChange={setVendored} title="Enough native code to be a library in its own right" />
         <TriSelect label="prebuilt" value={prebuilt} onChange={setPrebuilt} title="Ships .a / .so / .dll / .o files" />
         <label className="opt">

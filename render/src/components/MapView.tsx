@@ -1,25 +1,36 @@
 // NVL free layout: positions are exactly the server's. Screen <-> layout mapping is
 // calibrated from NVL zoom/pan, not node client positions (they lag a frame behind pans).
+// NVL draws the landmark crates (hit testing, zoom/pan, touch); a Canvas2D overlay on top
+// (mapOverlay.ts) draws density, community blobs and labels, and the selection halo.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type NVL from '@neo4j-nvl/base';
 import type { Node as NvlNode, Relationship as NvlRel, NvlOptions } from '@neo4j-nvl/base';
 import { InteractiveNvlWrapper, type MouseEventCallbacks } from '@neo4j-nvl/react';
-import { api, ApiError, type GraphNode, type LodStatus, type LodViewport } from '../api';
-import { communityColor } from '../graph';
-import { useTouchZoomPan } from '../touch';
+import { api, ApiError, type GraphNode, type LodBounds, type LodCommunity, type LodNeighbours, type LodStatus, type LodViewport } from '../api';
+import { drawOverlay, makeColorOf, pulseActive } from '../mapOverlay';
+import { useIsMobile, useTouchZoomPan } from '../touch';
 
 const MAP_PX = 6000;
-const FETCH_DEBOUNCE_MS = 180;
+const FETCH_DEBOUNCE_MS = 150;
 /** Fetch a bbox this much larger than the screen so small pans do not refetch. */
-const VIEW_MARGIN = 0.35;
+const VIEW_MARGIN = 0.25;
 /** NVL draws a node roughly this many screen px per unit of `size` at zoom 1 (measured). */
 const NVL_SIZE_PX = 2.75;
-const MIN_CELL_PX = 44;
+/** Landmark edges are only drawn when there are few enough to read; otherwise only the selection's. */
+const EDGE_SHOW_MAX = 220;
+const NEIGHBOUR_LIMIT = 40;
+const LEGEND_SIZE = 16;
+/** Edges are drawn by the overlay, never by NVL. */
+const NO_RELS: NvlRel[] = [];
 
-const compact = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n));
+const compact = (n: number) =>
+  n >= 1_000_000_000 ? `${(n / 1_000_000_000).toFixed(1)}B` : n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n);
 
-interface Props {
+/** Minimum on-screen spacing between landmarks for a density preset (toolbar: sparse / normal / dense). */
+const spacingFor = (budget: number) => (budget <= 300 ? 76 : budget <= 800 ? 52 : 36);
+
+type Props = {
   /** Crate to jump to; a new object each time the user asks. */
   target: { name: string; nonce: number } | null;
   budget: number;
@@ -27,7 +38,7 @@ interface Props {
   onBusy: (busy: boolean) => void;
   onOpenInDeps: (name: string) => void;
   onMeta: (m: { mode: string; level: number; inView: number; total: number; nodes: number; rels: number; elapsedMs: number } | null) => void;
-}
+};
 
 interface Calibration {
   scale: number;
@@ -35,30 +46,42 @@ interface Calibration {
   offsetY: number;
 }
 
+const num = (v: unknown) => (typeof v === 'number' ? v : Number(v ?? 0));
+
 export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta }: Props) {
   const nvlRef = useRef<NVL>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const overlayRef = useRef<HTMLCanvasElement>(null);
   const [canvasEl, setCanvasEl] = useState<HTMLDivElement | null>(null);
   const canvasRef = useCallback((el: HTMLDivElement | null) => {
     containerRef.current = el;
     setCanvasEl(el);
   }, []);
   useTouchZoomPan(canvasEl, nvlRef);
+  const isMobile = useIsMobile();
   const [status, setStatus] = useState<LodStatus | null>(null);
   const [payload, setPayload] = useState<LodViewport | null>(null);
+  const [communities, setCommunities] = useState<LodCommunity[] | null>(null);
+  /** The selected crate as last known (from a landmark, a locate, or a neighbour row). */
   const [selected, setSelected] = useState<GraphNode | null>(null);
+  const [neighbours, setNeighbours] = useState<LodNeighbours | null>(null);
   const [iterations, setIterations] = useState<number>(300);
   /** NVL zoom at the time of the last fetch; sizes are divided by it so they stay constant on screen. */
   const [viewScale, setViewScale] = useState(1);
   const [reuseEdges, setReuseEdges] = useState(true);
   const [resume, setResume] = useState(true);
-  const boundsRef = useRef<LodViewport['meta']['bounds'] | null>(null);
+  const boundsRef = useRef<LodBounds | null>(null);
+  const coreRef = useRef<LodBounds | null>(null);
   const calib = useRef<Calibration | null>(null);
   const debounce = useRef<number | undefined>(undefined);
   const lastBbox = useRef<string>('');
   const inflight = useRef<AbortController | null>(null);
-  /** False until the first whole-map payload has been centred; polling waits for it. */
+  /** False until the first payload has been centred; polling waits for it. */
   const centeredRef = useRef(false);
+  const pulseRef = useRef<number | null>(null);
+  const sceneDirty = useRef(true);
+
+  const colorOf = useMemo(() => makeColorOf(communities), [communities]);
 
   const toPx = useCallback((x: number, y: number) => {
     const b = boundsRef.current!;
@@ -108,7 +131,10 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
     try {
       const s = await api.lodStatus();
       setStatus(s);
-      if (s.index) boundsRef.current = s.index.bounds;
+      if (s.index) {
+        boundsRef.current = s.index.bounds;
+        coreRef.current = s.index.core ?? s.index.bounds;
+      }
       return s;
     } catch (err) {
       onError(err instanceof Error ? err.message : String(err));
@@ -116,9 +142,28 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
     }
   }, [onError]);
 
+  /** Fit a layout-space box on screen. */
+  const fitBox = useCallback(
+    (box: { x0: number; y0: number; x1: number; y1: number }, fill = 0.9) => {
+      const nvl = nvlRef.current;
+      const el = containerRef.current;
+      if (!nvl || !el || !boundsRef.current) return;
+      const a = toPx(box.x0, box.y0);
+      const b = toPx(box.x1, box.y1);
+      const w = Math.max(Math.abs(b.px - a.px), 1);
+      const h = Math.max(Math.abs(b.py - a.py), 1);
+      const scale = Math.min(el.clientWidth / w, el.clientHeight / h) * fill;
+      nvl.setZoomAndPan(scale, (a.px + b.px) / 2, (a.py + b.py) / 2);
+      calibrate();
+      lastBbox.current = '';
+      sceneDirty.current = true;
+    },
+    [toPx, calibrate],
+  );
+
   const fetchViewport = useCallback(
-    async (bbox: { x0: number; y0: number; x1: number; y1: number } | null) => {
-      const key = bbox ? [bbox.x0, bbox.y0, bbox.x1, bbox.y1].map((v) => v.toPrecision(5)).join(',') : 'all';
+    async (bbox: { x0: number; y0: number; x1: number; y1: number }) => {
+      const key = [bbox.x0, bbox.y0, bbox.x1, bbox.y1].map((v) => v.toPrecision(5)).join(',') + `:${budget}`;
       if (key === lastBbox.current) return;
       lastBbox.current = key;
       inflight.current?.abort();
@@ -129,21 +174,13 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
         const scaleNow = calib.current?.scale ?? 1;
         const b = boundsRef.current;
         const span = b ? Math.max(b.maxX - b.minX, b.maxY - b.minY) : 0;
-        const minCell = b ? (MIN_CELL_PX / scaleNow / MAP_PX) * span : 0;
-        const p = await api.lodViewport(bbox, budget, minCell);
+        const minCell = b ? (spacingFor(budget) / scaleNow / MAP_PX) * span : 0;
+        const p = await api.lodViewport(bbox, budget, minCell, EDGE_SHOW_MAX);
         if (ctrl.signal.aborted) return;
         boundsRef.current = p.meta.bounds;
         setViewScale(calib.current?.scale ?? 1);
         setPayload(p);
-        if (!centeredRef.current && bbox === null) {
-          // First whole-map payload: centre once, then the poll refetches for the real bbox.
-          window.setTimeout(() => {
-            showWholeMapRef.current();
-            setViewScale(calib.current?.scale ?? 1);
-            centeredRef.current = true;
-            lastBbox.current = '';
-          }, 250);
-        }
+        sceneDirty.current = true;
         onError(null);
         onMeta({ mode: p.mode, level: p.level, inView: p.meta.inView, total: p.meta.total, nodes: p.nodes.length, rels: p.rels.length, elapsedMs: p.meta.elapsedMs });
       } catch (err) {
@@ -170,23 +207,43 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
     }, FETCH_DEBOUNCE_MS);
   }, [screenBbox, fetchViewport]);
 
-  const showWholeMapRef = useRef<() => void>(() => {});
+  /** Open on the populated core of the map (the whole bounds are mostly the ring of isolated crates). */
+  const showCore = useCallback(() => {
+    const core = coreRef.current ?? boundsRef.current;
+    if (!core) return;
+    fitBox({ x0: core.minX, y0: core.minY, x1: core.maxX, y1: core.maxY }, 0.95);
+    scheduleViewportFetch();
+  }, [fitBox, scheduleViewportFetch]);
+
   const showWholeMap = useCallback(() => {
-    const nvl = nvlRef.current;
-    const el = containerRef.current;
-    if (!nvl || !el) return;
-    const scale = (Math.min(el.clientWidth, el.clientHeight) / MAP_PX) * 0.92;
-    nvl.setZoomAndPan(scale, MAP_PX / 2, MAP_PX / 2);
-    calibrate();
-  }, [calibrate]);
-  showWholeMapRef.current = showWholeMap;
+    const b = boundsRef.current;
+    if (!b) return;
+    fitBox({ x0: b.minX, y0: b.minY, x1: b.maxX, y1: b.maxY }, 0.92);
+    scheduleViewportFetch();
+  }, [fitBox, scheduleViewportFetch]);
+
+  const startOnIndex = useCallback(async () => {
+    centeredRef.current = false;
+    lastBbox.current = '';
+    try {
+      const c = await api.lodCommunities();
+      setCommunities(c.communities);
+    } catch (err) {
+      if (!(err instanceof ApiError && err.status === 503)) onError(err instanceof Error ? err.message : String(err));
+    }
+    // NVL needs a frame with a mounted canvas before setZoomAndPan sticks.
+    window.setTimeout(() => {
+      showCore();
+      centeredRef.current = true;
+    }, 150);
+  }, [onError, showCore]);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       const s = await fetchStatus();
       if (cancelled || !s?.index) return;
-      await fetchViewport(null);
+      await startOnIndex();
     })();
     return () => {
       cancelled = true;
@@ -198,39 +255,61 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
     if (!status?.running && !status?.indexLoading) return;
     const id = window.setInterval(async () => {
       const s = await fetchStatus();
-      if (s && !s.running && !s.indexLoading && s.index) {
-        lastBbox.current = '';
-        centeredRef.current = false;
-        void fetchViewport(null);
-      }
+      if (s && !s.running && !s.indexLoading && s.index) void startOnIndex();
     }, 3000);
     return () => window.clearInterval(id);
-  }, [status?.running, status?.indexLoading, fetchStatus, fetchViewport]);
+  }, [status?.running, status?.indexLoading, fetchStatus, startOnIndex]);
 
-  useEffect(() => {
-    if (!target) return;
-    (async () => {
+  /** Select a crate by its node (landmark click or neighbour row) and load its neighbourhood. */
+  const selectCrate = useCallback(
+    (node: GraphNode | null) => {
+      setSelected(node);
+      setNeighbours(null);
+      sceneDirty.current = true;
+      if (!node) return;
+      const name = String(node.properties.name);
+      api
+        .lodNeighbours(name, NEIGHBOUR_LIMIT)
+        .then((n) => {
+          setNeighbours((prev) => (String(n.crate.properties.name) === name ? n : prev));
+          setSelected((prev) => (prev && String(prev.properties.name) === name ? n.crate : prev));
+          sceneDirty.current = true;
+        })
+        .catch((err) => onError(err instanceof Error ? err.message : String(err)));
+    },
+    [onError],
+  );
+
+  /** Centre on a crate at neighbourhood zoom, select it, and pulse. */
+  const jumpTo = useCallback(
+    async (name: string) => {
       try {
-        const hit = await api.lodLocate(target.name);
+        const hit = await api.lodLocate(name);
         const nvl = nvlRef.current;
         const el = containerRef.current;
-        if (!nvl || !el) return;
-        const { px, py } = toPx(hit.x, hit.y);
-        const scale = Math.max(1, el.clientWidth / 600);
-        // NVL pan = layout coordinate shown at the screen centre.
-        nvl.setZoomAndPan(scale, px, py);
+        if (!nvl || !el || !boundsRef.current) return;
+        const { px, py } = toPx(num(hit.x), num(hit.y));
+        const scale = Math.max(2, Math.min(6, el.clientWidth / 500));
+        // NVL pan = layout coordinate shown at the screen centre. On a phone the details sheet covers
+        // the lower half, so put the crate in the upper part instead.
+        nvl.setZoomAndPan(scale, px, py + (isMobile ? (el.clientHeight * 0.22) / scale : 0));
         calibrate();
         lastBbox.current = '';
         scheduleViewportFetch();
-        setSelected({ id: `crate:${hit.name}`, labels: ['Crate'], properties: { ...hit } });
+        pulseRef.current = performance.now();
+        selectCrate({ id: `crate:${hit.name}`, labels: ['Crate'], properties: { ...hit } });
       } catch (err) {
         onError(err instanceof Error ? err.message : String(err));
       }
-    })();
+    },
+    [toPx, calibrate, scheduleViewportFetch, selectCrate, onError, isMobile],
+  );
+
+  useEffect(() => {
+    if (!target) return;
+    void jumpTo(target.name);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target]);
-
-
 
   // Poll zoom/pan instead of relying on NVL callbacks; refetch when it settles.
   useEffect(() => {
@@ -250,109 +329,187 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
 
   useEffect(() => {
     lastBbox.current = '';
-    if (boundsRef.current) scheduleViewportFetch();
+    if (boundsRef.current && centeredRef.current) scheduleViewportFetch();
   }, [budget, scheduleViewportFetch]);
 
-  const { nodes, rels } = useMemo(() => {
-    if (!payload || !boundsRef.current) return { nodes: [] as NvlNode[], rels: [] as NvlRel[] };
+
+  const selectedName = selected ? String(selected.properties.name) : null;
+
+  const { nodes, edges } = useMemo(() => {
+    type Edge = { x1: number; y1: number; x2: number; y2: number; color: string; width: number };
+    if (!payload || !boundsRef.current) return { nodes: [] as NvlNode[], edges: [] as Edge[] };
     // NVL sizes scale with zoom; divide by the zoom at fetch time for constant on-screen size.
     const k = 1 / (Math.max(viewScale, 1e-6) * NVL_SIZE_PX);
-    const cellPx = (MAP_PX / 2 ** payload.level) * viewScale;
-    const nodes: NvlNode[] = payload.nodes.map((n) => {
-      const p = n.properties as Record<string, number | string | string[]>;
-      const { px, py } = toPx(p.x as number, p.y as number);
-      const community = Number(p.community ?? -1);
-      if (n.labels.includes('Cluster')) {
-        const count = Number(p.count);
-        const top = (p.top as string[]) ?? [];
-        return {
-          id: n.id,
-          x: px,
-          y: py,
-          pinned: true,
-          size: Math.min(30 + Math.log2(count + 1) * 3.5, 72, cellPx * 1.05) * k,
-          color: communityColor(community),
-          captions: [{ value: `${compact(count)} crates`, styles: ['bold'] }, ...(top.length ? [{ value: top[0] }] : [])],
-          selected: selected?.id === n.id,
-        } as NvlNode;
-      }
-      const degree = Number(p.degree ?? 0);
+    const seen = new Set<string>();
+    const nodeOf = (n: GraphNode, dim: boolean): NvlNode => {
+      const p = n.properties;
+      const { px, py } = toPx(num(p.x), num(p.y));
+      const score = Math.log10(num(p.downloads) + 1) + 1.5 * Math.log10(num(p.dependents) + 1);
+      const isSel = n.id === selected?.id;
       return {
         id: n.id,
         x: px,
         y: py,
         pinned: true,
-        size: Math.min(18 + Math.log2(degree + 1) * 2, 44) * k,
-        color: communityColor(community),
-        caption: String(p.name),
-        selected: selected?.id === n.id,
+        // Dots only; names are drawn by the overlay so they can sit beside the dot and avoid each other.
+        size: Math.max(5, Math.min(22, 3 + score * 1.1)) * (dim ? 0.8 : 1) * k,
+        color: colorOf(num(p.community)),
+        selected: isSel,
+        activated: isSel,
       };
-    });
-    const rels: NvlRel[] = payload.rels.map((r) => {
-      const count = Number(r.properties.count ?? 1);
-      return {
-        id: r.id,
-        from: r.from,
-        to: r.to,
-        color: 'rgba(120,140,180,0.22)',
-        width: Math.min(0.3 + Math.log2(count + 1) * 0.15, 1.4) * k * NVL_SIZE_PX,
+    };
+    const nodes: NvlNode[] = [];
+    for (const n of payload.nodes) {
+      seen.add(n.id);
+      nodes.push(nodeOf(n, false));
+    }
+    // The selection and its neighbourhood are always drawn, even below the landmark cut.
+    const extra: GraphNode[] = [];
+    if (selected && !seen.has(selected.id)) extra.push(selected);
+    if (neighbours && selected && neighbours.crate.id === selected.id) {
+      for (const n of [...neighbours.dependents.top, ...neighbours.dependencies.top]) if (!seen.has(n.id)) extra.push(n);
+    }
+    for (const n of extra) {
+      if (seen.has(n.id)) continue;
+      seen.add(n.id);
+      nodes.push(nodeOf(n, n.id !== selected?.id));
+    }
+    const edges: Edge[] = [];
+    const at = (n: GraphNode) => ({ x: num(n.properties.x), y: num(n.properties.y) });
+    if (neighbours && selected && neighbours.crate.id === selected.id) {
+      const s = at(selected);
+      for (const n of neighbours.dependencies.top) {
+        const t = at(n);
+        edges.push({ x1: s.x, y1: s.y, x2: t.x, y2: t.y, color: 'rgba(76,141,255,0.7)', width: 1.4 });
+      }
+      for (const n of neighbours.dependents.top) {
+        const t = at(n);
+        edges.push({ x1: t.x, y1: t.y, x2: s.x, y2: s.y, color: 'rgba(245,166,35,0.65)', width: 1.4 });
+      }
+    } else if (payload.rels.length <= EDGE_SHOW_MAX) {
+      const pos = new Map(payload.nodes.map((n) => [n.id, at(n)]));
+      for (const r of payload.rels) {
+        const a = pos.get(r.from);
+        const b = pos.get(r.to);
+        if (!a || !b) continue;
+        const versions = num(r.properties.versions ?? 1);
+        edges.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y, color: 'rgba(150,170,210,0.35)', width: Math.min(0.6 + Math.log2(versions + 1) * 0.2, 2) });
+      }
+    }
+    return { nodes, edges };
+  }, [payload, selected, neighbours, toPx, viewScale, colorOf]);
+
+  // Overlay: redraw on animation frames while the view moves, the scene changes, or a pulse runs.
+  useEffect(() => {
+    let raf = 0;
+    let lastKey = '';
+    const tick = () => {
+      raf = window.requestAnimationFrame(tick);
+      const cv = overlayRef.current;
+      const el = containerRef.current;
+      const c = calibrate();
+      if (!cv || !el || !c || !boundsRef.current) return;
+      const dpr = window.devicePixelRatio || 1;
+      const w = el.clientWidth;
+      const h = el.clientHeight;
+      const key = `${c.scale}:${c.offsetX}:${c.offsetY}:${w}:${h}:${dpr}`;
+      const now = performance.now();
+      if (key === lastKey && !sceneDirty.current && !pulseActive(pulseRef.current, now)) return;
+      lastKey = key;
+      sceneDirty.current = false;
+      if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+        cv.width = Math.round(w * dpr);
+        cv.height = Math.round(h * dpr);
+      }
+      const ctx = cv.getContext('2d');
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      const b = boundsRef.current;
+      const span = Math.max(b.maxX - b.minX, b.maxY - b.minY);
+      const toScreen = (x: number, y: number) => {
+        const { px, py } = toPx(x, y);
+        return { sx: px * c.scale + c.offsetX, sy: py * c.scale + c.offsetY };
       };
-    });
-    return { nodes, rels };
-  }, [payload, selected, toPx, viewScale]);
+      const sel = selected ? { x: num(selected.properties.x), y: num(selected.properties.y) } : null;
+      const weightOf = (p: GraphNode['properties']) => Math.log10(num(p.downloads) + 1) + 1.5 * Math.log10(num(p.dependents) + 1);
+      const labels: { x: number; y: number; text: string; weight: number; selected?: boolean }[] = [];
+      if (selected) labels.push({ x: num(selected.properties.x), y: num(selected.properties.y), text: String(selected.properties.name), weight: 99, selected: true });
+      const nb = neighbours && selected && neighbours.crate.id === selected.id ? [...neighbours.dependents.top, ...neighbours.dependencies.top] : [];
+      const seenLabel = new Set(selected ? [selected.id] : []);
+      for (const n of [...(payload?.nodes ?? []), ...nb]) {
+        if (seenLabel.has(n.id)) continue;
+        seenLabel.add(n.id);
+        labels.push({ x: num(n.properties.x), y: num(n.properties.y), text: String(n.properties.name), weight: weightOf(n.properties) });
+      }
+      // Landmarks arrive in importance order; neighbours are appended after, so sort once by weight.
+      labels.sort((a, b) => b.weight - a.weight);
+      drawOverlay(ctx, {
+        width: w,
+        height: h,
+        toScreen,
+        pxPerUnit: (MAP_PX / span) * c.scale,
+        // Every in-view crate is already a labelled dot: shading would only duplicate them.
+        density: payload && payload.meta.shown < payload.meta.inView ? payload.density : null,
+        communities,
+        colorOf,
+        selected: sel,
+        edges,
+        labels,
+        pulseAt: pulseRef.current,
+        now,
+      });
+    };
+    raf = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(raf);
+  }, [calibrate, toPx, payload, communities, colorOf, selected, neighbours, edges]);
 
   const nvlOptions = useMemo<NvlOptions>(
     () => ({
       layout: 'free',
       renderer: 'canvas',
       minZoom: 0.02,
-      maxZoom: 40,
+      maxZoom: 120,
       allowDynamicMinZoom: true,
       styling: { selectedBorderColor: '#ffffff', selectedInnerBorderColor: '#111111', dropShadowColor: 'rgba(0,0,0,0.5)' },
     }),
     [],
   );
 
-  const zoomToCluster = useCallback(
-    (node: GraphNode) => {
-      const nvl = nvlRef.current;
-      const el = containerRef.current;
-      const bbox = node.properties.bbox as { x0: number; y0: number; x1: number; y1: number } | undefined;
-      if (!nvl || !el || !bbox) return;
-      const a = toPx(bbox.x0, bbox.y0);
-      const b = toPx(bbox.x1, bbox.y1);
-      const w = Math.abs(b.px - a.px);
-      const h = Math.abs(b.py - a.py);
-      const scale = Math.min(el.clientWidth / w, el.clientHeight / h) * 0.75;
-      const cx = (a.px + b.px) / 2;
-      const cy = (a.py + b.py) / 2;
-      nvl.setZoomAndPan(scale, cx, cy);
-      calibrate();
-      scheduleViewportFetch();
+  const byId = useCallback(
+    (id: string) => {
+      const inPayload = payload?.nodes.find((n) => n.id === id);
+      if (inPayload) return inPayload;
+      if (selected?.id === id) return selected;
+      return neighbours ? ([...neighbours.dependents.top, ...neighbours.dependencies.top].find((n) => n.id === id) ?? null) : null;
     },
-    [toPx, scheduleViewportFetch, calibrate],
+    [payload, selected, neighbours],
   );
-
-  const byId = useCallback((id: string) => payload?.nodes.find((n) => n.id === id) ?? null, [payload]);
 
   const mouseEventCallbacks = useMemo<MouseEventCallbacks>(
     () => ({
       onNodeClick: (node: NvlNode) => {
         const n = byId(node.id);
-        setSelected(n);
-        if (n?.labels.includes('Cluster')) zoomToCluster(n);
+        if (n) selectCrate(n);
       },
       onNodeDoubleClick: (node: NvlNode) => {
         const n = byId(node.id);
-        if (n?.labels.includes('Cluster')) zoomToCluster(n);
+        if (n) void jumpTo(String(n.properties.name));
       },
-      onCanvasClick: () => setSelected(null),
+      onCanvasClick: () => selectCrate(null),
       onZoomAndPan: () => scheduleViewportFetch(),
       onPan: () => scheduleViewportFetch(),
       onHover: true,
       onDrag: false,
     }),
-    [byId, zoomToCluster, scheduleViewportFetch],
+    [byId, selectCrate, jumpTo, scheduleViewportFetch],
+  );
+
+  const zoomToCommunity = useCallback(
+    (c: LodCommunity) => {
+      fitBox(c.bbox, 0.85);
+      scheduleViewportFetch();
+    },
+    [fitBox, scheduleViewportFetch],
   );
 
   const startJob = async (kind: 'build' | 'update') => {
@@ -367,6 +524,38 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
 
   const meta = status?.meta ?? null;
   const fmt = (v: unknown) => (typeof v === 'number' ? v.toLocaleString() : v == null ? '—' : String(v));
+  const selectedCommunity = selected ? (communities?.find((c) => c.id === num(selected.properties.community)) ?? null) : null;
+
+  const neighbourList = (title: string, side: LodNeighbours['dependents'] | undefined, hint: string) => (
+    <>
+      <h3>
+        {title} <span className="count">{side ? `${fmt(side.total)}${side.total > side.top.length ? `, top ${side.top.length}` : ''}` : '…'}</span>
+      </h3>
+      {side && side.top.length === 0 ? (
+        <p className="muted small">{hint}</p>
+      ) : (
+        <ul className="map-neighbours">
+          {(side?.top ?? []).map((n) => {
+            const p = n.properties;
+            return (
+              <li key={n.id}>
+                <span className="swatch" style={{ background: colorOf(num(p.community)) }} />
+                <button type="button" className="link name" title={`${compact(num(p.downloads))} downloads · used by ${fmt(p.dependents)} crates`} onClick={() => void jumpTo(String(p.name))}>
+                  {String(p.name)}
+                </button>
+                <span className="count" title="versions declaring the dependency">
+                  {compact(num(p.versions ?? 0))}v
+                </span>
+                <button type="button" className="deps" title="Open this crate's dependency chain in the Deps view" onClick={() => onOpenInDeps(String(p.name))}>
+                  deps
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </>
+  );
 
   return (
     <>
@@ -378,7 +567,7 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
               {status?.running
                 ? `LOD ${status.running.kind} running: ${status.running.phase}${status.running.total ? ` ${fmt(status.running.done)}/${fmt(status.running.total)}` : ''}`
                 : status?.indexLoading
-                  ? 'Loading the map index from the database…'
+                  ? 'Loading the map index from the database (a few minutes on a cold start; seconds from its snapshot)…'
                   : status?.indexError
                     ? `Map index failed to load: ${status.indexError}`
                     : status
@@ -390,7 +579,7 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
         <InteractiveNvlWrapper
           ref={nvlRef}
           nodes={nodes}
-          rels={rels}
+          rels={NO_RELS}
           positions={nodes}
           nvlOptions={nvlOptions}
           mouseEventCallbacks={mouseEventCallbacks}
@@ -398,10 +587,11 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
           onInitializationError={(e) => onError(`NVL failed to initialise: ${e instanceof Error ? e.message : String(e)}`)}
           style={{ width: '100%', height: '100%' }}
         />
+        <canvas ref={overlayRef} className="map-overlay" />
       </div>
       <aside className={`sidebar${selected ? ' has-selection' : ''}`}>
         {selected && (
-          <button type="button" className="sheet-close" aria-label="Close details" onClick={() => setSelected(null)}>
+          <button type="button" className="sheet-close" aria-label="Close details" onClick={() => selectCrate(null)}>
             ×
           </button>
         )}
@@ -409,140 +599,168 @@ export function MapView({ target, budget, onError, onBusy, onOpenInDeps, onMeta 
           {selected ? (
             <>
               <h2>
-                <span className={`badge ${selected.labels.includes('Cluster') ? 'rel' : 'crate'}`}>{selected.labels.join(':')}</span>{' '}
-                {selected.labels.includes('Cluster')
-                  ? `${fmt(selected.properties.count)} crates`
-                  : String(selected.properties.name)}
+                <span className="badge crate">Crate</span> {selectedName}
               </h2>
-              {selected.labels.includes('Cluster') ? (
-                <>
-                  <p className="muted">
-                    Grid level {fmt(selected.properties.level)} · dominant community {fmt(selected.properties.community)}. Click to zoom
-                    in.
-                  </p>
-                  <h3>Largest crates here</h3>
-                  <ul className="targets">
-                    {((selected.properties.top as string[]) ?? []).map((t) => (
-                      <li key={t}>
-                        <code>{t}</code>
-                      </li>
-                    ))}
-                  </ul>
-                </>
-              ) : (
-                <>
-                  <table className="props">
-                    <tbody>
-                      <tr>
-                        <th>community</th>
-                        <td>
-                          <span className="swatch" style={{ background: communityColor(Number(selected.properties.community)) }} />{' '}
-                          {fmt(selected.properties.community)}
-                        </td>
-                      </tr>
-                      <tr>
-                        <th>crate-level degree</th>
-                        <td>{fmt(selected.properties.degree)}</td>
-                      </tr>
-                    </tbody>
-                  </table>
-                  <div className="actions" style={{ marginTop: 10 }}>
-                    <button onClick={() => onOpenInDeps(String(selected.properties.name))}>Open chain in Deps view</button>
-                  </div>
-                </>
-              )}
+              <table className="props">
+                <tbody>
+                  <tr>
+                    <th>downloads</th>
+                    <td>{selected.properties.downloads == null ? '—' : compact(num(selected.properties.downloads))}</td>
+                  </tr>
+                  <tr>
+                    <th>used by</th>
+                    <td>{fmt(selected.properties.dependents)} crates</td>
+                  </tr>
+                  <tr>
+                    <th>depends on</th>
+                    <td>{fmt(selected.properties.dependencies)} crates</td>
+                  </tr>
+                  <tr>
+                    <th>neighbourhood</th>
+                    <td className="map-neighbours">
+                      {selectedCommunity ? (
+                        <button type="button" className="link" onClick={() => zoomToCommunity(selectedCommunity)} title="Zoom to this community">
+                          <span className="swatch" style={{ background: colorOf(num(selected.properties.community)) }} /> {selectedCommunity.top.slice(0, 3).join(' · ')}{' '}
+                          <span className="count">({compact(selectedCommunity.size)} crates)</span>
+                        </button>
+                      ) : (
+                        <span className="muted">
+                          <span className="swatch" style={{ background: colorOf(num(selected.properties.community)) }} /> small community #{fmt(selected.properties.community)}
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <div className="actions" style={{ marginTop: 10 }}>
+                <button onClick={() => onOpenInDeps(selectedName!)}>Open chain in Deps view</button>
+                <button onClick={() => void jumpTo(selectedName!)} title="Centre the map on this crate">
+                  Centre
+                </button>
+              </div>
+              <p className="muted small" style={{ marginTop: 8 }}>
+                Orange edges: crates that use it. Blue edges: what it depends on. Click a name to jump there.
+              </p>
+              {neighbourList('Used by', neighbours?.dependents, 'No crate depends on it.')}
+              {neighbourList('Depends on', neighbours?.dependencies, 'No dependencies on crates.io.')}
               <hr className="rule" />
             </>
           ) : (
             <>
               <h2>Ecosystem map</h2>
               <p className="muted">
-                Every crate at a precomputed position (ForceAtlas2), coloured by Louvain community. Scroll to zoom, drag to pan.
-                Clusters show how many crates they hold and resolve into crates as you zoom in.
+                Every crate at a precomputed position; the most downloaded and most depended-on crates are the labelled landmarks, and shading
+                shows where the rest are. Scroll to zoom, drag to pan, click a crate for its neighbourhood, double-click to centre on it.
               </p>
+              <div className="actions">
+                <button onClick={showCore}>Reset view</button>
+                <button onClick={showWholeMap} title="Include the ring of isolated crates">
+                  Whole map
+                </button>
+              </div>
+              <h3>Largest neighbourhoods</h3>
+              <p className="muted small">Louvain communities, named after their dominant crates. Click to zoom.</p>
+              <ul className="map-legend">
+                {(communities ?? []).slice(0, LEGEND_SIZE).map((c) => (
+                  <li key={c.id}>
+                    <span className="swatch" style={{ background: colorOf(c.id) }} />
+                    <button type="button" className="names" title={c.top.join(', ')} onClick={() => zoomToCommunity(c)}>
+                      {c.top.slice(0, 3).join(' · ')}
+                    </button>
+                    <span className="count">{compact(c.size)}</span>
+                  </li>
+                ))}
+              </ul>
+              {communities && status?.index && (
+                <p className="muted small">
+                  {fmt(status.index.communities)} communities in total; the rest are drawn grey.
+                </p>
+              )}
               <hr className="rule" />
             </>
           )}
 
-          <h3>Layout build</h3>
-          {status?.running ? (
-            <p>
-              <strong>{status.running.kind}</strong> running · {status.running.phase}
-              {status.running.total ? ` ${fmt(status.running.done)} / ${fmt(status.running.total)}` : ''}
-              {status.running.message ? <span className="muted"> · {status.running.message}</span> : null}
+          <details className="map-build">
+            <summary>Layout build</summary>
+            {status?.running ? (
+              <p>
+                <strong>{status.running.kind}</strong> running · {status.running.phase}
+                {status.running.total ? ` ${fmt(status.running.done)} / ${fmt(status.running.total)}` : ''}
+                {status.running.message ? <span className="muted"> · {status.running.message}</span> : null}
+              </p>
+            ) : meta ? (
+              <table className="props">
+                <tbody>
+                  <tr>
+                    <th>built</th>
+                    <td>{fmt(meta.built_at)}</td>
+                  </tr>
+                  <tr>
+                    <th>crates / edges</th>
+                    <td>
+                      {fmt(meta.crates)} / {fmt(meta.edges)}
+                    </td>
+                  </tr>
+                  <tr>
+                    <th>communities</th>
+                    <td>{fmt(meta.communities)}</td>
+                  </tr>
+                  <tr>
+                    <th>isolated</th>
+                    <td>{fmt(meta.isolated)}</td>
+                  </tr>
+                  <tr>
+                    <th>iterations</th>
+                    <td>{fmt(meta.iterations)}</td>
+                  </tr>
+                  <tr>
+                    <th>placed by update</th>
+                    <td>{fmt(meta.updated_crates)}</td>
+                  </tr>
+                  <tr>
+                    <th>unpositioned now</th>
+                    <td>{fmt(status?.unpositionedCrates)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            ) : (
+              <p className="muted">No build yet.</p>
+            )}
+            {status?.last && !status.running && (
+              <p className={`small ${status.last.ok ? 'muted' : 'error'}`}>
+                last {status.last.kind}: {status.last.ok ? 'ok' : `failed: ${status.last.error}`} ({Math.round(status.last.elapsedMs / 1000)} s)
+              </p>
+            )}
+            <div className="actions" style={{ marginTop: 8 }}>
+              <button disabled={Boolean(status?.running)} onClick={() => void startJob('update')} title="Place crates added since the last build">
+                Update
+              </button>
+              <button
+                disabled={Boolean(status?.running)}
+                className="danger"
+                onClick={() => void startJob('build')}
+                title="Recompute communities and the whole layout (minutes)"
+              >
+                Rebuild
+              </button>
+              <label className="opt">
+                iterations
+                <input type="number" min={10} max={5000} value={iterations} onChange={(e) => setIterations(Math.max(10, Number(e.target.value) || 10))} className="limit" />
+              </label>
+            </div>
+            <div className="actions" style={{ marginTop: 6 }}>
+              <label className="opt" title="Skip the DEPENDS_ON aggregation and reuse the LOD_DEP edges already stored (minutes faster); untick after a large import">
+                <input type="checkbox" checked={reuseEdges} onChange={(e) => setReuseEdges(e.target.checked)} /> reuse stored edges
+              </label>
+              <label className="opt" title="Continue from the last checkpoint or stored positions instead of a fresh layout">
+                <input type="checkbox" checked={resume} onChange={(e) => setResume(e.target.checked)} /> resume
+              </label>
+            </div>
+            <p className="muted small">
+              Update is cheap and places new crates next to their neighbours. Rebuild streams every DEPENDS_ON edge and runs the full
+              layout; on a complete index that takes many minutes and a few GB of memory in the render server.
             </p>
-          ) : meta ? (
-            <table className="props">
-              <tbody>
-                <tr>
-                  <th>built</th>
-                  <td>{fmt(meta.built_at)}</td>
-                </tr>
-                <tr>
-                  <th>crates / edges</th>
-                  <td>
-                    {fmt(meta.crates)} / {fmt(meta.edges)}
-                  </td>
-                </tr>
-                <tr>
-                  <th>communities</th>
-                  <td>{fmt(meta.communities)}</td>
-                </tr>
-                <tr>
-                  <th>isolated</th>
-                  <td>{fmt(meta.isolated)}</td>
-                </tr>
-                <tr>
-                  <th>iterations</th>
-                  <td>{fmt(meta.iterations)}</td>
-                </tr>
-                <tr>
-                  <th>placed by update</th>
-                  <td>{fmt(meta.updated_crates)}</td>
-                </tr>
-                <tr>
-                  <th>unpositioned now</th>
-                  <td>{fmt(status?.unpositionedCrates)}</td>
-                </tr>
-              </tbody>
-            </table>
-          ) : (
-            <p className="muted">No build yet.</p>
-          )}
-          {status?.last && !status.running && (
-            <p className={`small ${status.last.ok ? 'muted' : 'error'}`}>
-              last {status.last.kind}: {status.last.ok ? 'ok' : `failed: ${status.last.error}`} ({Math.round(status.last.elapsedMs / 1000)} s)
-            </p>
-          )}
-          <div className="actions" style={{ marginTop: 8 }}>
-            <button disabled={Boolean(status?.running)} onClick={() => void startJob('update')} title="Place crates added since the last build">
-              Update
-            </button>
-            <button
-              disabled={Boolean(status?.running)}
-              className="danger"
-              onClick={() => void startJob('build')}
-              title="Recompute communities and the whole layout (minutes)"
-            >
-              Rebuild
-            </button>
-            <label className="opt">
-              iterations
-              <input type="number" min={10} max={5000} value={iterations} onChange={(e) => setIterations(Math.max(10, Number(e.target.value) || 10))} className="limit" />
-            </label>
-          </div>
-          <div className="actions" style={{ marginTop: 6 }}>
-            <label className="opt" title="Skip the DEPENDS_ON aggregation and reuse the LOD_DEP edges already stored (minutes faster); untick after a large import">
-              <input type="checkbox" checked={reuseEdges} onChange={(e) => setReuseEdges(e.target.checked)} /> reuse stored edges
-            </label>
-            <label className="opt" title="Continue from the last checkpoint or stored positions instead of a fresh layout">
-              <input type="checkbox" checked={resume} onChange={(e) => setResume(e.target.checked)} /> resume
-            </label>
-          </div>
-          <p className="muted small">
-            Update is cheap and places new crates next to their neighbours. Rebuild streams every DEPENDS_ON edge and runs the full
-            layout; on a complete index that takes many minutes and a few GB of memory in the render server.
-          </p>
+          </details>
         </div>
       </aside>
     </>

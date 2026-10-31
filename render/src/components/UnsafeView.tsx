@@ -11,6 +11,7 @@ import {
   type UnsafeStats,
   type UnsafeTri,
 } from '../api';
+import { NameFilter } from './NameFilter';
 
 interface Props {
   busy: boolean;
@@ -351,7 +352,7 @@ export function UnsafeView({ busy, onBusy, onError, onOpenCrate }: Props) {
             <option value="all">all versions</option>
           </select>
         </label>
-        <input type="text" placeholder="Crate name contains…" value={q} onChange={(e) => setQ(e.target.value)} spellCheck={false} className="q" />
+        <NameFilter value={q} onChange={setQ} />
         <label className="opt">
           forbid(unsafe_code)
           <select value={forbids} onChange={(e) => setForbids(e.target.value as UnsafeTri)}>

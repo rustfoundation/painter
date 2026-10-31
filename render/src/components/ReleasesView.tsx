@@ -8,6 +8,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { api, type ReleaseKind, type ReleaseRow, type ReleaseSort, type ReleaseSource, type ReleasesHistogram } from '../api';
 import { NativeFlags } from './BuildView';
 import { copyTsv, daysAgo, errorMessage, fmt, fmtBytes, fmtCompact, fmtDate, fmtDateTime, HistoryStrip, isoDay, LoadMore, RowsSelect, SortHeaders, UserLink, useDebounced, useLeaderboard, useSort, type Column, type HistoryBar } from './meta';
+import { NameFilter } from './NameFilter';
 
 interface Props {
   busy: boolean;
@@ -185,7 +186,7 @@ export function ReleasesView({ busy, onBusy, onError, onOpenCrate, onOpenUser }:
             </button>
           ))}
         </span>
-        <input type="text" placeholder="Crate name contains…" value={q} onChange={(e) => setQ(e.target.value)} spellCheck={false} className="q" />
+        <NameFilter value={q} onChange={setQ} />
         <label className="opt" title="Only crates / versions with at least this many downloads">
           min downloads
           <input type="number" min={0} step={1000} value={minDownloads} onChange={(e) => setMinDownloads(Math.max(0, Number(e.target.value) || 0))} className="limit wide" />

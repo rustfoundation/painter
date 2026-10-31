@@ -1,0 +1,71 @@
+/* DOM captions for the Default view, positioned under each NVL node by OverviewLabels.tsx. */
+.node-labels {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.node-label {
+  position: absolute;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  white-space: nowrap;
+  font-size: 11px;
+  line-height: 1.2;
+  color: var(--text);
+  text-shadow:
+    0 0 3px #000,
+    0 0 3px #000,
+    0 1px 2px #000;
+}
+
+.node-label .t {
+  font-weight: 500;
+}
+
+.node-label .s {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.node-labels.no-sub .node-label:not(.root) .s {
+  display: none;
+}
+
+.node-label.root {
+  font-size: 13px;
+}
+
+.node-label.root .t {
+  font-weight: 700;
+}
+
+.node-label.version {
+  font-size: 10px;
+}
+
+.node-label.version .s {
+  font-size: 9px;
+}
+
+.node-label.latest .t {
+  color: #ffd38a;
+  font-weight: 700;
+}
+
+.node-label.yanked .t {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.node-label.callee .s {
+  color: #ff9a9d;
+}
+
+.node-label.dependent .s {
+  color: #7fd9ab;
+}

@@ -1,4 +1,5 @@
 import neo4j from 'neo4j-driver';
+import { crateNameScope } from './match.mjs';
 
 // `scope` 'latest' is served by idx_is_latest; 'all' is a label scan (seconds on millions of versions).
 
@@ -65,12 +66,13 @@ export const unsafeStats = async (read, scope) => {
 
 // Returns one row more than `limit` when more exist (`hasMore`).
 export const unsafeTop = async (read, { scope, sort, desc, q, forbids, build, minLines, minUnsafe, limit, offset }) => {
+  const ns = await crateNameScope(read, neo4j.int, q);
   const order = SORTS[sort] ?? SORTS.total;
   const rows = await read(
-    `MATCH (v:Version)
+    `${ns.match}
      WHERE ${scopeClause(scope)}
        AND v.unsafe_scanner IS NOT NULL AND v.unsafe_error IS NULL
-       AND ($q = '' OR toLower(v.name) CONTAINS $q)
+       AND ${ns.filter}
        AND ($forbids = 'any' OR ($forbids = 'yes' AND v.forbids_unsafe = true)
             OR ($forbids = 'no' AND coalesce(v.forbids_unsafe, false) = false))
        AND ($build = 'any' OR v.has_build_script = ($build = 'yes'))
@@ -80,7 +82,7 @@ export const unsafeTop = async (read, { scope, sort, desc, q, forbids, build, mi
      ORDER BY ${order} ${desc ? 'DESC' : 'ASC'}, v.name, v.version
      SKIP $offset LIMIT $limit
      ${RETURN_ROW}`,
-    { q: q.toLowerCase(), forbids, build, minLines: neo4j.int(minLines), minUnsafe: neo4j.int(minUnsafe), offset: neo4j.int(offset), limit: neo4j.int(limit + 1) },
+    { ...ns.params, forbids, build, minLines: neo4j.int(minLines), minUnsafe: neo4j.int(minUnsafe), offset: neo4j.int(offset), limit: neo4j.int(limit + 1) },
   );
   const hasMore = rows.length > limit;
   return { rows: hasMore ? rows.slice(0, limit) : rows, hasMore };

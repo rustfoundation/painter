@@ -481,24 +481,204 @@ hr.rule {
   background: var(--panel);
 }
 
-.callers-form .search.crate {
-  min-width: 200px;
-}
-
 .callers-form .search.fn {
   flex: 1;
   min-width: 360px;
 }
 
+.callers-form .suggestions.grouped {
+  max-height: 60vh;
+}
+
 .callers-form .suggestions li {
+  display: flex;
+  gap: 10px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
+.callers-form .suggestions li .name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.callers-form .suggestions li .calls {
+  color: var(--muted);
+  font-family: system-ui, sans-serif;
+  font-size: 11px;
+}
+
+.callers-form .suggestions li.active .calls {
+  color: #fff;
+}
+
+.callers-form .suggestions li.group,
+.callers-form .suggestions li.group:hover {
+  font-family: system-ui, sans-serif;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--panel);
+  cursor: default;
+  position: sticky;
+  top: 0;
+  white-space: normal;
+}
+
 .callers-summary code {
   font-size: 12px;
   word-break: break-all;
+}
+
+.callers-summary .small {
+  font-size: 11px;
+}
+
+.callers-summary input {
+  width: 220px;
+}
+
+.callers-form .suggestions li.notice {
+  color: var(--text);
+  position: static;
+}
+
+.callers-summary .callers-filter {
+  min-width: 0;
+}
+
+.callers-summary .callers-filter input {
+  width: 280px;
+  padding-right: 22px;
+}
+
+.callers-summary .callers-filter .clear {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 14px;
+}
+
+.callers-summary .callers-filter .suggestions {
+  left: 0;
+  right: 0;
+}
+
+.callers-summary .callers-filter .suggestions li {
+  display: flex;
+  gap: 10px;
+  white-space: nowrap;
+}
+
+.callers-summary .callers-filter .suggestions li .name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.callers-summary .callers-filter .suggestions li .calls {
+  color: var(--muted);
+  font-family: system-ui, sans-serif;
+  font-size: 11px;
+}
+
+.callers-summary .callers-filter .suggestions li.active .calls,
+.callers-summary .callers-filter .suggestions li:hover .calls {
+  color: #fff;
+}
+
+.callers-summary .callers-filter .suggestions li.group,
+.callers-summary .callers-filter .suggestions li.group:hover {
+  font-family: system-ui, sans-serif;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--panel);
+  cursor: default;
+  white-space: normal;
+}
+
+.callers-pager {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.callers-pager button.link:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+.callers-summary .callers-page-size {
+  font-size: 12px;
+}
+
+.callers-table tr.crate-row.stale {
+  opacity: 0.5;
+}
+
+.callers-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.callers-body .callers-tree {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* The NVL canvas reports a wide intrinsic size; pin the pane so it cannot squeeze the table. */
+.callers-graph {
+  position: relative;
+  flex: 0 0 42%;
+  min-width: 0;
+  overflow: hidden;
+  border-left: 1px solid var(--border);
+  touch-action: none;
+  background: radial-gradient(circle at 50% 50%, #151924 0%, var(--bg) 70%);
+}
+
+.callers-graph .graph-info {
+  position: absolute;
+  top: 6px;
+  left: 8px;
+  right: 8px;
+  z-index: 1;
+  font-size: 11px;
+  color: var(--text);
+  pointer-events: none;
+}
+
+.callers-graph .swatch {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  vertical-align: middle;
+  margin-right: 2px;
+}
+
+.callers button.link {
+  background: none;
+  border: 0;
+  padding: 0 4px;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+}
+
+.callers button.link:hover:not(:disabled) {
+  text-decoration: underline;
+}
+
+.callers-empty .link.mono {
+  font-size: 12px;
 }
 
 .callers-empty {
@@ -525,12 +705,22 @@ hr.rule {
   table-layout: fixed;
 }
 
-.callers-table th.depth {
-  width: 64px;
+.callers-table th.num,
+.callers-table td.num {
+  text-align: right;
+  width: 84px;
+  font-variant-numeric: tabular-nums;
 }
 
-.callers-table th.crate {
-  width: 220px;
+.callers-table th.versions {
+  width: 170px;
+}
+
+.callers-table th:last-child,
+.callers-table td.row-actions {
+  width: 104px;
+  white-space: nowrap;
+  text-align: right;
 }
 
 .callers-table th,
@@ -548,11 +738,11 @@ hr.rule {
   cursor: pointer;
   user-select: none;
   white-space: nowrap;
+  z-index: 1;
 }
 
-.callers-table td.depth {
-  width: 1%;
-  text-align: right;
+.callers-table th.sorted {
+  color: var(--accent);
 }
 
 .callers-table td.crate {
@@ -561,36 +751,89 @@ hr.rule {
   text-overflow: ellipsis;
 }
 
-.callers-table td.crate .badge {
+.callers-table td.crate .badge,
+.callers-table td.function .badge {
   margin-left: 6px;
 }
 
-.callers-table td.function,
-.callers-table td.calls {
-  word-break: break-all;
+.callers-table .badge.unverified {
+  background: #6b728033;
+  color: #b0b7c7;
 }
 
-.callers-table tbody tr:not(.chain) {
+.callers-table .badge.same {
+  background: #f5a62333;
+  color: #ffd38a;
+}
+
+.callers-table .badge.foreign {
+  background: #b88bff33;
+  color: #d5bfff;
+}
+
+.callers-table .caret {
+  display: inline-block;
+  width: 16px;
+  color: var(--muted);
+}
+
+.callers-table button.caret {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  font: inherit;
+}
+
+.callers-table td.function {
+  word-break: break-all;
+  white-space: normal;
+}
+
+.callers-table td.function .name {
+  color: var(--text);
+}
+
+.callers-table td.versions {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.callers-table tr.crate-row {
   cursor: pointer;
 }
 
-.callers-table tbody tr:not(.chain):hover,
-.callers-table tr.open {
+.callers-table tr.crate-row:hover,
+.callers-table tr.crate-row.open {
   background: var(--panel-2);
 }
 
-.callers-table tr.chain td {
+.callers-table tr.crate-row.selected td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.callers-table tr.fn-row td {
   background: var(--panel);
+  font-size: 11.5px;
 }
 
-.callers-table tr.chain ol {
-  margin: 0;
-  padding-left: 20px;
+.callers-table tr.info td {
+  color: var(--muted);
 }
 
-.callers-table tr.chain li {
-  word-break: break-all;
-  padding: 1px 0;
+.callers-table td.danger {
+  color: var(--danger);
+}
+
+.callers-table td.row-actions .link {
+  opacity: 0.45;
+  font-size: 11px;
+}
+
+.callers-table tr:hover td.row-actions .link,
+.callers-table tr.selected td.row-actions .link {
+  opacity: 1;
 }
 
 .pad {
@@ -1232,6 +1475,76 @@ table.diff-files-table td.path {
   text-decoration: underline;
 }
 
+/* Deps view */
+/* `.canvas > div` stretches every child over the canvas, so undo the inset here. */
+.canvas > .deps-legend {
+  position: absolute;
+  inset: auto auto 10px 10px;
+  max-width: calc(100% - 20px);
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--muted);
+  background: rgb(17 21 30 / 80%);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  pointer-events: none;
+}
+
+.deps-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.line.faint {
+  opacity: 0.4;
+}
+
+.details p.deps-hint {
+  padding: 6px 8px;
+  border-left: 3px solid var(--accent);
+  background: rgb(76 141 255 / 8%);
+}
+
+.details .deps-actions {
+  margin-bottom: 8px;
+}
+
+.details ol.deps-path,
+.details ul.deps-children {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.details ol.deps-path li,
+.details ul.deps-children li {
+  padding: 2px 0;
+  word-break: break-all;
+}
+
+.details ul.deps-children {
+  list-style: none;
+  padding-left: 0;
+}
+
+.details button.link {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.details button.link:hover {
+  text-decoration: underline;
+}
+
 .toolbar-opts {
   display: contents;
 }
@@ -1242,6 +1555,104 @@ table.diff-files-table td.path {
 }
 
 /* Phones. Keep the width in sync with MOBILE_QUERY in touch.ts. */
+
+/* Map view: a Canvas2D overlay above NVL for density, community blobs/labels, and the selection halo. */
+.map-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.map-legend {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+}
+
+.map-legend li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.map-legend button,
+.map-neighbours button.link {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+}
+
+.map-legend button:hover,
+.map-neighbours button.link:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.map-legend .names {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.map-legend .count,
+.map-neighbours .count {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+
+.map-neighbours {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+}
+
+.map-neighbours li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 13px;
+}
+
+.map-neighbours li .name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.map-neighbours li .deps {
+  font-size: 11px;
+  padding: 0 6px;
+  line-height: 18px;
+}
+
+.map-legend .swatch,
+.map-neighbours .swatch {
+  flex: 0 0 auto;
+}
+
+.details details.map-build summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 12px 0 6px;
+}
+
 @media (max-width: 768px) {
   .toolbar {
     gap: 6px;
@@ -1355,6 +1766,10 @@ table.diff-files-table td.path {
     flex: 1;
   }
 
+  .canvas > .deps-legend {
+    display: none;
+  }
+
   /* Table views scroll as a whole page so wrapped tiles do not squeeze the table to nothing. */
   .callers,
   .unsafe {
@@ -1382,12 +1797,39 @@ table.diff-files-table td.path {
     flex: 1 1 140px;
   }
 
-  .callers-form .search.crate,
   .callers-form .search.fn,
   .unsafe-controls .search,
   .unsafe-controls input.q {
     min-width: 0;
     flex: 1 1 100%;
+  }
+
+  /* Phones get the tree only; the graph needs a pointer and width. */
+  .callers-body {
+    display: block;
+    flex: none;
+  }
+
+  .callers-table td.row-actions .link {
+    opacity: 1;
+  }
+
+  /* Size columns to content and scroll sideways instead of squeezing the crate name to nothing. */
+  .callers-table table {
+    table-layout: auto;
+    min-width: 100%;
+  }
+
+  .callers-table th.versions,
+  .callers-table th.num,
+  .callers-table td.num,
+  .callers-table th:last-child,
+  .callers-table td.row-actions {
+    width: auto;
+  }
+
+  .callers-table td.function {
+    min-width: 240px;
   }
 
   .unsafe-history,

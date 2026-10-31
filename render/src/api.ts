@@ -1,7 +1,39 @@
+/** Degree-store counts the overview route attaches to crate nodes (cheap: no traversal). */
+export interface NodeCounts {
+  versions?: number;
+  /** Distinct dependent crates (LOD_DEP in-degree, from the last Map build). */
+  dependents?: number;
+  /** Versions declaring a dependency on it (DEPENDS_ON in-degree). */
+  dependentVersions?: number;
+  deps?: number;
+  /** Distinct functions of this crate that some other crate's bitcode calls. */
+  symbolsCalled?: number;
+}
+
+export type OverviewPart = 'deps' | 'versions' | 'calls' | 'dependents';
+
+export interface OverviewMeta {
+  name: string;
+  version: string | null;
+  parts: OverviewPart[];
+  from: 'crate' | 'version';
+  skip: number;
+  limits: Record<OverviewPart, number>;
+  counts: NodeCounts;
+  depsTotal: number;
+  callsTotal: number;
+  selfCalls: number;
+  dependentsShown: number;
+  dependentsSource: 'lod' | 'sample' | null;
+}
+
 export interface GraphNode {
   id: string;
   labels: string[];
   properties: Record<string, unknown>;
+  /** Set by the overview route: root / dep / dependent / callee. */
+  role?: string;
+  counts?: NodeCounts;
 }
 
 export interface GraphRel {
@@ -32,6 +64,7 @@ export interface GraphPayload {
     maxDepth?: number;
     crates?: number;
     edges?: number;
+    overview?: OverviewMeta;
   };
 }
 
@@ -42,8 +75,8 @@ export interface Health {
   config: {
     neo4j: { uri: string; user: string; database: string; maxRows: number; queryTimeoutMs: number };
     allowCypher: boolean;
-    depsMaxEdges: number;
-    depsDefaultEdges: number;
+    depsDefaultNodes: number;
+    depsMaxNodes: number;
   };
 }
 
@@ -51,9 +84,9 @@ export type View = 'default' | 'deps' | 'map' | 'callers' | 'unsafe' | 'build' |
 
 export const VIEWS: { id: View; label: string; title: string }[] = [
   { id: 'default', label: 'Default', title: 'Crates, versions, and their DEPENDS_ON / INVOKES edges' },
-  { id: 'deps', label: 'Deps', title: 'Transitive crate-level dependency chain of every crate matching the filter' },
+  { id: 'deps', label: 'Deps', title: 'Dependency tree of one crate, layered by distance from it' },
   { id: 'map', label: 'Map', title: 'Whole ecosystem on a precomputed layout; zoom in to resolve clusters into crates' },
-  { id: 'callers', label: 'Callers', title: 'Table of every crate version and function that calls a function, directly or through other functions' },
+  { id: 'callers', label: 'Callers', title: 'Who calls a function: caller crates aggregated from the LLVM call graph, expandable into functions and their callers, plus what the function calls' },
   { id: 'unsafe', label: 'Unsafe', title: 'Leaderboard of crate versions by unsafe code: per-category counts, density, forbid(unsafe_code), build scripts, and the unsafe in their dependencies' },
   { id: 'build', label: 'Build scripts', title: 'Crate versions with a build script: where it is, how big, what native library it links, and the most-linked libraries' },
   { id: 'native', label: 'Native code', title: 'Crate versions shipping C / C++ / Objective-C / assembly sources, headers, or prebuilt binaries; vendored libraries' },
@@ -66,44 +99,134 @@ export const VIEWS: { id: View; label: string; title: string }[] = [
 export const TABLE_VIEWS: ReadonlySet<View> = new Set<View>(['callers', 'unsafe', 'build', 'native', 'diffs', 'publishers', 'releases', 'supply']);
 export const isTableView = (v: View) => TABLE_VIEWS.has(v);
 
-export interface CallerRow {
-  depth: number;
+export interface SymbolHit {
+  name: string;
   crate: string;
-  version: string;
-  function: string;
-  calls: string;
-  /** False when a version was pinned but the caller has no direct DEPENDS_ON to check it against. */
-  verified: boolean;
-  path: string[];
+  /** Distinct calling functions (CALLS fan-in). */
+  calls: number;
 }
 
+export interface SymbolSearchResult {
+  symbols: SymbolHit[];
+  /** Crate names starting with the query, for a bare word (`tokio` -> `tokio::`). */
+  crates: string[];
+  /** Crate the search was scoped to when the query had a `crate::` prefix. */
+  scope: string | null;
+  /** The query had `*` / `?`: `symbols` are full-name pattern matches, most callers first. */
+  pattern?: boolean;
+  /** Why a pattern returned nothing to search from (no literal run long enough). */
+  hint?: string;
+  /** Global pattern: the literal it was seeded from and how many names containing it were checked. */
+  seed?: string;
+  scan?: number;
+  elapsedMs: number;
+}
+
+/** What Enter opens: an exact symbol for plain text, the match with the most callers for a pattern. */
+export interface SymbolResolveResult {
+  symbol: SymbolHit | null;
+  pattern: boolean;
+  matches?: number;
+  hint?: string | null;
+  elapsedMs: number;
+}
+
+/** `verified`: a dependency requirement admits a pinned version; `same`: same crate, same version; `unverified`: no direct dependency to check. */
+export type CallerStatus = 'verified' | 'same' | 'unverified';
+
+export interface CallerVersion {
+  version: string;
+  latest: boolean;
+  /** Calling functions in this version. */
+  fns: number;
+  status: CallerStatus;
+}
+
+export interface CallerCrate {
+  crate: string;
+  downloads: number;
+  versions: CallerVersion[];
+  fns: number;
+  verified: number;
+  unverified: number;
+  functionCount: number;
+  /** Distinct calling functions, most widespread across versions first (capped server-side). */
+  functions: { name: string; versions: number }[];
+}
+
+export type CallerSort = 'downloads' | 'functions' | 'versions' | 'crate';
+
 export interface CallersResult {
-  rows: CallerRow[];
+  target: {
+    name: string;
+    crate: string | null;
+    versions: string[] | null;
+    local: { crate: string; versions: string[] } | null;
+  };
+  callers: CallerCrate[];
   meta: {
-    crate: string;
-    version: string | null;
-    fn: string;
-    exact: boolean;
-    targets: string[];
-    maxDepth: number;
-    depth: number;
-    limit: number;
+    /** True CALLS fan-in of the symbol. */
+    total: number;
+    /** Calling functions actually expanded (<= cap). */
+    scanned: number;
+    cap: number;
     truncated: boolean;
-    exhausted: boolean;
-    unverified: number;
-    /** Edges dropped because the caller's requirement excludes the pinned version. */
+    /** Caller versions dropped because their requirement excludes every pinned version. */
     rejected: number;
+    /** Totals over the whole filtered set, not just this page. */
+    crates: number;
+    versions: number;
+    fns: number;
+    unverified: number;
+    /** Caller crates before the filter. */
+    allCrates: number;
+    offset: number;
+    limit: number;
+    hasMore: boolean;
+    sort: CallerSort;
+    desc: boolean;
+    filter: string;
+    /** The per-crate aggregate came from the server's cache (paging / sorting / filtering never re-run the fan-in). */
+    cached: boolean;
+    aggregateMs: number;
+    /** Only set when nothing calls the symbol: how many versions define it. */
+    definitions?: number;
     elapsedMs: number;
   };
 }
 
 export interface CallersQuery {
-  crate: string;
-  version: string | null;
   fn: string;
-  exact: boolean;
-  depth: number;
-  limit: number;
+  /** Pin the callee crate to these versions; null = any. */
+  versions: string[] | null;
+  /** Walk only these versions of this crate (the symbol is a monomorphised copy inside them). */
+  local?: { crate: string; versions: string[] } | null;
+  /** Calling functions to expand (server default 15,000; raise to see every caller of a hot symbol). */
+  cap?: number;
+  /** Page of caller crates (server default 0 / 100, limit <= 500). */
+  offset?: number;
+  limit?: number;
+  sort?: CallerSort;
+  desc?: boolean;
+  /** Caller crate name (exact, case-insensitive) or a `*` / `?` pattern. */
+  filter?: string;
+}
+
+const callersParams = (q: CallersQuery) => {
+  const params = new URLSearchParams({ fn: q.fn });
+  if (q.versions?.length) params.set('versions', q.versions.join(','));
+  if (q.local) {
+    params.set('localCrate', q.local.crate);
+    params.set('localVersions', q.local.versions.join(','));
+  }
+  if (q.cap) params.set('cap', String(q.cap));
+  return params;
+};
+
+export interface CalleesResult {
+  from: { crate: string; version: string } | null;
+  callees: { crate: string; downloads: number; functions: { name: string; copies: number; calls: number }[] }[];
+  meta: { crates: number; functions: number; elapsedMs: number };
 }
 
 export interface CrateVersion {
@@ -112,19 +235,50 @@ export interface CrateVersion {
   exported: boolean;
 }
 
+export interface LodBounds {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+}
+
 export interface LodViewport {
-  mode: 'crates' | 'cells';
+  mode: 'landmarks';
   level: number;
+  /** Landmark crates (properties: name, x, y, community, downloads, dependents, dependencies, rank). */
   nodes: GraphNode[];
   rels: GraphRel[];
+  /** Sparse count grid over the bbox: `cells` is flat [index, count, dominant community, ...]. */
+  density: { x0: number; y0: number; x1: number; y1: number; cols: number; rows: number; cells: number[] };
   meta: {
     inView: number;
     total: number;
-    cells?: number;
+    shown: number;
+    relsTotal: number;
     elapsedMs: number;
     relsTruncated: boolean;
-    bounds: { minX: number; minY: number; maxX: number; maxY: number };
+    bounds: LodBounds;
   };
+}
+
+export interface LodCommunity {
+  id: number;
+  size: number;
+  downloads: number;
+  x: number;
+  y: number;
+  radius: number;
+  spread: number;
+  bbox: { x0: number; y0: number; x1: number; y1: number };
+  hull: [number, number][];
+  top: string[];
+}
+
+export interface LodNeighbours {
+  crate: GraphNode;
+  community: { id: number; size: number; top: string[] } | null;
+  dependencies: { total: number; top: GraphNode[] };
+  dependents: { total: number; top: GraphNode[] };
 }
 
 export interface LodJob {
@@ -141,7 +295,7 @@ export interface LodStatus {
   last: { kind: string; startedAt: string; finishedAt: string; ok: boolean; error: string | null; elapsedMs: number } | null;
   meta: Record<string, unknown> | null;
   unpositionedCrates: number | null;
-  index: { loadedAt: string; crates: number; edges: number; bounds: LodViewport['meta']['bounds']; maxLevel: number } | null;
+  index: { loadedAt: string; crates: number; edges: number; bounds: LodBounds; core: LodBounds; communities: number } | null;
   indexLoading: boolean;
   indexError: string | null;
   config: { iterations: number; budget: number; maxLevel: number };
@@ -744,7 +898,7 @@ export class ApiError extends Error {
   }
 }
 
-const request = async <T>(url: string, init?: RequestInit): Promise<T> => {
+export const request = async <T>(url: string, init?: RequestInit): Promise<T> => {
   const res = await fetch(url, init);
   const text = await res.text();
   let body: unknown = null;
@@ -781,39 +935,56 @@ export const api = {
     });
     return request<GraphPayload>(`/api/graph/crate/${encodeURIComponent(name)}?${params}`);
   },
-  /** Partial match from 3 characters, exact below. */
-  loadDepsChain: (q: string, limit: number, depth: number, exact = false) =>
-    request<GraphPayload>(
-      `/api/graph/deps/chain?${new URLSearchParams({ q, limit: String(limit), depth: String(depth), exact: exact ? '1' : '0' })}`,
-    ),
-  loadDeps: (crate: string | null, direction: 'in' | 'out' | 'both', limit: number) => {
-    const params = new URLSearchParams({ direction, limit: String(limit) });
-    if (crate) params.set('crate', crate);
-    return request<GraphPayload>(`/api/graph/deps?${params}`);
+  /** Default view: one crate with bounded, pre-aggregated neighbours; `name` may be partial. */
+  overview: (req: { name: string; parts: OverviewPart[]; version?: string | null; from?: 'crate' | 'version'; skip?: number; limit?: number; root?: boolean }) => {
+    const params = new URLSearchParams({ parts: req.parts.join(',') });
+    if (req.version) params.set('version', req.version);
+    if (req.from) params.set('from', req.from);
+    if (req.skip) params.set('skip', String(req.skip));
+    if (req.limit) params.set('limit', String(req.limit));
+    if (req.root) params.set('root', '1');
+    return request<GraphPayload>(`/api/graph/overview/${encodeURIComponent(req.name)}?${params}`);
   },
   lodStatus: () => request<LodStatus>('/api/lod/status'),
   lodRebuild: (opts: { iterations?: number; reuseEdges?: boolean; resume?: boolean } = {}) =>
     request<LodStatus>('/api/lod/rebuild', json(opts)),
   lodUpdate: () => request<LodStatus>('/api/lod/update', json({})),
-  lodViewport: (bbox: { x0: number; y0: number; x1: number; y1: number } | null, budget: number, minCell = 0) => {
-    const params = new URLSearchParams({ budget: String(budget), minCell: String(minCell) });
+  lodViewport: (bbox: { x0: number; y0: number; x1: number; y1: number } | null, budget: number, minCell = 0, maxRels = budget) => {
+    const params = new URLSearchParams({ budget: String(budget), minCell: String(minCell), maxRels: String(maxRels) });
     if (bbox) for (const k of ['x0', 'y0', 'x1', 'y1'] as const) params.set(k, String(bbox[k]));
     return request<LodViewport>(`/api/lod/viewport?${params}`);
   },
-  lodLocate: (name: string) =>
-    request<{ name: string; x: number; y: number; community: number; degree: number }>(`/api/lod/locate?name=${encodeURIComponent(name)}`),
+  lodLocate: (name: string) => request<GraphNode['properties'] & { name: string; x: number; y: number }>(`/api/lod/locate?name=${encodeURIComponent(name)}`),
+  lodNeighbours: (name: string, limit = 40) => request<LodNeighbours>(`/api/lod/neighbours?name=${encodeURIComponent(name)}&limit=${limit}`),
+  lodCommunities: () => request<{ communities: LodCommunity[]; total: number }>('/api/lod/communities'),
   lodSearch: (q: string, limit = 15) =>
     request<{ names: string[] }>(`/api/lod/search?q=${encodeURIComponent(q)}&limit=${limit}`).then((r) => r.names),
-  searchFunctions: (crate: string, q: string, limit = 20) =>
-    request<{ functions: { name: string; calls: number }[] }>(
-      `/api/functions/search?${new URLSearchParams({ crate, q, limit: String(limit) })}`,
-    ).then((r) => r.functions),
+  searchSymbols: (q: string, limit = 30, signal?: AbortSignal) =>
+    request<SymbolSearchResult>(`/api/symbols/search?${new URLSearchParams({ q, limit: String(limit) })}`, { signal }),
   crateVersions: (name: string) =>
     request<{ versions: CrateVersion[] }>(`/api/crates/${encodeURIComponent(name)}/versions`).then((r) => r.versions),
+  resolveSymbol: (q: string) => request<SymbolResolveResult>(`/api/symbols/resolve?${new URLSearchParams({ q })}`),
   callers: (q: CallersQuery) => {
-    const params = new URLSearchParams({ crate: q.crate, fn: q.fn, match: q.exact ? 'exact' : 'contains', depth: String(q.depth), limit: String(q.limit) });
-    if (q.version) params.set('version', q.version);
-    return request<CallersResult>(`/api/callers?${params}`);
+    const params = callersParams(q);
+    if (q.offset) params.set('offset', String(q.offset));
+    if (q.limit) params.set('limit', String(q.limit));
+    if (q.sort) params.set('sort', q.sort);
+    if (q.desc !== undefined) params.set('desc', q.desc ? '1' : '0');
+    if (q.filter) params.set('filter', q.filter);
+    return request<CallersResult>(`/api/symbols/callers?${params}`);
+  },
+  /** Caller crate names containing `text` for the filter hints, off the server's cached aggregate. */
+  callerCrates: (q: CallersQuery, text: string, limit = 12, signal?: AbortSignal) => {
+    const params = callersParams(q);
+    params.set('q', text);
+    params.set('limit', String(limit));
+    return request<{ names: { crate: string; downloads: number; fns: number }[]; matches: number }>(`/api/symbols/callers/crates?${params}`, { signal });
+  },
+  callees: (fn: string, crate?: string | null, version?: string | null) => {
+    const params = new URLSearchParams({ fn });
+    if (crate) params.set('crate', crate);
+    if (version) params.set('version', version);
+    return request<CalleesResult>(`/api/symbols/callees?${params}`);
   },
   unsafeStats: (scope: UnsafeScope) => request<UnsafeStats>(`/api/unsafe/stats?scope=${scope}`),
   unsafeTop: (q: UnsafeTopQuery) =>

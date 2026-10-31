@@ -21,6 +21,8 @@ import {
   type Column,
   type HistoryBar,
 } from './meta';
+import { NameFilter } from './NameFilter';
+import { hasWildcard, nameTester } from '../match';
 
 interface Props {
   busy: boolean;
@@ -110,6 +112,15 @@ function BuildHistory({ name, versions, onPick }: { name: string; versions: Buil
     />
   );
 }
+
+// Every distinct package.links value (a few hundred), fetched once for the hint dropdown.
+let linksList: Promise<{ value: string; note: string }[]> | null = null;
+const linkHints = async (q: string) => {
+  linksList ??= api.buildLinks('all', 2000).then((rows) => rows.map((r) => ({ value: r.links, note: `${r.crates.toLocaleString()} crates` })));
+  const all = await linksList.catch(() => (linksList = null, []));
+  const test = hasWildcard(q) ? nameTester(q) : (n: string) => n.toLowerCase().includes(q.toLowerCase());
+  return all.filter((h) => test(h.value)).slice(0, 12);
+};
 
 export function BuildView({ busy, onBusy, onError, onOpenCrate }: Props) {
   const [scope, setScope] = useState<UnsafeScope>('latest');
@@ -203,11 +214,11 @@ export function BuildView({ busy, onBusy, onError, onOpenCrate }: Props) {
 
       <div className="unsafe-controls">
         <ScopeSelect scope={scope} onChange={setScope} />
-        <input type="text" placeholder="Crate name contains…" value={q} onChange={(e) => setQ(e.target.value)} spellCheck={false} className="q" />
+        <NameFilter value={q} onChange={setQ} />
         <TriSelect label="links" value={links} onChange={setLinks} title="Only scripts that declare (or do not declare) package.links" />
-        <label className="opt" title="Exact package.links value">
+        <label className="opt" title="package.links value: exact, or a pattern like z*">
           links =
-          <input type="text" value={link} onChange={(e) => setLink(e.target.value.trim())} placeholder="any" className="limit wide" spellCheck={false} />
+          <NameFilter value={link} onChange={(v) => setLink(v.trim())} hints={linkHints} placeholder="any" className="limit wide" />
         </label>
         <TriSelect label="custom path" value={custom} onChange={setCustom} title="Script is not the default build.rs" />
         <label className="opt" title="Only scripts with at least this many lines">
