@@ -22,6 +22,7 @@ import {
   type Column,
   type HistoryBar,
 } from './meta';
+import { NameFilter } from './NameFilter';
 
 interface Props {
   busy: boolean;
@@ -289,7 +290,7 @@ export function DiffsView({ busy, onBusy, onError, onOpenCrate }: Props) {
 
       <div className="unsafe-controls">
         <ScopeSelect scope={scope} onChange={setScope} />
-        <input type="text" placeholder="Crate name contains…" value={q} onChange={(e) => setQ(e.target.value)} spellCheck={false} className="q" />
+        <NameFilter value={q} onChange={setQ} />
         <label className="opt" title="A crate's first version is compared against nothing, so every line counts as added">
           first versions
           <select value={firsts} onChange={(e) => setFirsts(e.target.value as DiffFirsts)}>

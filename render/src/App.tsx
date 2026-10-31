@@ -8,19 +8,24 @@ import {
   type CrateLoadOptions,
   type ExpandType,
   type GraphNode,
-  type GraphPayload,
   type GraphRel,
   type Health,
+  type OverviewMeta,
+  type OverviewPart,
   type Stats,
   type View,
 } from './api';
-import { emptyStore, mergePayload, removeNode, toNvl, type GraphStore } from './graph';
-import { useTouchZoomPan } from './touch';
+import { emptyStore, isCrate, isVersion, mergePayload, removeNode, toNvl, type GraphStore } from './graph';
+import { DEFAULT_DEPS_OPTIONS, type DepsOptions, type DepsStatus } from './deps';
+import { clearOverviewLayout, mergeOverview, overviewLabels, placeOverview, shownCount, toNvlOverview } from './overview';
+import { OverviewLabels } from './components/OverviewLabels';
+import { useIsMobile, useTouchZoomPan } from './touch';
 import { Toolbar } from './components/Toolbar';
 import { DetailsPanel } from './components/DetailsPanel';
 import { CypherPanel } from './components/CypherPanel';
 import { StatusBar } from './components/StatusBar';
 import { MapView } from './components/MapView';
+import { DepsView } from './components/DepsView';
 import { CallersView } from './components/CallersView';
 import { UnsafeView } from './components/UnsafeView';
 import { BuildView } from './components/BuildView';
@@ -31,7 +36,6 @@ import { ReleasesView } from './components/ReleasesView';
 import { SupplyView } from './components/SupplyView';
 
 const DEFAULT_OPTIONS: CrateLoadOptions = { versions: 'latest', deps: true, invokes: true, dependents: false, limit: 200 };
-const DEFAULT_DEPS_LIMIT = 5000;
 
 const errorMessage = (err: unknown): string => {
   if (err instanceof ApiError) return err.code ? `${err.message} [${err.code}]` : err.message;
@@ -43,10 +47,14 @@ export function App() {
   const nvlRef = useRef<NVL>(null);
   const [canvasEl, setCanvasEl] = useState<HTMLDivElement | null>(null);
   useTouchZoomPan(canvasEl, nvlRef);
+  // On a phone the details sheet covers the canvas, so a fresh load leaves nothing selected there.
+  const isMobile = useIsMobile();
   const [store, setStore] = useState<GraphStore>(emptyStore);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [options, setOptions] = useState<CrateLoadOptions>(DEFAULT_OPTIONS);
-  const [layout, setLayout] = useState<string>('forceDirected');
+  // The Default view lays nodes out itself (src/overview.ts) on NVL's free layout; other graph views simulate.
+  const [layout, setLayout] = useState<string>('free');
+  const [overviewMeta, setOverviewMeta] = useState<(OverviewMeta & { elapsedMs: number }) | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
@@ -55,9 +63,9 @@ export function App() {
   const [hiddenRelTypes, setHiddenRelTypes] = useState<Set<string>>(new Set());
   const [showRelCaptions, setShowRelCaptions] = useState(false);
   const [view, setView] = useState<View>('default');
-  const [depsLimit, setDepsLimit] = useState(DEFAULT_DEPS_LIMIT);
-  const [depsDepth, setDepsDepth] = useState(0);
-  const [depsMeta, setDepsMeta] = useState<GraphPayload['meta'] | null>(null);
+  const [depsOptions, setDepsOptions] = useState<DepsOptions>(DEFAULT_DEPS_OPTIONS);
+  const [depsTarget, setDepsTarget] = useState<{ name: string; nonce: number } | null>(null);
+  const [depsStatus, setDepsStatus] = useState<DepsStatus | null>(null);
   const [mapTarget, setMapTarget] = useState<{ name: string; nonce: number } | null>(null);
   const [mapBudget, setMapBudget] = useState(600);
   const [mapMeta, setMapMeta] = useState<{ mode: string; level: number; inView: number; total: number; nodes: number; rels: number; elapsedMs: number } | null>(null);
@@ -101,77 +109,62 @@ export function App() {
   // Resolved name: the server accepts partial input ("serd" loads "serde").
   const [loadedName, setLoadedName] = useState<string | null>(null);
 
+  // Replaces the canvas: the overview is laid out around one root (src/overview.ts); expansions merge into it.
   const loadCrate = useCallback(
     async (input: string) => {
       setBusy(true);
       setError(null);
       try {
-        const payload = await api.loadCrate(input, options);
+        const parts: OverviewPart[] = ['deps', 'versions'];
+        if (options.invokes) parts.push('calls');
+        if (options.dependents) parts.push('dependents');
+        const payload = await api.overview({ name: input, parts, root: true });
         const name = payload.meta.resolvedName ?? input;
         setLoadedName(name);
-        setStore((s) => mergePayload(s, payload, name));
+        setOverviewMeta(payload.meta.overview ? { ...payload.meta.overview, elapsedMs: payload.meta.elapsedMs } : null);
         const crate = payload.nodes.find((n) => n.labels.includes('Crate') && n.properties.name === name);
-        if (crate) setSelectedId(crate.id);
-        window.setTimeout(fitAll, 400);
-      } catch (err) {
-        setError(errorMessage(err));
-      } finally {
-        setBusy(false);
-      }
-    },
-    [options, fitAll],
-  );
-
-  const loadDeps = useCallback(
-    async (crate: string | null, direction: 'in' | 'out' | 'both' = 'both', replace = false) => {
-      setBusy(true);
-      setError(null);
-      try {
-        const payload = await api.loadDeps(crate, direction, depsLimit);
-        const name = payload.meta.resolvedName ?? crate ?? null;
-        if (name) setLoadedName(name);
-        setDepsMeta(payload.meta);
-        setStore((s) => mergePayload(replace ? emptyStore() : s, payload, name ?? undefined));
-        if (name) {
-          const node = payload.nodes.find((n) => n.labels.includes('Crate') && n.properties.name === name);
-          if (node) setSelectedId(node.id);
-        } else {
-          setSelectedId(null);
-        }
-        window.setTimeout(fitAll, 600);
-      } catch (err) {
-        setError(errorMessage(err));
-      } finally {
-        setBusy(false);
-      }
-    },
-    [depsLimit, fitAll],
-  );
-
-  // Replaces the canvas; expansions from the details panel merge via loadDeps.
-  const loadChain = useCallback(
-    async (q: string, exact = false) => {
-      setBusy(true);
-      setError(null);
-      try {
-        const payload = await api.loadDepsChain(q, depsLimit, depsDepth, exact);
-        setDepsMeta(payload.meta);
-        let next = emptyStore();
-        for (const r of payload.meta.roots ?? []) next.roots.add(r);
-        next = mergePayload(next, payload);
+        clearOverviewLayout();
+        const next = mergePayload(emptyStore(), payload, name);
+        placeOverview(next, crate?.id ?? null);
         setStore(next);
-        setLoadedName(null);
-        const roots = payload.meta.roots ?? [];
-        const single = roots.length === 1 ? payload.nodes.find((n) => n.properties.name === roots[0]) : undefined;
-        setSelectedId(single?.id ?? null);
-        window.setTimeout(fitAll, 600);
+        setSelectedId(isMobile ? null : (crate?.id ?? null));
+        window.setTimeout(fitAll, 150);
       } catch (err) {
         setError(errorMessage(err));
       } finally {
         setBusy(false);
       }
     },
-    [depsLimit, depsDepth, fitAll],
+    [options, fitAll, isMobile],
+  );
+
+  // One bounded part (deps / versions / calls / dependents) of one crate, hung off its node (or one of its
+  // version nodes when `version` is given) and placed away from the root.
+  const expandOverview = useCallback(
+    async (name: string, part: OverviewPart, opts: { version?: string } = {}) => {
+      setBusy(true);
+      setError(null);
+      try {
+        const skip = part === 'versions' || part === 'dependents' ? shownCount(store, name, part) : 0;
+        const payload = await api.overview({ name, parts: [part], version: opts.version ?? null, from: opts.version ? 'version' : 'crate', skip });
+        const anchor = opts.version
+          ? payload.nodes.find((n) => isVersion(n) && n.properties.name === name && n.properties.version === opts.version)
+          : payload.nodes.find((n) => isCrate(n) && n.properties.name === name);
+        setStore((s) => {
+          const next = mergeOverview(s, payload);
+          placeOverview(next, anchor?.id ?? null);
+          return next;
+        });
+        if (payload.nodes.length <= 1 && payload.rels.length === 0) {
+          setError(`${name}${opts.version ? `@${opts.version}` : ''}: nothing more to add for ${part}`);
+        }
+      } catch (err) {
+        setError(errorMessage(err));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [store],
   );
 
   const switchView = useCallback(
@@ -181,34 +174,36 @@ export function App() {
       setStore(emptyStore());
       setSelectedId(null);
       setError(null);
-      setDepsMeta(null);
+      setDepsStatus(null);
+      setOverviewMeta(null);
+      clearOverviewLayout();
+      setLayout((l) => (next === 'default' ? 'free' : l === 'free' ? 'forceDirected' : l));
     },
     [view],
   );
 
   const load = useCallback(
-    (input: string, exact = false) => {
+    (input: string) => {
       if (view === 'map') {
         setMapTarget({ name: input, nonce: Date.now() });
         return Promise.resolve();
       }
-      return view === 'deps' ? loadChain(input, exact) : loadCrate(input);
+      if (view === 'deps') {
+        setDepsTarget({ name: input, nonce: Date.now() });
+        return Promise.resolve();
+      }
+      return loadCrate(input);
     },
-    [view, loadChain, loadCrate],
+    [view, loadCrate],
   );
 
-  const openInDeps = useCallback(
-    (name: string) => {
-      setView('deps');
-      setStore(emptyStore());
-      setSelectedId(null);
-      setError(null);
-      setDepsMeta(null);
-      // loadChain reads view-independent state, so it can run right after the switch.
-      void loadChain(name, true);
-    },
-    [loadChain],
-  );
+  const openInDeps = useCallback((name: string) => {
+    setView('deps');
+    setStore(emptyStore());
+    setSelectedId(null);
+    setError(null);
+    setDepsTarget({ name, nonce: Date.now() });
+  }, []);
 
   const openInGraph = useCallback(
     (name: string) => {
@@ -216,6 +211,7 @@ export function App() {
       setStore(emptyStore());
       setSelectedId(null);
       setError(null);
+      setLayout('free');
       void loadCrate(name);
     },
     [loadCrate],
@@ -232,20 +228,30 @@ export function App() {
     setError(null);
     try {
       const payload = await api.expand(id, direction, types, 100);
-      setStore((s) => mergePayload(s, payload));
+      setStore((s) => {
+        const next = mergePayload(s, payload);
+        // The Default view's free layout needs coordinates for owners / uploaders too.
+        if (view === 'default') placeOverview(next, id);
+        return next;
+      });
     } catch (err) {
       setError(errorMessage(err));
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [view]);
 
   const runCypher = useCallback(async (query: string) => {
     setBusy(true);
     setError(null);
     try {
       const payload = await api.cypher(query);
-      setStore((s) => mergePayload(s, payload));
+      setStore((s) => {
+        const next = mergePayload(s, payload);
+        // The free layout needs coordinates; ring the newcomers around whatever is drawn.
+        if (view === 'default') placeOverview(next, null);
+        return next;
+      });
       window.setTimeout(fitAll, 400);
       return payload;
     } catch (err) {
@@ -254,7 +260,7 @@ export function App() {
     } finally {
       setBusy(false);
     }
-  }, [fitAll]);
+  }, [fitAll, view]);
 
   const remove = useCallback((id: string) => {
     setStore((s) => removeNode(s, id));
@@ -265,12 +271,18 @@ export function App() {
     setStore(emptyStore());
     setSelectedId(null);
     setError(null);
+    setOverviewMeta(null);
+    clearOverviewLayout();
   }, []);
 
   const { nodes, rels } = useMemo(
-    () => toNvl(store, selectedId, { showRelCaptions, hiddenRelTypes }),
-    [store, selectedId, showRelCaptions, hiddenRelTypes],
+    () =>
+      view === 'default'
+        ? toNvlOverview(store, selectedId, { showRelCaptions, hiddenRelTypes })
+        : toNvl(store, selectedId, { showRelCaptions, hiddenRelTypes }),
+    [store, selectedId, showRelCaptions, hiddenRelTypes, view],
   );
+  const labelSpecs = useMemo(() => (view === 'default' ? overviewLabels(store, overviewMeta?.version ?? null) : []), [store, view, overviewMeta]);
 
   const selected: GraphNode | GraphRel | null = selectedId ? (store.nodes.get(selectedId) ?? store.rels.get(selectedId) ?? null) : null;
 
@@ -304,9 +316,11 @@ export function App() {
       onRelationshipClick: (rel: NvlRel) => setSelectedId(rel.id),
       onCanvasClick: () => setSelectedId(null),
       onNodeDoubleClick: (node: NvlNode) => {
-        if (view === 'deps') {
-          const n = store.nodes.get(node.id);
-          if (n) void loadDeps(String(n.properties.name), 'both');
+        const n = store.nodes.get(node.id);
+        if (view === 'default' && n && isCrate(n)) {
+          void expandOverview(String(n.properties.name), 'deps');
+        } else if (view === 'default' && n && isVersion(n)) {
+          void expandOverview(String(n.properties.name), 'deps', { version: String(n.properties.version) });
         } else {
           void expand(node.id, 'both', []);
         }
@@ -317,7 +331,7 @@ export function App() {
       onZoomAndPan: true,
       onDrag: true,
     }),
-    [expand, view, store, loadDeps],
+    [expand, expandOverview, view, store],
   );
 
   return (
@@ -325,16 +339,13 @@ export function App() {
       <Toolbar
         view={view}
         onViewChange={switchView}
-        depsLimit={depsLimit}
-        depsMaxLimit={health?.config.depsMaxEdges ?? 50_000}
-        onDepsLimitChange={setDepsLimit}
-        depsDepth={depsDepth}
-        onDepsDepthChange={setDepsDepth}
+        depsOptions={depsOptions}
+        onDepsOptionsChange={setDepsOptions}
         mapBudget={mapBudget}
         onMapBudgetChange={setMapBudget}
         options={options}
         onOptionsChange={setOptions}
-        onLoad={(n, exact) => void load(n, exact)}
+        onLoad={(n) => void load(n)}
         loadedName={loadedName}
         onClear={clear}
         onFit={fitAll}
@@ -344,7 +355,7 @@ export function App() {
       />
       <div className="main">
         {view === 'callers' ? (
-          <CallersView busy={busy} onBusy={setBusy} onError={setError} />
+          <CallersView busy={busy} onBusy={setBusy} onError={setError} onOpenCrate={openInGraph} onOpenDeps={openInDeps} />
         ) : view === 'unsafe' ? (
           <UnsafeView busy={busy} onBusy={setBusy} onError={setError} onOpenCrate={openInGraph} />
         ) : view === 'build' ? (
@@ -368,32 +379,32 @@ export function App() {
             onOpenInDeps={openInDeps}
             onMeta={setMapMeta}
           />
+        ) : view === 'deps' ? (
+          <DepsView
+            target={depsTarget}
+            options={depsOptions}
+            onOptionsChange={setDepsOptions}
+            onBusy={setBusy}
+            onError={setError}
+            onStatus={setDepsStatus}
+            onRootChange={setLoadedName}
+            onOpenInGraph={openInGraph}
+          />
         ) : (
         <>
         <div className="canvas" ref={setCanvasEl}>
-          {nodes.length === 0 && view === 'deps' ? (
+          {nodes.length === 0 ? (
             <div className="empty">
-              <h1>crate dependency chain</h1>
+              <h1>crate overview</h1>
               <p>
                 {busy
-                  ? 'Resolving the transitive dependency chain…'
-                  : 'Type a crate name and press Load to draw its full transitive dependency chain. If no crate has exactly that name, 3 or more characters make every crate whose name contains the text a root.'}
+                  ? 'Loading…'
+                  : 'Type a crate name and press Load. You get the crate in the middle, what its latest version depends on to the right (normal deps inside, build / dev outside, dimmer when optional, thicker when its code calls into them), its newest versions along the bottom, and, with the dependents option, the biggest crates that use it on the left.'}
               </p>
               <p className="muted">
-                Versions are folded into their crate: an edge A → B means some version of A depends on B. Max edges and max depth
-                (0 = unlimited) bound the chain.
-              </p>
-            </div>
-          ) : nodes.length === 0 ? (
-            <div className="empty">
-              <h1>painter graph</h1>
-              <p>
-                Type part of a crate name above and press Load. Partial names match anywhere in the name and load the
-                closest crate, with its versions and their dependency / invocation edges.
-              </p>
-              <p className="muted">
-                Or open the Cypher panel at the bottom and run any read query: every node and relationship in the result is
-                drawn.
+                Click anything for details and bounded next steps (dependencies, dependents, older versions, calls, owners);
+                double-click a crate or version to add its dependencies. The Cypher panel below merges any read query into the
+                canvas.
               </p>
             </div>
           ) : null}
@@ -407,6 +418,7 @@ export function App() {
             onInitializationError={(e) => setError(`NVL failed to initialise: ${errorMessage(e)}`)}
             style={{ width: '100%', height: '100%' }}
           />
+          <OverviewLabels nvlRef={nvlRef} specs={labelSpecs} active={view === 'default'} />
         </div>
         <aside className={`sidebar${selected ? ' has-selection' : ''}`}>
           {selected && (
@@ -416,12 +428,13 @@ export function App() {
           )}
           <DetailsPanel
             view={view}
-            onExpandDeps={(name, dir) => void loadDeps(name, dir)}
             selected={selected}
             nodeById={(id) => store.nodes.get(id)}
             onExpand={(id, dir, types) => void expand(id, dir, types)}
+            onOverview={(name, part, o) => void expandOverview(name, part, o)}
+            shownCount={(name, part) => shownCount(store, name, part)}
             onRemove={remove}
-            onLoadCrate={(n) => void (view === 'deps' ? loadChain(n, true) : loadCrate(n))}
+            onLoadCrate={(n) => void loadCrate(n)}
             onOpenUser={openUser}
             busy={busy}
           />
@@ -432,13 +445,14 @@ export function App() {
       <CypherPanel enabled={health?.config.allowCypher ?? true} busy={busy} onRun={runCypher} />
       <StatusBar
         view={view}
-        depsMeta={depsMeta}
+        depsStatus={depsStatus}
+        overviewMeta={overviewMeta}
         mapMeta={mapMeta}
         health={health}
         healthError={healthError}
         stats={stats}
-        nodeCount={view === 'map' ? (mapMeta?.nodes ?? 0) : nodes.length}
-        relCount={view === 'map' ? (mapMeta?.rels ?? 0) : rels.length}
+        nodeCount={view === 'map' ? (mapMeta?.nodes ?? 0) : view === 'deps' ? (depsStatus?.nodes ?? 0) : nodes.length}
+        relCount={view === 'map' ? (mapMeta?.rels ?? 0) : view === 'deps' ? (depsStatus?.edges ?? 0) : rels.length}
         hiddenRelTypes={hiddenRelTypes}
         onToggleRelType={(t) =>
           setHiddenRelTypes((h) => {

@@ -1,14 +1,18 @@
 import { useEffect, useState } from 'react';
-import { api, type CrateRegistry, type ExpandType, type GraphNode, type GraphRel, type VersionPublisher, type View } from '../api';
+import { api, type CrateRegistry, type ExpandType, type GraphNode, type GraphRel, type OverviewPart, type VersionPublisher, type View } from '../api';
 import { isCrate, isTeam, isUser, isVersion, nodeTitle, relTitle } from '../graph';
+import { ROLE_COLORS } from '../overview';
 import { fmtBytes, fmtCompact, fmtDate, fmtDateTime, UserLink } from './meta';
 
 interface Props {
   view: View;
-  onExpandDeps: (name: string, direction: 'in' | 'out' | 'both') => void;
   selected: GraphNode | GraphRel | null;
   nodeById: (id: string) => GraphNode | undefined;
   onExpand: (id: string, direction: 'in' | 'out' | 'both', types: ExpandType[]) => void;
+  /** Default view: add one bounded part of a crate (or of one of its versions) to the canvas. */
+  onOverview?: (name: string, part: OverviewPart, opts?: { version?: string }) => void;
+  /** Default view: how many versions / dependents of a crate are already drawn. */
+  shownCount?: (name: string, part: OverviewPart) => number;
   onRemove: (id: string) => void;
   onLoadCrate: (name: string) => void;
   onOpenUser: (login: string) => void;
@@ -570,28 +574,94 @@ function Properties({ props }: { props: Record<string, unknown> }) {
   );
 }
 
-export function DetailsPanel({ view, onExpandDeps, selected, nodeById, onExpand, onRemove, onLoadCrate, onOpenUser, busy }: Props) {
+const plus = (n: number | undefined | null) => (typeof n === 'number' && n > 0 ? ` +${n.toLocaleString()}` : '');
+
+function GraphCounts({ node }: { node: GraphNode }) {
+  const c = node.counts;
+  if (!c) return null;
+  return (
+    <>
+      <h3>In the graph</h3>
+      <table className="props unsafe-cats">
+        <tbody>
+          {typeof c.deps === 'number' && (
+            <tr>
+              <th>dependencies</th>
+              <td>{c.deps.toLocaleString()} crates <span className="muted">(any version)</span></td>
+            </tr>
+          )}
+          {typeof c.dependents === 'number' && (
+            <tr>
+              <th>dependents</th>
+              <td>
+                <b>{c.dependents.toLocaleString()}</b> crates
+                {typeof c.dependentVersions === 'number' ? <span className="muted"> · {c.dependentVersions.toLocaleString()} version declarations</span> : null}
+              </td>
+            </tr>
+          )}
+          {typeof c.versions === 'number' && (
+            <tr>
+              <th>versions</th>
+              <td>{c.versions.toLocaleString()}</td>
+            </tr>
+          )}
+          {typeof c.symbolsCalled === 'number' && (
+            <tr>
+              <th>called from other crates</th>
+              <td>
+                {c.symbolsCalled.toLocaleString()} functions <span className="muted">(Callers view lists who)</span>
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </>
+  );
+}
+
+export function DetailsPanel({ view, selected, nodeById, onExpand, onOverview, shownCount, onRemove, onLoadCrate, onOpenUser, busy }: Props) {
   if (!selected) {
     return (
       <div className="details">
         <h2>Nothing selected</h2>
         <p className="muted">
-          {view === 'deps'
-            ? 'Click a crate or edge to inspect it. Double-click a crate to add its direct crate-level dependencies and dependents.'
-            : 'Click a node or relationship to inspect it. Double-click a node to expand all of its neighbours.'}
+          Click a node or edge to inspect it. Double-click a crate or version to add its dependencies. Drag nodes; the layout stays where you put it.
         </p>
         <h3>Legend</h3>
-        {view === 'deps' ? (
+        {view === 'default' ? (
           <ul className="legend">
             <li>
-              <span className="swatch" style={{ background: '#1F5FD1' }} /> Crate (loaded root)
+              <span className="swatch" style={{ background: ROLE_COLORS.root }} /> Loaded crate (centre)
             </li>
             <li>
-              <span className="swatch" style={{ background: '#4C8DFF' }} /> Crate (size = connections)
+              <span className="swatch" style={{ background: ROLE_COLORS.dep }} /> Dependency (right; size = downloads)
             </li>
             <li>
-              <span className="line" style={{ background: '#4C8DFF' }} /> A → B: some version of A depends on B (width = how many)
+              <span className="swatch" style={{ background: ROLE_COLORS.depOptional }} /> optional ·{' '}
+              <span className="swatch" style={{ background: ROLE_COLORS.depBuild }} /> build ·{' '}
+              <span className="swatch" style={{ background: ROLE_COLORS.depDev }} /> dev
             </li>
+            <li>
+              <span className="swatch" style={{ background: ROLE_COLORS.callee }} /> Called into but not declared (inlined transitive code)
+            </li>
+            <li>
+              <span className="swatch" style={{ background: ROLE_COLORS.dependent }} /> Dependent (left; the most-downloaded users)
+            </li>
+            <li>
+              <span className="swatch" style={{ background: ROLE_COLORS.version }} /> Version (bottom strip, oldest → latest) ·{' '}
+              <span className="swatch" style={{ background: ROLE_COLORS.versionPre }} /> pre-release ·{' '}
+              <span className="swatch" style={{ background: ROLE_COLORS.versionYanked }} /> yanked
+            </li>
+            <li>
+              <span className="line" style={{ background: ROLE_COLORS.dep }} /> DEPENDS_ON (thicker = more calls into it; turn on edge labels for requirement / kind)
+            </li>
+            <li>
+              <span className="line" style={{ background: ROLE_COLORS.callee }} /> INVOKES: calls into a crate that is not a direct dependency
+            </li>
+            <li>
+              <span className="swatch" style={{ background: '#E36BAE' }} /> User · <span className="swatch" style={{ background: '#20B2AA' }} /> Team (crates.io, top)
+            </li>
+            <li className="muted small">Captions: ⊘ yanked · ☢N unsafe · ⚙ build script · C native code · Δ lines changed</li>
           </ul>
         ) : (
         <ul className="legend">
@@ -655,6 +725,15 @@ export function DetailsPanel({ view, onExpandDeps, selected, nodeById, onExpand,
             declare a dependency on {to ? nodeTitle(to) : selected.to}.
           </p>
         )}
+        {selected.type === 'DEPENDS_ON' && typeof selected.properties.via === 'string' && (
+          <p className="muted">
+            Declared by version {selected.properties.via}
+            {Number(selected.properties.declarations) > 1 ? ` (${fmt(selected.properties.declarations)} declarations, e.g. per target, folded into one edge)` : ''}
+            {typeof selected.properties.calls === 'number' && selected.properties.calls > 0
+              ? `; its compiled code makes ${selected.properties.calls.toLocaleString()} distinct calls into ${fmt(selected.properties.symbols)} of its functions.`
+              : '.'}
+          </p>
+        )}
         {targets ? (
           <>
             <h3>Targets</h3>
@@ -683,32 +762,28 @@ export function DetailsPanel({ view, onExpandDeps, selected, nodeById, onExpand,
       </h2>
 
       <div className="actions">
-        {isCrate(node) && view === 'deps' && (
+        {isCrate(node) && view === 'default' && onOverview && (
           <>
-            <button disabled={busy} onClick={() => onExpandDeps(name, 'out')} title="Add direct crate-level dependencies">
-              Dependencies
+            {node.role !== 'root' && (
+              <button disabled={busy} className="primary" onClick={() => onLoadCrate(name)} title="Redraw the canvas around this crate">
+                Focus
+              </button>
+            )}
+            <button disabled={busy} onClick={() => onOverview(name, 'deps')} title={`Add what its latest version depends on (one edge per crate)${typeof node.counts?.deps === 'number' ? `; ${node.counts.deps.toLocaleString()} crates across all versions` : ''}`}>
+              Latest deps
             </button>
-            <button disabled={busy} onClick={() => onExpandDeps(name, 'in')} title="Add direct crate-level dependents">
-              Dependents
+            <button
+              disabled={busy}
+              onClick={() => onOverview(name, 'dependents')}
+              title="Add the 25 most-downloaded crates that depend on it; press again for the next 25"
+            >
+              Dependents{plus(node.counts?.dependents !== undefined ? node.counts.dependents - (shownCount?.(name, 'dependents') ?? 0) : undefined)}
             </button>
-            <button disabled={busy} onClick={() => onLoadCrate(name)} title="Replace the canvas with this crate's full transitive chain">
-              Chain from here
+            <button disabled={busy} onClick={() => onOverview(name, 'versions')} title="Add the next 12 older versions to the strip">
+              Versions{plus(node.counts?.versions !== undefined ? node.counts.versions - (shownCount?.(name, 'versions') ?? 0) : undefined)}
             </button>
-          </>
-        )}
-        {isCrate(node) && view === 'default' && (
-          <>
-            <button disabled={busy} onClick={() => onLoadCrate(name)}>
-              Load crate
-            </button>
-            <button disabled={busy} onClick={() => onExpand(node.id, 'both', ['VERSION_OF'])}>
-              Versions
-            </button>
-            <button disabled={busy} onClick={() => onExpand(node.id, 'in', ['DEPENDS_ON'])}>
-              Dependents
-            </button>
-            <button disabled={busy} onClick={() => onExpand(node.id, 'in', ['INVOKES'])}>
-              Invoked by
+            <button disabled={busy} onClick={() => onOverview(name, 'calls')} title="Crates the latest version's compiled code calls into">
+              Calls
             </button>
             <button disabled={busy} onClick={() => onExpand(node.id, 'in', ['OWNS'])} title="Add the crates.io owners (users and teams)">
               Owners
@@ -718,7 +793,25 @@ export function DetailsPanel({ view, onExpandDeps, selected, nodeById, onExpand,
             </button>
           </>
         )}
-        {isVersion(node) && (
+        {isCrate(node) && view === 'default' && !onOverview && (
+          <button disabled={busy} onClick={() => onLoadCrate(name)}>
+            Load crate
+          </button>
+        )}
+        {isVersion(node) && view === 'default' && onOverview && (
+          <>
+            <button disabled={busy} onClick={() => onOverview(name, 'deps', { version: String(node.properties.version) })} title="What this version declares (edges from this version)">
+              Dependencies
+            </button>
+            <button disabled={busy} onClick={() => onOverview(name, 'calls', { version: String(node.properties.version) })} title="Crates this version's compiled code calls into">
+              Calls
+            </button>
+            <button disabled={busy} onClick={() => onExpand(node.id, 'in', ['PUBLISHED'])} title="Add the user who uploaded this version">
+              Uploader
+            </button>
+          </>
+        )}
+        {isVersion(node) && !(view === 'default' && onOverview) && (
           <>
             <button disabled={busy} onClick={() => onExpand(node.id, 'out', ['DEPENDS_ON'])}>
               Dependencies
@@ -751,7 +844,7 @@ export function DetailsPanel({ view, onExpandDeps, selected, nodeById, onExpand,
             )}
           </>
         )}
-        {view === 'default' && (
+        {view === 'default' && !(onOverview && (isCrate(node) || isVersion(node))) && (
           <button disabled={busy} onClick={() => onExpand(node.id, 'both', [])}>
             Expand all
           </button>
@@ -761,6 +854,7 @@ export function DetailsPanel({ view, onExpandDeps, selected, nodeById, onExpand,
         </button>
       </div>
 
+      {isCrate(node) && view === 'default' && <GraphCounts node={node} />}
       {isCrate(node) && <CrateRegistrySummary p={node.properties} onOpenUser={onOpenUser} />}
       {isVersion(node) && (
         <>

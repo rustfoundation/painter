@@ -1,20 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, isTableView, VIEWS, type CrateLoadOptions, type View } from '../api';
+import { DEP_KINDS, type DepsOptions } from '../deps';
 import { useIsMobile } from '../touch';
 
 interface Props {
   view: View;
   onViewChange: (v: View) => void;
-  depsLimit: number;
-  depsMaxLimit: number;
-  onDepsLimitChange: (n: number) => void;
-  depsDepth: number;
-  onDepsDepthChange: (n: number) => void;
+  depsOptions: DepsOptions;
+  onDepsOptionsChange: (o: DepsOptions) => void;
   mapBudget: number;
   onMapBudgetChange: (n: number) => void;
   options: CrateLoadOptions;
   onOptionsChange: (o: CrateLoadOptions) => void;
-  /** `exact` is set when the user picked a suggestion, so a 3+ character name is not treated as a partial filter. */
+  /** `exact` is set when the user picked a suggestion. Typed text must name a crate exactly unless it has `*` / `?`. */
   onLoad: (name: string, exact: boolean) => void;
   loadedName: string | null;
   onClear: () => void;
@@ -25,8 +23,7 @@ interface Props {
 }
 
 export function Toolbar(props: Props) {
-  const { view, onViewChange, depsLimit, depsMaxLimit, onDepsLimitChange, depsDepth, onDepsDepthChange, mapBudget, onMapBudgetChange } = props;
-  const MIN_PARTIAL = 3;
+  const { view, onViewChange, depsOptions, onDepsOptionsChange, mapBudget, onMapBudgetChange } = props;
   const { options, onOptionsChange, onLoad, loadedName, onClear, onFit, layout, onLayoutChange, busy } = props;
   const [query, setQuery] = useState('');
   const isMobile = useIsMobile();
@@ -48,7 +45,7 @@ export function Toolbar(props: Props) {
 
   useEffect(() => {
     window.clearTimeout(debounce.current);
-    if (!query.trim() || (view === 'deps' && query.trim().length < MIN_PARTIAL)) {
+    if (!query.trim()) {
       setSuggestions([]);
       return;
     }
@@ -97,11 +94,7 @@ export function Toolbar(props: Props) {
         <input
           type="text"
           placeholder={
-            view === 'deps'
-              ? 'Crate name, or 3+ chars to match many…'
-              : view === 'map'
-                ? 'Find a crate on the map…'
-                : 'Crate name or part of one… (e.g. serd)'
+            view === 'map' ? 'Find a crate on the map: exact name, or a pattern like tokio*' : 'Crate: exact name, or a pattern like serde* (picks the most downloaded)'
           }
           value={query}
           onChange={(e) => {
@@ -142,7 +135,6 @@ export function Toolbar(props: Props) {
         className="primary"
         disabled={busy || !query.trim()}
         onClick={() => submit(query)}
-        title={view === 'deps' ? 'Exact crate name if one exists; otherwise (3+ chars) every crate containing the text' : undefined}
       >
         {busy ? 'Loading…' : view === 'map' ? 'Go to' : 'Load'}
       </button>
@@ -158,42 +150,67 @@ export function Toolbar(props: Props) {
       {/* `display: contents` on desktop, a collapsible row on phones. */}
       <div className={`toolbar-opts${optsOpen ? ' open' : ''}`}>
       {view === 'map' && (
-        <label className="opt" title="Maximum clusters or crates drawn for one viewport">
-          max visible
-          <input
-            type="number"
-            min={50}
-            max={5000}
-            step={50}
-            value={mapBudget}
-            onChange={(e) => onMapBudgetChange(Math.min(5000, Math.max(50, Number(e.target.value) || 50)))}
-            className="limit wide"
-          />
+        <label className="opt" title="How many labelled crates to show per screen">
+          density
+          <select value={mapBudget <= 300 ? 250 : mapBudget <= 800 ? 600 : 1200} onChange={(e) => onMapBudgetChange(Number(e.target.value))}>
+            <option value={250}>sparse</option>
+            <option value={600}>normal</option>
+            <option value={1200}>dense</option>
+          </select>
         </label>
       )}
 
       {view === 'deps' && (
         <>
-          <label className="opt" title="0 = follow the chain to the end">
-            max depth
-            <input
-              type="number"
-              min={0}
-              max={64}
-              value={depsDepth}
-              onChange={(e) => onDepsDepthChange(Math.max(0, Number(e.target.value) || 0))}
-              className="limit"
-            />
+          <label className="opt" title="What the root depends on, or what depends on the root">
+            <select value={depsOptions.direction} onChange={(e) => onDepsOptionsChange({ ...depsOptions, direction: e.target.value as DepsOptions['direction'] })}>
+              <option value="out">dependencies</option>
+              <option value="in">dependents</option>
+            </select>
           </label>
-          <label className="opt">
-            max edges
+          <label className="opt" title="Declared by the current version only, or by any version ever published (crate-level)">
+            <select value={depsOptions.mode} onChange={(e) => onDepsOptionsChange({ ...depsOptions, mode: e.target.value as DepsOptions['mode'] })}>
+              <option value="latest">current version</option>
+              <option value="any">any version</option>
+            </select>
+          </label>
+          {depsOptions.mode === 'latest' && (
+            <>
+              {DEP_KINDS.map((k) => (
+                <label key={k} className="opt" title={`${k} dependencies`}>
+                  <input
+                    type="checkbox"
+                    checked={depsOptions.kinds[k]}
+                    onChange={(e) => onDepsOptionsChange({ ...depsOptions, kinds: { ...depsOptions.kinds, [k]: e.target.checked } })}
+                  />{' '}
+                  {k}
+                </label>
+              ))}
+              <label className="opt" title="Include optional (feature-gated) dependencies; they are drawn fainter">
+                <input type="checkbox" checked={depsOptions.optional} onChange={(e) => onDepsOptionsChange({ ...depsOptions, optional: e.target.checked })} /> optional
+              </label>
+            </>
+          )}
+          <label className="opt" title="Hops fetched up front; expand a crate for more">
+            depth
             <input
               type="number"
               min={1}
-              max={depsMaxLimit}
-              step={500}
-              value={depsLimit}
-              onChange={(e) => onDepsLimitChange(Math.min(depsMaxLimit, Math.max(1, Number(e.target.value) || 1)))}
+              max={8}
+              value={depsOptions.depth}
+              onChange={(e) => onDepsOptionsChange({ ...depsOptions, depth: Math.min(8, Math.max(1, Number(e.target.value) || 1)) })}
+              className="limit"
+            />
+          </label>
+          <label className="opt" title="Most crates drawn; the best-downloaded ones are kept and the rest show as +N">
+            max crates
+            <input
+              type="number"
+              min={20}
+              max={2000}
+              step={50}
+              value={depsOptions.limit}
+              onChange={(e) => onDepsOptionsChange({ ...depsOptions, limit: Math.min(2000, Math.max(20, Number(e.target.value) || 20)) })}
               className="limit wide"
             />
           </label>
@@ -202,31 +219,11 @@ export function Toolbar(props: Props) {
 
       {view === 'default' && (
       <>
-      <label className="opt">
-        <select value={options.versions} onChange={(e) => set('versions', e.target.value as 'latest' | 'all')}>
-          <option value="latest">latest version</option>
-          <option value="all">all versions</option>
-        </select>
+      <label className="opt" title="Crates the latest version's compiled code calls into (red when not a declared dependency)">
+        <input type="checkbox" checked={options.invokes} onChange={(e) => set('invokes', e.target.checked)} /> calls
       </label>
-      <label className="opt">
-        <input type="checkbox" checked={options.deps} onChange={(e) => set('deps', e.target.checked)} /> deps
-      </label>
-      <label className="opt">
-        <input type="checkbox" checked={options.invokes} onChange={(e) => set('invokes', e.target.checked)} /> invokes
-      </label>
-      <label className="opt">
+      <label className="opt" title="Also load the 25 most-downloaded crates that depend on it (left side)">
         <input type="checkbox" checked={options.dependents} onChange={(e) => set('dependents', e.target.checked)} /> dependents
-      </label>
-      <label className="opt">
-        limit
-        <input
-          type="number"
-          min={1}
-          max={2000}
-          value={options.limit}
-          onChange={(e) => set('limit', Math.max(1, Number(e.target.value) || 1))}
-          className="limit"
-        />
       </label>
       </>
       )}
@@ -235,9 +232,11 @@ export function Toolbar(props: Props) {
 
       {!isTableView(view) && (
       <>
+      {view !== 'deps' && view !== 'map' && (
       <label className="opt">
         layout
         <select value={layout} onChange={(e) => onLayoutChange(e.target.value)}>
+          {view === 'default' && <option value="free">radial</option>}
           <option value="forceDirected">force directed</option>
           <option value="d3Force">d3 force</option>
           <option value="hierarchical">hierarchical</option>
@@ -245,6 +244,7 @@ export function Toolbar(props: Props) {
           <option value="grid">grid</option>
         </select>
       </label>
+      )}
       <button onClick={onFit}>Fit</button>
       <button onClick={onClear} className="danger">
         Clear

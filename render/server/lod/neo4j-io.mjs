@@ -70,7 +70,7 @@ export const loadLodPositions = async (driver, database, { timeoutMs }) => {
     driver,
     database,
     `MATCH (c:Crate) WHERE c.lod_x IS NOT NULL
-     RETURN c.name AS name, c.lod_x AS x, c.lod_y AS y, c.lod_community AS community, c.lod_degree AS degree`,
+     RETURN c.name AS name, c.lod_x AS x, c.lod_y AS y, c.lod_community AS community, c.lod_degree AS degree, c.downloads AS downloads`,
     {},
     {
       timeoutMs,
@@ -81,6 +81,8 @@ export const loadLodPositions = async (driver, database, { timeoutMs }) => {
           y: toNum(r.get('y')),
           community: toNum(r.get('community')) ?? -1,
           degree: toNum(r.get('degree')) ?? 0,
+          // Registry job property; absent until it has run, then used to rank landmarks.
+          downloads: toNum(r.get('downloads')) ?? 0,
         }),
     },
   );

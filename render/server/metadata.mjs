@@ -1,6 +1,7 @@
 // `scope` is 'latest' (idx_is_latest) or 'all' (a label scan, seconds on millions of versions). A generate-metadata
 // run may be in progress, so any property can be null; the meta_* markers are what "scanned" means.
 import neo4j from 'neo4j-driver';
+import { crateNameScope, hasWildcard, wildcardRegex } from './match.mjs';
 
 const scopeClause = (scope) => (scope === 'all' ? 'true' : 'v.latest = true');
 const tri = (expr, value) => `($${value} = 'any' OR ($${value} = 'yes' AND ${expr}) OR ($${value} = 'no' AND NOT ${expr}))`;
@@ -66,20 +67,23 @@ export const buildLinks = async (read, scope, limit) =>
   );
 
 export const buildTop = async (read, { scope, sort, desc, q, links, link, custom, minLines, limit, offset }) => {
+  const ns = await crateNameScope(read, neo4j.int, q);
   const order = BUILD_SORTS[sort] ?? BUILD_SORTS.lines;
-  // An exact `link` name is served by idx_version_links; otherwise idx_has_build_script.
+  // An exact `link` name is served by idx_version_links; a `*` / `?` pattern and no link use idx_has_build_script.
+  const linkPattern = link && hasWildcard(link);
+  const linkClause = !link ? '' : linkPattern ? 'v.links =~ $linkRe AND ' : 'v.links = $link AND ';
   const rows = await read(
-    `MATCH (v:Version)
-     WHERE ${link ? 'v.links = $link AND v.has_build_script = true' : 'v.has_build_script = true'} AND ${scopeClause(scope)}
+    `${ns.match}
+     WHERE ${linkClause}v.has_build_script = true AND ${scopeClause(scope)}
        AND v.meta_build IS NOT NULL
-       AND ($q = '' OR toLower(v.name) CONTAINS $q)
+       AND ${ns.filter}
        AND ${tri('v.links IS NOT NULL', 'links')}
        AND ${tri("v.build_script <> 'build.rs'", 'custom')}
        AND coalesce(v.build_script_lines, 0) >= $minLines
      WITH v ORDER BY ${order} ${desc ? 'DESC' : 'ASC'}, v.name, v.version
      SKIP $offset LIMIT $limit
      ${BUILD_ROW}`,
-    { q: q.toLowerCase(), links, link, custom, minLines: neo4j.int(minLines), offset: neo4j.int(offset), limit: neo4j.int(limit + 1) },
+    { ...ns.params, links, link, linkRe: linkPattern ? wildcardRegex(link) : null, custom, minLines: neo4j.int(minLines), offset: neo4j.int(offset), limit: neo4j.int(limit + 1) },
   );
   return page(rows, limit);
 };
@@ -148,11 +152,12 @@ export const nativeStats = async (read, scope) => {
 };
 
 export const nativeTop = async (read, { scope, sort, desc, q, vendored, prebuilt, lang, minLines, limit, offset }) => {
+  const ns = await crateNameScope(read, neo4j.int, q);
   const order = NATIVE_SORTS[sort] ?? NATIVE_SORTS.lines;
   const rows = await read(
-    `MATCH (v:Version)
+    `${ns.match}
      WHERE v.has_native_code = true AND ${scopeClause(scope)}
-       AND ($q = '' OR toLower(v.name) CONTAINS $q)
+       AND ${ns.filter}
        AND ${tri('v.vendored_native = true', 'vendored')}
        AND ${tri('v.native_prebuilt_files > 0', 'prebuilt')}
        AND ($lang = '' OR $lang IN coalesce(v.native_langs, []))
@@ -160,7 +165,7 @@ export const nativeTop = async (read, { scope, sort, desc, q, vendored, prebuilt
      WITH v ORDER BY ${order} ${desc ? 'DESC' : 'ASC'}, v.name, v.version
      SKIP $offset LIMIT $limit
      ${NATIVE_ROW}`,
-    { q: q.toLowerCase(), vendored, prebuilt, lang, minLines: neo4j.int(minLines), offset: neo4j.int(offset), limit: neo4j.int(limit + 1) },
+    { ...ns.params, vendored, prebuilt, lang, minLines: neo4j.int(minLines), offset: neo4j.int(offset), limit: neo4j.int(limit + 1) },
   );
   return page(rows, limit);
 };
@@ -220,14 +225,15 @@ export const diffStats = async (read, scope) => {
 
 // Sorting by `added` is index-backed (idx_diff_lines_added); the computed sorts walk every scanned version in scope.
 export const diffTop = async (read, { scope, sort, desc, q, firsts, approximate, minChurn, limit, offset }) => {
+  const ns = await crateNameScope(read, neo4j.int, q);
   const order = DIFF_SORTS[sort] ?? DIFF_SORTS.churn;
   const firstsClause = firsts === 'include' ? 'true' : firsts === 'only' ? 'v.diff_base IS NULL' : 'v.diff_base IS NOT NULL';
   const rows = await read(
-    `MATCH (v:Version)
+    `${ns.match}
      WHERE ${scopeClause(scope)}
        AND v.meta_diff IS NOT NULL
        AND ${firstsClause}
-       AND ($q = '' OR toLower(v.name) CONTAINS $q)
+       AND ${ns.filter}
        AND ${tri('v.diff_approximate = true', 'approximate')}
      ${DIFF_DERIVED}
      WHERE churn >= $minChurn
@@ -235,7 +241,7 @@ export const diffTop = async (read, { scope, sort, desc, q, firsts, approximate,
      ORDER BY ${order} ${desc ? 'DESC' : 'ASC'}, v.name, v.version
      SKIP $offset LIMIT $limit
      ${DIFF_ROW}`,
-    { q: q.toLowerCase(), approximate, minChurn: neo4j.int(minChurn), offset: neo4j.int(offset), limit: neo4j.int(limit + 1) },
+    { ...ns.params, approximate, minChurn: neo4j.int(minChurn), offset: neo4j.int(offset), limit: neo4j.int(limit + 1) },
   );
   return page(rows, limit);
 };

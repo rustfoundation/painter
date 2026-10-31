@@ -76,8 +76,9 @@ Locally: `npm run start:jobs` (port 8081) next to `RENDER_JOBS_URL=http://127.0.
 
 Create the constraints and indexes in `docker/queries.md`; views are slow or unusable without them:
 
-- `idx_crate_name_text`: partial-name search.
-- `const_symbol_name`: Callers view (one seek per function name on `Symbol.name`, then its callers).
+- `idx_crate_name_text`: partial-name hints in the search dropdowns.
+- `const_symbol_name`, `idx_symbol_name_text`: Callers view (one seek per function name on `Symbol.name`,
+  then its callers; the TEXT index backs the function search).
 - `idx_has_build_script`, `idx_version_links`, `idx_has_native_code`, `idx_vendored_native`,
   `idx_diff_lines_added`: Build scripts / Native code / Diffs leaderboards.
 - Registry indexes (`idx_user_login`, `idx_published_at`, `idx_owns_since`,
@@ -91,24 +92,82 @@ Default and Deps work as soon as the graph has data; Map needs the precompute be
 
 Graph views (Default, Deps, Map): wheel/pinch zooms, drag pans; click a node or edge for properties.
 
-**Default**: crates, versions, and `VERSION_OF` / `DEPENDS_ON` / `INVOKES` edges around a crate name
-(case-insensitive substring, prefix first; Load takes the top match). "Latest" is
-`Version.latest` when present, else the highest semver triple. `INVOKES` is not stored: the server
-folds calls into one synthetic edge per (`Version`, `Crate`) with a `count` of distinct calls and up
-to ten sample `targets` (ids start with `agg:`). The Cypher panel returns raw relationships and
-merges nodes, relationships, and paths into the canvas.
+**Searching** (`server/match.mjs`, `src/match.ts`): every search box and table filter takes an exact
+name, case-insensitive. Only `*` (any run of characters) and `?` (one character) make it a pattern:
+`tokio*`, `*-sys`, `serde_?son`. The hint dropdowns still offer partial matches as you type, and
+picking one sets that exact name. A pattern in a graph view's box (or the Callers function box) opens
+the best match, by downloads (Map: importance, Callers: callers). In the table views (Unsafe, Build
+scripts, Native code, Diffs, Releases, a publisher's crates, Callers) it returns every matching row,
+and in the Publishers login box it lists every matching login. The version tables resolve the crate
+names first (`crateNameScope`: one index lookup, or a regex over the crate names when at most 5,000
+match) and start from those crates, so an exact or rare filter does not walk every version.
 
-**Deps**: crates only; an edge A -> B means some version of A depends on B, and its width is the
-number of versions that declare it. An exact crate name is the only root; otherwise, with 3+
-characters, every crate containing the text is a root. The walk stops at max depth (0 = unlimited)
-or max edges (default 5000); the status bar says which. Full-depth chains of big crates hit the cap
-fast because every historical version is folded in, so use depth 2-3.
+**Default**: one crate's overview (`GET /api/graph/overview/:name`, `server/overview.mjs`; the name
+is exact, or a `*` / `?` pattern). One bounded Cypher round trip returns the
+crate with degree-store counts, what its latest version depends on (folded to one `DEPENDS_ON` per
+crate: strongest `kind`, `optional` only if every declaration is, all requirements, `via` = the
+declaring version; ids `dep:`), its 12 newest versions, the crates its compiled code calls into
+(`calls` on the dependency edge when declared, else a red `INVOKES` edge to a `callee` node; ids
+`agg:`; self-calls dropped), and with the dependents option its 25 most-downloaded dependents from
+`LOD_DEP`. The client (`src/overview.ts`) lays this out itself on NVL's `free` layout: root in the
+middle, dependencies fanned right (normal / optional / called on the inner arc, build / dev outside,
+size = downloads, colour = kind), dependents left, versions as an oldest → latest strip along the
+bottom joined by a canvas-only `PRECEDES` chain, crates.io accounts on top. Captions are DOM labels
+(`components/OverviewLabels.tsx`) that follow the canvas, with a detail line (requirement, kind,
+calls; versions using it; publish date and ⊘ ☢ ⚙ C Δ badges) once zoomed past 0.7. Dragging keeps
+positions; `layout` can switch back to force directed. The details panel pages bounded expansions
+(`Latest deps`, `Dependents +N` 25 at a time, `Versions +N` 12 at a time, `Calls`, `Owners`,
+`Publishers`), double-click adds a crate's or a version's dependencies, and new nodes fan out from
+the node that was expanded. Inbound callers are not drawn (4-15 s even bounded); the panel shows
+how many functions are called from other crates and the Callers view lists who. The Cypher panel
+returns raw relationships and merges nodes, relationships, and paths into the canvas.
 
-**Map**: the whole ecosystem on a precomputed layout, drawn at a level of detail that keeps the
-element count under max visible (default 600); colour is Louvain community.
+**Deps**: one crate's dependency tree, root on top and one row per hop (layered layout, not force).
+By default it follows the root's current version (`Crate.default_version`, else `Version.latest`)
+and its required normal dependencies, two hops deep, at most 300 crates. Toolbar toggles add
+optional (drawn fainter), build (orange), and dev (purple) edges; "any version" switches to the
+Map's crate-level `LOD_DEP` edges (width = versions declaring it); "dependents" walks `LOD_DEP`
+backwards, keeping the 30 best-downloaded dependents of the root and 3 of each of those, and in
+current-version mode checks each candidate's current version. Node size is crate-level in-degree.
+Edges to a crate already reached by a shorter path are drawn faint unless they touch the selection.
+The root's details say which declarations the toggles leave out (tokio: 20 dev, 15 optional). When the budget or depth cuts a
+crate's children, it shows "+N"; double-click (or Show +N) fetches them, double-click again folds
+them. Clicking a crate highlights its path from the root. The sidebar has the path, children, and
+the legend. Reverse mode and node sizes need `LOD_DEP` (the Map build); without it, they show 0.
 
-**Callers**: a table of every crate version and function that calls a given function, directly or
-transitively, with the call chain per row. Requirement checks are applied per hop.
+**Map**: the whole ecosystem on a precomputed layout. Each viewport shows the most important crates
+in it as labelled landmarks (importance = log downloads + 1.5 log dependents, picked in global order
+with a minimum on-screen spacing, so a landmark stays one at every deeper zoom), a smoothed density
+shading for everything else, and the largest Louvain communities as translucent blobs labelled by
+their dominant crates ("serde · serde_json · thiserror"). Only the 16 largest communities (by
+downloads) get a colour; the rest are grey. The sidebar lists them as a clickable legend. Clicking a
+crate shows downloads, dependents, dependencies, its most important neighbours (jump or "deps" to
+open the Deps view), and draws its edges: orange from crates that use it, blue to what it depends
+on. Other edges are drawn only when there are few enough to read (<= 220). The toolbar "density"
+preset (sparse / normal / dense) sets how many landmarks fit on a screen. The view opens on the
+populated core (1.5-98.5 percentile box); "Whole map" includes the ring of isolated crates.
+`/api/lod/viewport` answers from memory in ~10-50 ms; `/api/lod/neighbours` and
+`/api/lod/communities` are computed from the same in-memory index, no database query.
+
+**Callers**: who calls a function. One search box takes `crate::path::fn`, `crate::` (that crate's
+most-called functions), or a bare name, with suggestions grouped by crate and ranked by callers.
+Suggestions are partial; with `*` / `?` the query is a full-name pattern (`serde_json::*from_str`:
+a regex over that crate's symbols; a global pattern seeds from the TEXT index on its longest literal,
+which must be at least 3 characters, then filters with the regex). Enter without a picked suggestion
+opens plain text only as an exact function name ("no function named X" otherwise) and a pattern's
+match with the most callers. The result is aggregated per caller crate (ordered by downloads, with
+the calling versions and the number of calling functions) and paged server-side (100 crates a page,
+up to 500; sort by downloads / functions / versions / crate). The server caches the per-version
+aggregate (no function names) per (function, pin, cap) for 10 minutes, 20 entries, so paging,
+sorting, and the caller crate filter (exact name, or a pattern like `tokio*`, with hints from the
+cached list) never re-run the fan-in; calling function names (40 per crate) are fetched for the
+page's crates only. A crate row opens into its calling functions, and a function opens into its own
+callers one level further out (paged 50 at a time). The callee version is pinned to the latest (newest stable if that is a pre-release) by default: a caller counts
+when its `DEPENDS_ON` requirement admits that version (`unverified` when it has no direct dependency,
+dropped when the requirement excludes it). The graph pane draws the current page's crates (edge width = calling
+functions, node size = downloads); `calls` flips to what the function calls. Hot symbols are answered
+from the first 15,000 calling functions with an "expand all" link, since every calling function is a
+random read. `focus` re-roots on any function; `graph` / `deps` open the crate in those views.
 
 **Unsafe**, **Build scripts**, **Native code**, **Diffs**: leaderboards over the `generate-metadata`
 properties (`docker/queries.md` lists them). Scope is latest versions (index-backed) or all
@@ -139,6 +198,11 @@ Stored in the database so every render instance shares it:
 - `(Crate)-[:LOD_DEP {versions}]->(Crate)`: one edge per crate pair, `versions` = how many versions
   declare it
 - `(:LodMeta {id:'default'})`: counts, bounds, timings, `built_at`
+
+The render server loads all of that (plus `Crate.downloads`) into memory at start: ~4 min against a
+remote database, during which the Map reports "loading". It then writes a JSON snapshot to
+`RENDER_LOD_INDEX_CACHE` (default `/tmp/painter-lod-index.json`, ~65 MB, empty disables it) keyed on
+`built_at`, so a restart loads in a couple of seconds until the next build or update.
 
 A full build aggregates every `DEPENDS_ON`, runs Louvain and a single-threaded ForceAtlas2, and
 writes it all back. On 340k crates / 37M `DEPENDS_ON` it takes ~30 min and ~2.5 GB, almost all of it
@@ -177,11 +241,17 @@ obvious ones:
 | Route | What |
 | --- | --- |
 | `GET /api/health` | connection state and effective config, no secrets |
-| `GET /api/graph/crate/:name` | Default load; `name` may be partial, `meta.resolvedName` says what was picked |
+| `GET /api/graph/overview/:name` | Default load; `parts=deps,versions,calls,dependents`, `version` + `from=version`, `skip`, `limit`, `root=1`; nodes carry `role` / `counts`, `meta.overview` the totals |
+| `GET /api/graph/crate/:name` | older raw load (Crate, Versions, their edges); `name` is exact or a `*` / `?` pattern, `meta.resolvedName` says what was picked |
 | `POST /api/graph/expand` | neighbours of a node (`VERSION_OF`, `DEPENDS_ON`, `INVOKES`, `OWNS`, `PUBLISHED`) |
-| `GET /api/graph/deps/chain` | Deps view; `meta.roots/depth/truncated` |
+| `GET /api/deps/tree?crate&direction=out\|in&mode=latest\|any&kinds&optional&depth&limit` | Deps tree keyed by crate name: nodes with `depth/downloads/dependents/hidden/unexpanded`, edges with `kinds/optional/req/versions` |
+| `GET /api/deps/expand?crate&...` | one crate's direct neighbours for the Deps view (same options) |
 | `GET /api/lod/*` | Map status, viewport, locate, search; viewport is 503 until a build is loaded |
-| `GET /api/callers?crate&fn&match&version&depth&limit` | Callers rows; `match=exact\|contains` |
+| `GET /api/symbols/search?q&limit` | function search (`crate::` prefix scopes it); `symbols` grouped by `crate`, `crates` prefix matches; `*` / `?` make it a pattern (`pattern`, `hint`) |
+| `GET /api/symbols/resolve?q` | what Enter opens: the exact symbol for plain text, the most-called pattern match, or `symbol: null` |
+| `GET /api/symbols/callers?fn&versions&cap&localCrate&localVersions&offset&limit&sort&desc&filter` | one page of caller crates (cached aggregate), per-version requirement status, names for the page's crates; totals for the filtered set, `meta.hasMore`, `meta.truncated` when `total > cap` |
+| `GET /api/symbols/callers/crates?fn&versions&cap&q&limit` | caller crate names containing `q` (filter hints), off the same cached aggregate |
+| `GET /api/symbols/callees?fn&crate&version` | what a function calls, in the chosen or newest compiled copy |
 | `GET /api/{unsafe,build,native,diffs}/{stats,top,crate/:name}` | leaderboard tiles, sorted/filtered rows (`hasMore` for paging), one crate's per-version history; stats come from the jobs service's `Stats` nodes (`computedAt`), live + cached 60 s without one |
 | `GET /api/stats/status`, `POST /api/stats/refresh` | stored `Stats` ages; refresh forwarded to `RENDER_JOBS_URL` (503 without one) |
 | `GET /api/registry/*`, `/api/publishers/*`, `/api/releases*`, `/api/supply/*` | registry, publisher, release, and supply-chain data |

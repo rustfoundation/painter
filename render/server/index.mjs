@@ -5,7 +5,9 @@ import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
 import { config, describeConfig } from './config.mjs';
 import { collectGraph } from './graph.mjs';
-import { findCallers, normCrate } from './callers.mjs';
+import { calleesOf, callerCrateNames, callersPage, parseCallersQuery, resolveSymbol, searchSymbols, symbolHome } from './callers.mjs';
+import { crateOverview } from './overview.mjs';
+import { hasWildcard, nameTester, wildcardRegex } from './match.mjs';
 import { SORTS as UNSAFE_SORTS, unsafeCrate, unsafeDeps, unsafeStats, unsafeTop } from './unsafe.mjs';
 import {
   BUILD_SORTS,
@@ -43,6 +45,7 @@ import {
 import { createLodJobs } from './lod/jobs.mjs';
 import { LodIndex } from './lod/index.mjs';
 import { createDriver, waitForNeo4j } from './db.mjs';
+import { depsExpand, depsTree, parseDepsQuery } from './deps.mjs';
 import { STATS_IDS, overviewStats, readStats, readStatsAges } from './stats.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -149,30 +152,49 @@ api.get(
 
 api.post('/stats/refresh', forwardToJobs('POST', '/api/stats/refresh'));
 
-// A TEXT index on Crate.name (docker/queries.md) makes CONTAINS fast; without it this is a label scan.
-const searchCrates = async (q, limit) =>
-  readGraph(
+// Suggestions are always partial: CONTAINS on the TEXT index (docker/queries.md), exact and prefix hits first.
+// A query with `*` / `?` is a pattern instead, ranked by downloads.
+const searchCrates = async (input, limit) => {
+  const text = String(input ?? '').trim();
+  if (!text) return [];
+  if (hasWildcard(text)) {
+    return readGraph(
+      `MATCH (c:Crate) WHERE c.name =~ $re
+       RETURN c.name AS name ORDER BY coalesce(c.downloads, 0) DESC, c.name LIMIT $limit`,
+      { re: wildcardRegex(text), limit: neo4j.int(limit) },
+    ).then((g) => g.rows.map((r) => r.name));
+  }
+  return readGraph(
     `MATCH (c:Crate) WHERE toLower(c.name) CONTAINS $q
      WITH c, toLower(c.name) AS lname
      RETURN c.name AS name
      ORDER BY lname = $q DESC, lname STARTS WITH $q DESC, size(c.name), c.name
      LIMIT $limit`,
-    { q, limit: neo4j.int(limit) },
+    { q: text.toLowerCase(), limit: neo4j.int(limit) },
   ).then((g) => g.rows.map((r) => r.name));
+};
 
+// Plain input must name a crate exactly (case-insensitive); only a wildcard query picks the best
+// (most-downloaded) match. The indexed lookup covers the typed and lowercase spellings; the
+// case-insensitive scan only runs for names like `Inflector` typed in another case.
 const resolveCrateName = async (input) => {
   const q = String(input ?? '').trim();
   if (!q) return null;
-  const exact = await readGraph(`MATCH (c:Crate {name: $name}) RETURN c.name AS name LIMIT 1`, { name: q });
+  if (hasWildcard(q)) return (await searchCrates(q, 1))[0] ?? null;
+  const exact = await readGraph(`MATCH (c:Crate) WHERE c.name IN $names RETURN c.name AS name LIMIT 1`, { names: [...new Set([q, q.toLowerCase()])] });
   if (exact.rows.length) return exact.rows[0].name;
-  const matches = await searchCrates(q.toLowerCase(), 1);
-  return matches[0] ?? null;
+  const folded = await readGraph(`MATCH (c:Crate) WHERE toLower(c.name) = $q RETURN c.name AS name LIMIT 1`, { q: q.toLowerCase() });
+  return folded.rows[0]?.name ?? null;
 };
+
+/** 404 text for a name that did not resolve, pointing at the wildcard syntax. */
+const noCrate = (q) =>
+  hasWildcard(q) ? `no crate matches the pattern '${q}'` : `no crate named '${q}' (pick a suggestion, or use * for a pattern, e.g. ${q}*)`;
 
 api.get(
   '/crates/search',
   wrap(async (req, res) => {
-    const q = String(req.query.q ?? '').trim().toLowerCase();
+    const q = String(req.query.q ?? '').trim();
     const limit = clampLimit(req.query.limit, 20);
     if (!q) return res.json({ names: [] });
     res.json({ names: await searchCrates(q, limit) });
@@ -194,7 +216,7 @@ api.get(
     const requested = String(req.params.name);
     const name = await resolveCrateName(requested);
     if (!name) {
-      return res.status(404).json({ error: `no crate matches '${requested}'` });
+      return res.status(404).json({ error: noCrate(requested) });
     }
     const allVersions = req.query.versions === 'all';
     const deps = req.query.deps !== 'false';
@@ -258,6 +280,28 @@ api.get(
   }),
 );
 
+// Default view: see server/overview.mjs. `parts` = deps,versions,calls,dependents; `version` + `from=version`
+// hangs the edges off that version node; `skip` pages versions / dependents; `root=1` marks the layout root.
+api.get(
+  '/graph/overview/:name',
+  wrap(async (req, res) => {
+    const requested = String(req.params.name);
+    const name = await resolveCrateName(requested);
+    if (!name) return res.status(404).json({ error: noCrate(requested) });
+    const g = await crateOverview(readGraph, neo4j.int, {
+      name,
+      parts: req.query.parts,
+      limit: req.query.limit,
+      skip: req.query.skip,
+      version: req.query.version,
+      from: req.query.from,
+      root: req.query.root === '1' || req.query.root === 'true',
+    });
+    if (!g) return res.status(404).json({ error: `crate '${name}' not found` });
+    res.json(g);
+  }),
+);
+
 api.post(
   '/graph/expand',
   wrap(async (req, res) => {
@@ -304,247 +348,92 @@ api.post(
   }),
 );
 
-const aggregatedDependsOn = (fromId, toId, versions) => ({
-  id: `dep:${fromId}->${toId}`,
-  type: 'DEPENDS_ON',
-  from: fromId,
-  to: toId,
-  properties: { versions, aggregated: true },
-});
+// Deps view (server/deps.mjs): a bounded tree around one crate. `direction=out` walks dependencies of the
+// latest version (`mode=latest`, `kinds=normal,build,dev`, `optional=1` to include optional ones) or of any
+// version (`mode=any`, the Map's LOD_DEP edges); `direction=in` walks dependents. `limit` is a node budget.
+const readRowsDeps = (cypher, params) => readGraph(cypher, params, { timeoutMs: config.depsTimeoutMs }).then((g) => g.rows);
 
-const depsFromRows = (g) => {
-  for (const row of g.rows) {
-    if (row.a && row.b) g.rels.push(aggregatedDependsOn(row.a.id, row.b.id, row.versions));
-  }
-  return g;
-};
-
-const depsCache = new Map();
-
-// Informational only: computed in the background so it never blocks a response.
-let depsTotalPairs = { value: null, at: 0, inFlight: null };
-
-const totalCratePairs = () => {
-  const stale = Date.now() - depsTotalPairs.at > config.depsCacheMs;
-  if (stale && !depsTotalPairs.inFlight) {
-    depsTotalPairs.inFlight = readGraph(
-      `MATCH (v:Version)-[:DEPENDS_ON]->(b:Crate)
-       RETURN count(DISTINCT [v.name, b.name]) AS pairs`,
-      {},
-      { timeoutMs: config.depsTimeoutMs },
-    )
-      .then((g) => {
-        const pairs = g.rows[0]?.pairs ?? null;
-        if (pairs !== null && pairs > 0) depsTotalPairs = { ...depsTotalPairs, value: pairs, at: Date.now() };
-      })
-      .catch((err) => log(`total crate pairs count failed: ${err.message}`))
-      .finally(() => {
-        depsTotalPairs.inFlight = null;
-      });
-  }
-  return depsTotalPairs.value;
-};
-
-const clampDepsLimit = (value) => {
-  const n = Number.parseInt(value ?? '', 10);
-  if (!Number.isFinite(n) || n <= 0) return config.depsDefaultEdges;
-  return Math.min(n, config.depsMaxEdges);
-};
-
-// Without `crate`, return the most-used edges (by version count) so a capped view still shows the ecosystem core.
 api.get(
-  '/graph/deps',
+  '/deps/tree',
   wrap(async (req, res) => {
-    const limit = clampDepsLimit(req.query.limit);
-    const crateInput = String(req.query.crate ?? '').trim();
-
-    if (!crateInput) {
-      const cached = depsCache.get(limit);
-      if (cached && Date.now() - cached.at < config.depsCacheMs) {
-        return res.json({ ...cached.payload, meta: { ...cached.payload.meta, cached: true } });
-      }
-      // Version nodes carry the crate name, so skip the VERSION_OF hop and resolve the source Crate only
-      // for the `limit` winners. Scans every DEPENDS_ON edge once, hence the long timeout.
-      const g = depsFromRows(
-        await readGraph(
-          `MATCH (v:Version)-[:DEPENDS_ON]->(b:Crate)
-           WITH v.name AS aName, b, count(*) AS versions
-           ORDER BY versions DESC
-           LIMIT $limit
-           MATCH (a:Crate {name: aName})
-           RETURN a, b, versions`,
-          { limit: neo4j.int(limit) },
-          { timeoutMs: config.depsTimeoutMs },
-        ),
-      );
-      const totalPairs = totalCratePairs();
-      const payload = {
-        ...stripRows(g),
-        meta: {
-          ...g.meta,
-          limit,
-          totalPairs,
-          truncated: g.rels.length >= limit && (totalPairs === null || totalPairs > limit),
-        },
-      };
-      if (g.rels.length > 0) depsCache.set(limit, { at: Date.now(), payload });
-      return res.json(payload);
-    }
-
-    const name = await resolveCrateName(crateInput);
-    if (!name) return res.status(404).json({ error: `no crate matches '${crateInput}'` });
-    const direction = req.query.direction === 'out' || req.query.direction === 'in' ? req.query.direction : 'both';
-    const cap = neo4j.int(limit);
-
-    const g = await readGraph(`MATCH (c:Crate {name: $name}) RETURN c`, { name });
-    if (direction !== 'in') {
-      mergeInto(
-        g,
-        depsFromRows(
-          await readGraph(
-            `MATCH (a:Crate {name: $name})
-             MATCH (v:Version {name: $name})-[:DEPENDS_ON]->(b:Crate)
-             WITH a, b, count(*) AS versions
-             ORDER BY versions DESC LIMIT $limit
-             RETURN a, b, versions`,
-            { name, limit: cap },
-          ),
-        ),
-      );
-    }
-    if (direction !== 'out') {
-      mergeInto(
-        g,
-        depsFromRows(
-          await readGraph(
-            `MATCH (b:Crate {name: $name})<-[:DEPENDS_ON]-(v:Version)
-             WITH b, v.name AS aName, count(*) AS versions
-             ORDER BY versions DESC LIMIT $limit
-             MATCH (a:Crate {name: aName})
-             RETURN a, b, versions`,
-            { name, limit: cap },
-          ),
-        ),
-      );
-    }
-    res.json({ ...stripRows(g), meta: { ...g.meta, limit, resolvedName: name } });
+    const input = String(req.query.crate ?? '').trim();
+    if (!input) return res.status(400).json({ error: 'crate is required' });
+    const name = await resolveCrateName(input);
+    if (!name) return res.status(404).json({ error: noCrate(input) });
+    const tree = await depsTree(readRowsDeps, name, parseDepsQuery(req.query, config));
+    if (!tree) return res.status(404).json({ error: `no crate named '${name}'` });
+    res.json({ ...tree, meta: { ...tree.meta, resolvedName: name, query: input } });
   }),
 );
 
 api.get(
-  '/graph/deps/chain',
+  '/deps/expand',
   wrap(async (req, res) => {
-    const q = String(req.query.q ?? '').trim();
-    if (!q) return res.status(400).json({ error: 'q is required' });
-    const limit = clampDepsLimit(req.query.limit);
-    const maxDepth = Math.max(0, Number.parseInt(req.query.depth ?? '0', 10) || 0);
-    const forceExact = req.query.exact === '1' || req.query.exact === 'true';
-    const started = Date.now();
-
-    let rootsGraph = await readGraph(`MATCH (c:Crate {name: $q}) RETURN c`, { q });
-    let exact = rootsGraph.nodes.length > 0;
-    let partial = false;
-    if (!exact && !forceExact && q.length >= 3) {
-      partial = true;
-      rootsGraph = await readGraph(
-        `MATCH (c:Crate) WHERE toLower(c.name) CONTAINS $q RETURN c ORDER BY size(c.name), c.name`,
-        { q: q.toLowerCase() },
-        { timeoutMs: config.depsTimeoutMs },
-      );
-    }
-    if (rootsGraph.nodes.length === 0) {
-      return res.status(404).json({
-        error: partial ? `no crate name contains '${q}'` : q.length >= 3 ? `no crate named '${q}'` : `no crate named '${q}' (3+ characters enables partial matching)`,
-      });
-    }
-
-    const g = { nodes: [...rootsGraph.nodes], rels: [], meta: { records: rootsGraph.meta.records, elapsedMs: 0 } };
-    const roots = rootsGraph.nodes.map((n) => n.properties.name);
-    const visited = new Set(roots);
-    let frontier = roots;
-    let depth = 0;
-    let truncated = false;
-
-    while (frontier.length > 0 && (maxDepth === 0 || depth < maxDepth)) {
-      const remaining = limit - g.rels.length;
-      if (remaining <= 0) {
-        truncated = true;
-        break;
-      }
-      // Crate.name is unique-constrained (indexed).
-      const level = depsFromRows(
-        await readGraph(
-          `MATCH (a:Crate) WHERE a.name IN $names
-           MATCH (a)-[:VERSION_OF]-(v:Version)-[:DEPENDS_ON]->(b:Crate)
-           WITH a, b, count(v) AS versions
-           ORDER BY a.name = $q DESC, versions DESC
-           RETURN a, b, versions
-           LIMIT $limit`,
-          { names: frontier, q, limit: neo4j.int(remaining + 1) },
-          { timeoutMs: config.depsTimeoutMs },
-        ),
-      );
-      if (level.rels.length > remaining) {
-        truncated = true;
-        level.rels = level.rels.slice(0, remaining);
-        const keep = new Set(level.rels.flatMap((r) => [r.from, r.to]));
-        level.nodes = level.nodes.filter((n) => keep.has(n.id));
-      }
-      mergeInto(g, level);
-      depth += 1;
-      const next = [];
-      for (const n of level.nodes) {
-        const name = n.properties.name;
-        if (!visited.has(name)) {
-          visited.add(name);
-          next.push(name);
-        }
-      }
-      frontier = next;
-      if (truncated) break;
-    }
-
-    res.json({
-      ...stripRows(g),
-      meta: {
-        ...g.meta,
-        elapsedMs: Date.now() - started,
-        query: q,
-        partial,
-        exact,
-        roots,
-        depth,
-        maxDepth,
-        limit,
-        truncated,
-        crates: g.nodes.length,
-        edges: g.rels.length,
-      },
-    });
+    const name = String(req.query.crate ?? '').trim();
+    if (!name) return res.status(400).json({ error: 'crate is required' });
+    const part = await depsExpand(readRowsDeps, name, parseDepsQuery(req.query, config));
+    if (!part) return res.status(404).json({ error: `no crate named '${name}'` });
+    res.json(part);
   }),
 );
 
-// Symbol paths spell `my-crate` as `my_crate`; accept either.
-const crateSpellings = (name) => [...new Set([name, normCrate(name), name.replace(/_/g, '-')])];
-
-// Names ending in `q` rank first so `spawn` finds `tokio::task::spawn::spawn`.
-const searchFunctions = async (crate, q, limit) =>
-  readGraph(
-    `MATCH (t:Crate) WHERE t.name IN $names
-     MATCH (t)<-[:IN]-(s:Symbol)
-     WHERE $q = '' OR toLower(s.name) CONTAINS $q
-     WITH s.name AS name, COUNT { (s)<-[:CALLS]-() } AS calls
-     ORDER BY toLower(name) ENDS WITH $q DESC, calls DESC, size(name)
-     RETURN name, calls LIMIT $limit`,
-    { names: crateSpellings(crate), q: q.toLowerCase(), limit: neo4j.int(limit) },
-  ).then((g) => g.rows);
+// Callers view (server/callers.mjs): one search box, then callers aggregated per crate.
 
 api.get(
-  '/functions/search',
+  '/symbols/search',
   wrap(async (req, res) => {
-    const crate = String(req.query.crate ?? '').trim();
-    if (!crate) return res.status(400).json({ error: 'crate is required' });
-    res.json({ functions: await searchFunctions(crate, String(req.query.q ?? '').trim(), clampLimit(req.query.limit, 20)) });
+    res.json(await searchSymbols(readRowsPlain, neo4j.int, String(req.query.q ?? ''), { limit: clampLimit(req.query.limit, 30) }));
+  }),
+);
+
+api.get(
+  '/symbols/resolve',
+  wrap(async (req, res) => {
+    res.json(await resolveSymbol(readRowsPlain, neo4j.int, String(req.query.q ?? '')));
+  }),
+);
+
+// Paged: `offset`, `limit` (<= 500), `sort`, `desc`, `filter` (caller crate name or pattern) over an
+// aggregate cached per (fn, versions, local, cap); function names only for the page's crates.
+api.get(
+  '/symbols/callers',
+  wrap(async (req, res) => {
+    const opts = parseCallersQuery(req.query);
+    if (!opts.name) return res.status(400).json({ error: 'fn is required' });
+    const result = await callersPage(readRowsPlain, neo4j.int, opts);
+    if (!result.target.crate && !result.meta.allCrates) {
+      const home = await symbolHome(readRowsPlain, opts.name);
+      if (!home) return res.status(404).json({ error: `no function named '${opts.name}' in the call graph (calls are only recorded from crate versions painter has exported)` });
+      result.target.crate = home.crate;
+      result.meta.total = home.calls;
+      result.meta.definitions = home.definitions;
+    }
+    res.json(result);
+  }),
+);
+
+// Caller crate names for the Callers filter hints (`q` partial), off the same cached aggregate.
+api.get(
+  '/symbols/callers/crates',
+  wrap(async (req, res) => {
+    const opts = parseCallersQuery(req.query);
+    if (!opts.name) return res.status(400).json({ error: 'fn is required' });
+    res.json(await callerCrateNames(readRowsPlain, neo4j.int, opts, { limit: clampLimit(req.query.limit, 12) }));
+  }),
+);
+
+api.get(
+  '/symbols/callees',
+  wrap(async (req, res) => {
+    const name = String(req.query.fn ?? '').trim();
+    if (!name) return res.status(400).json({ error: 'fn is required' });
+    res.json(
+      await calleesOf(readRowsPlain, {
+        name,
+        crate: String(req.query.crate ?? '').trim() || null,
+        version: String(req.query.version ?? '').trim() || null,
+      }),
+    );
   }),
 );
 
@@ -561,56 +450,6 @@ api.get(
   }),
 );
 
-api.get(
-  '/callers',
-  wrap(async (req, res) => {
-    const crate = String(req.query.crate ?? '').trim();
-    const fn = String(req.query.fn ?? '').trim();
-    if (!crate || !fn) return res.status(400).json({ error: 'crate and fn are required' });
-    const version = String(req.query.version ?? '').trim() || null;
-    const exact = req.query.match === 'exact';
-    const maxDepth = Math.min(10, Math.max(1, Number.parseInt(req.query.depth ?? '3', 10) || 3));
-    const limit = clampLimit(req.query.limit, config.neo4j.maxRows);
-    const started = Date.now();
-
-    if (version) {
-      const found = await readGraph(`MATCH (c:Crate)-[:VERSION_OF]-(v:Version {version: $version}) WHERE c.name IN $names RETURN v LIMIT 1`, {
-        names: crateSpellings(crate),
-        version,
-      });
-      if (!found.nodes.length) return res.status(404).json({ error: `no version ${version} of crate '${crate}'` });
-    }
-
-    const targets = exact ? [fn] : (await searchFunctions(crate, fn, 500)).map((f) => f.name);
-    if (!targets.length) {
-      return res.status(404).json({
-        error: `nothing calls a function of '${crate}' containing '${fn}' (calls are only recorded from crate versions painter has exported)`,
-      });
-    }
-
-    const read = (cypher, params) => readGraph(cypher, params).then((g) => g.rows);
-    const result = await findCallers(read, { crate, version, targets, maxDepth, limit });
-    res.json({
-      rows: result.rows,
-      meta: {
-        crate,
-        version,
-        fn,
-        exact,
-        targets,
-        maxDepth,
-        depth: result.depth,
-        limit,
-        truncated: result.truncated,
-        exhausted: result.exhausted,
-        unverified: result.unverified,
-        rejected: result.rejected,
-        elapsedMs: Date.now() - started,
-      },
-    });
-  }),
-);
-
 let lodIndex = null;
 let lodLoading = null;
 let lodLoadError = null;
@@ -620,7 +459,7 @@ const loadLodIndex = () => {
   lodLoadError = null;
   const started = Date.now();
   log('lod index: loading');
-  lodLoading = LodIndex.load(driver, config.neo4j.database, { timeoutMs: config.lod.timeoutMs, maxLevel: config.lod.maxLevel })
+  lodLoading = LodIndex.load(driver, config.neo4j.database, { timeoutMs: config.lod.timeoutMs, cachePath: config.lod.cachePath || null, log })
     .then((idx) => {
       lodIndex = idx;
       log(idx ? `lod index: ${idx.count.toLocaleString()} crates, ${idx.edgeCount.toLocaleString()} edges in ${Date.now() - started} ms` : 'lod index: no build in database');
@@ -1035,7 +874,8 @@ api.get(
     }
     const budget = Math.max(10, Math.min(Number.parseInt(req.query.budget ?? '', 10) || config.lod.budget, 5000));
     const minCell = Math.max(0, Number.parseFloat(req.query.minCell ?? '') || 0);
-    res.json(idx.viewport(bbox, { budget, minCell }));
+    const maxRels = Math.max(0, Math.min(Number.parseInt(req.query.maxRels ?? '', 10) || budget, 5000));
+    res.json(idx.viewport(bbox, { budget, maxRels, minCell }));
   }),
 );
 
@@ -1046,8 +886,31 @@ api.get(
     if (!idx) return;
     const name = String(req.query.name ?? '').trim();
     const hit = idx.locate(name);
-    if (!hit) return res.status(404).json({ error: `crate '${name}' is not on the map` });
+    if (!hit) return res.status(404).json({ error: hasWildcard(name) ? `no crate on the map matches '${name}'` : `no crate named '${name}' on the map (pick a suggestion, or use * for a pattern, e.g. ${name}*)` });
     res.json(hit);
+  }),
+);
+
+// The crate's most important direct dependencies and dependents, from the in-memory index (no database query).
+api.get(
+  '/lod/neighbours',
+  wrap(async (req, res) => {
+    const idx = await requireLod(res);
+    if (!idx) return;
+    const name = String(req.query.name ?? '').trim();
+    const hit = idx.neighbours(name, clampLimit(req.query.limit, 30));
+    if (!hit) return res.status(404).json({ error: hasWildcard(name) ? `no crate on the map matches '${name}'` : `no crate named '${name}' on the map (pick a suggestion, or use * for a pattern, e.g. ${name}*)` });
+    res.json(hit);
+  }),
+);
+
+// Largest communities with centroid, hull, and dominant crates; computed once when the index loads.
+api.get(
+  '/lod/communities',
+  wrap(async (_req, res) => {
+    const idx = await requireLod(res);
+    if (!idx) return;
+    res.json({ communities: idx.communities, total: idx.communityCount });
   }),
 );
 

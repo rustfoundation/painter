@@ -1,6 +1,7 @@
 // Dates are ISO strings (`toString(datetime)`), never driver temporal objects. Queries are index-backed
 // and LIMITed; only the publisher leaderboards aggregate a whole relationship type, so the routes cache them.
 import neo4j from 'neo4j-driver';
+import { hasWildcard, nameFilter, nameParams, wildcardRegex } from './match.mjs';
 
 const page = (rows, limit) => {
   const hasMore = rows.length > limit;
@@ -63,7 +64,23 @@ export const registryStats = async (read) => {
 };
 
 // `STARTS WITH` is case-sensitive and served by idx_user_login, so try the typed, lowercase and capitalised spellings.
+// A `*` / `?` query is a pattern over every login (73k users, 1.5k teams: a cheap scan), ranked by activity.
 export const searchUsers = async (read, q, limit) => {
+  if (hasWildcard(q)) {
+    const re = wildcardRegex(q);
+    const [users, teams] = await Promise.all(
+      ['User', 'Team'].map((label) =>
+        read(
+          `MATCH (u:${label}) WHERE u.login =~ $re
+           WITH u, COUNT { (u)-[:PUBLISHED]->(:Crate) } AS crates, COUNT { (u)-[:OWNS]->() } AS owns
+           RETURN u.login AS login, u.name AS name, crates, owns
+           ORDER BY crates + owns DESC, u.login LIMIT $limit`,
+          { re, limit: neo4j.int(limit) },
+        ),
+      ),
+    );
+    return { users, teams };
+  }
   const variants = [...new Set([q, q.toLowerCase(), q.toUpperCase(), q.charAt(0).toUpperCase() + q.slice(1)])];
   const [users, teams] = await Promise.all([
     read(
@@ -225,8 +242,8 @@ const VERSION_RELEASE_ROW = `
 // `extra.joined` is true when the crate already existed (a new publisher).
 export const releases = async (read, { kind, source, from, to, q, minDownloads, sort, desc, limit, offset }) => {
   const dir = desc ? 'DESC' : 'ASC';
-  const params = { from, to, q: q.toLowerCase(), minDownloads: neo4j.int(minDownloads), offset: neo4j.int(offset), limit: neo4j.int(limit + 1) };
-  const filters = (nameExpr, dlExpr) => `AND ($q = '' OR toLower(${nameExpr}) CONTAINS $q) AND coalesce(${dlExpr}, 0) >= $minDownloads`;
+  const params = { from, to, ...nameParams(q), minDownloads: neo4j.int(minDownloads), offset: neo4j.int(offset), limit: neo4j.int(limit + 1) };
+  const filters = (nameExpr, dlExpr) => `AND ${nameFilter(nameExpr)} AND coalesce(${dlExpr}, 0) >= $minDownloads`;
   let cypher;
   if (kind === 'crates' && source === 'created') {
     const order = { date: 'c.created_at', downloads: 'c.downloads', name: 'c.name' }[sort];
